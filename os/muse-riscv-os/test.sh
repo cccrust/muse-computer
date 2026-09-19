@@ -83,6 +83,13 @@ check "cat ARG PASS"
 check "hello-arg"
 check "bg PASS"
 check "kill PASS"
+check "sleep PASS"
+check "chdir PASS"
+check "append PASS"
+check "lseek PASS"
+check "dup2 PASS"
+check "waitpid PASS"
+check "df PASS"
 if grep -q "PANIC" qemu.log; then
   echo "FAIL: PANIC found"; PASS=0
 else
@@ -114,6 +121,48 @@ else
     echo "FAIL: PANIC in second boot"; PASS=0
   else
     echo "OK: no PANIC (second boot)"
+  fi
+fi
+
+echo "=== 8. interactive: Ctrl-C kills foreground sh, respawn, halt ==="
+rm -f qemu3.log
+# NOTE: stdin is a pipe here (not a tty), so no QEMU silence issue.
+# Ctrl-C at ~15s hits sh blocked at prompt; respawned sh then reads halt.
+(sleep 15; printf '\003'; sleep 7; printf 'halt\n') | $TO qemu-system-riscv64 \
+  -machine virt \
+  -nographic \
+  -bios default \
+  -kernel "$KBIN" \
+  -drive file=fs.img,if=none,format=raw,id=x0 \
+  -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  2>&1 | tee qemu3.log || true
+
+if [ ! -s qemu3.log ]; then
+  echo "FAIL: qemu3.log empty"
+  PASS=0
+else
+  if grep -q "killed" qemu3.log; then
+    echo "OK: Ctrl-C killed fg"
+  else
+    echo "FAIL: missing [killed] (Ctrl-C did nothing)";
+    PASS=0
+  fi
+  if grep -q "respawn" qemu3.log; then
+    echo "OK: sh respawned"
+  else
+    echo "FAIL: missing [respawn]";
+    PASS=0
+  fi
+  if grep -q "halting" qemu3.log; then
+    echo "OK: halted cleanly"
+  else
+    echo "FAIL: missing [halting]";
+    PASS=0
+  fi
+  if grep -q "PANIC" qemu3.log; then
+    echo "FAIL: PANIC in third boot"; PASS=0
+  else
+    echo "OK: no PANIC (third boot)"
   fi
 fi
 

@@ -149,8 +149,16 @@ pub fn stat(path: &str) -> (u8, u32, u32) {
     }
 }
 
-pub fn link(old: &str, new: &str) -> bool {
+/// v0.5: (total_blocks, free_blocks) for SYS_FSSTAT/`df`.
+pub fn blocks_stat() -> (u32, u32) {
     if use_disk() {
+        (disk::total_blocks(), disk::free_blocks())
+    } else {
+        (8192, 8192)
+    }
+}
+
+pub fn link(old: &str, new: &str) -> bool {    if use_disk() {
         disk::link(old, new)
     } else {
         // ramfs: copy content (no shared inode)

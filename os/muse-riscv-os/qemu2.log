@@ -65,7 +65,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [BOOT] hart booted in S-mode, kernel @ 0x80200000
 [MM] heap init ok
 [MM] frame allocator ok
-[MM] root=0x80ab6000
+[MM] root=0x80aa3000
 [MM] text mapped
 [MM] rodata mapped
 [MM] data mapped
@@ -74,6 +74,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [MM] mmio mapped, activating...
 [MM] activated
 [MMU] SV39 enabled (satp MODE=8, 3-level)
+[PLIC] uart irq10 enabled
 [TRAP] stvec set
 [TIMER] enabled (10ms tick)
 [VIRTIO] blk device found @ 0x10001000 (ver=1, 8192 sectors)
@@ -111,6 +112,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 bin/
 README ok
 TESTDATA ok
+WD/
 /bin:
 init ok
 sh ok
@@ -161,7 +163,11 @@ hello-arg
 bin/
 README ok
 TESTDATA ok
+WD/
 /bin:
+[PROC] pid=16 exited(0)
+[TEST] pipe PASS
+[PROC] pid=14 exited(0)
 init ok
 sh ok
 ls ok
@@ -175,13 +181,18 @@ persist ok
 [TEST] fstat PASS
 [TEST] ls PASS
 [PROC] pid=15 exited(0)
-[PROC] pid=16 exited(0)
-[TEST] pipe PASS
-[PROC] pid=14 exited(0)
-[bg] done
 [TEST] bg PASS
+[TEST] sleep PASS
 [PROC] fork pid=2 -> child=17
 [PROC] pid=17 killed
 [PROC] pid=17 exited(-9)
 [TEST] kill PASS
-sh$ qemu-system-riscv64: terminating on signal 15 from pid 1374 (<unknown process>)
+[TEST] chdir PASS
+[TEST] append PASS
+[TEST] dup2 PASS
+[TEST] lseek PASS
+[PROC] fork pid=2 -> child=18
+[PROC] pid=18 exited(42)
+[TEST] waitpid PASS
+[TEST] df PASS
+sh$ qemu-system-riscv64: terminating on signal 15 from pid 12931 (<unknown process>)

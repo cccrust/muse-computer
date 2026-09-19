@@ -160,6 +160,38 @@ fn get_ino_raw(ino: u32) -> Option<Ino> {
 fn nblocks() -> u32 {
     unsafe { NBLOCKS }
 }
+
+/// v0.5: public block stats for SYS_FSSTAT/`df`.
+pub fn total_blocks() -> u32 {
+    nblocks()
+}
+
+/// Count free blocks by scanning the bitmap (4MB image = 8K blocks; fine on demand).
+pub fn free_blocks() -> u32 {
+    let nb = nblocks();
+    if nb == 0 {
+        return 0;
+    }
+    let mut free = 0u32;
+    let mut b = 0u32;
+    while b < nb {
+        let byte = (b / 8) as usize;
+        let lb = bmap_lba() + (byte / BLOCK) as u32;
+        let off = byte % BLOCK;
+        let mut blk = [0u8; 512];
+        crate::fs::blk::read(lb, &mut blk);
+        let v = blk[off];
+        let mut bit = 0u32;
+        while bit < 8 && b + bit < nb {
+            if v & (1 << bit) == 0 {
+                free += 1;
+            }
+            bit += 1;
+        }
+        b += bit;
+    }
+    free
+}
 fn bmap_lba() -> u32 {
     unsafe { BMAP_LBA }
 }

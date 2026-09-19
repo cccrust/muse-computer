@@ -34,17 +34,9 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
         user_lib::print("[TEST] echo PASS\n");
         user_lib::exit(0);
     }
-    let mut buf = [0u8; 256];
-    let n = user_lib::read(0, buf.as_mut_ptr(), 200);
-    if n > 0 {
-        let _ = user_lib::write(1, buf.as_ptr(), n as usize);
-        // ensure newline
-        if buf[n as usize - 1] != b'\n' {
-            user_lib::print("\n");
-        }
-    } else {
-        user_lib::print("echo: hi from unix-v6\n");
-    }
+    // no args: do NOT touch stdin here (usertests runs us arg-less and
+    // stdin reads now block); print default instead.
+    user_lib::print("echo: hi from unix-v6\n");
     user_lib::print("[TEST] echo PASS\n");
     user_lib::exit(0);
 }

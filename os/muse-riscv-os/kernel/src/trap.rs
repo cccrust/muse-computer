@@ -44,7 +44,15 @@ pub fn trap_stack_top() -> usize {
 pub fn init() {
     unsafe {
         asm!("csrw stvec, {0}", in(reg) __trap_entry as usize);
+        // enable supervisor timer (5) + external (9) interrupts;
+        // SIE bit itself stays 0 in kernel, set on sret to user.
+        let mut sie: usize;
+        asm!("csrr {0}, sie", out(reg) sie);
+        sie |= (1 << 5) | (1 << 9);
+        asm!("csrw sie, {0}", in(reg) sie);
     }
+    crate::plic::init();
+    crate::uart::irq_enable();
 }
 
 #[no_mangle]
@@ -54,6 +62,13 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
         let stval: usize;
         asm!("csrr {0}, scause", out(reg) scause);
         asm!("csrr {0}, stval", out(reg) stval);
+        // killed tasks die on any trap entry (covers timer-only victims)
+        let cur = crate::task::current_pid();
+        if crate::task::is_killed(cur) {
+            let code = crate::task::kill_code(cur);
+            crate::println!("[PROC] pid={} killed", cur);
+            crate::syscall::do_exit(code);
+        }
         let tfm = &mut *tf;
         let is_int = (scause >> 63) != 0;
         let code = scause & 0xfff;
@@ -62,8 +77,22 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
                 5 => {
                     crate::timer::tick();
                     crate::timer::set_next();
+                    crate::task::wake_sleepers(crate::timer::ticks() as u64);
                     if crate::timer::should_preempt() {
                         crate::task::set_yield_flag();
+                    }
+                }
+                9 => {
+                    // supervisor external: PLIC
+                    loop {
+                        let irq = crate::plic::claim();
+                        if irq == 0 {
+                            break;
+                        }
+                        if irq == crate::plic::UART_IRQ {
+                            crate::uart::on_irq();
+                        }
+                        crate::plic::complete(irq);
                     }
                 }
                 _ => {
@@ -74,14 +103,6 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
             match code {
                 8 => {
                     tfm.sepc += 4;
-                    // kill takes effect on entry (covers timer-only victims too)
-                    if crate::task::is_killed(crate::task::current_pid()) {
-                        crate::println!(
-                            "[PROC] pid={} killed",
-                            crate::task::current_pid()
-                        );
-                        crate::syscall::do_exit(-9);
-                    }
                     let id = tfm.syscall_id();
                     let a0 = tfm.arg(0);
                     let a1 = tfm.arg(1);

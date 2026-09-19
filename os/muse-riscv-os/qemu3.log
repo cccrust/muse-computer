@@ -81,7 +81,6 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [TEST] virtio-blk PASS
 [TEST] virtio-blk RW PASS
 [FS] disk mount ok (MUSEFS01, 8192 blocks)
-[FS] fsck: bitmap rebuilt
 [PROC] init pid=1
 [PROC] spawn init
 [TEST] boot markers ready
@@ -112,6 +111,8 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 /:
 bin/
 README ok
+TESTDATA ok
+WD/
 /bin:
 init ok
 sh ok
@@ -141,8 +142,7 @@ echo: hi from unix-v6
 [PROC] pid=3 exited(0)
 [PROC] fork pid=2 -> child=11
 [PROC] exec pid=11 -> /bin/persist (argc=0)
-[TEST] link PASS
-[TEST] persist WRITE PASS
+[TEST] persist READ PASS
 [PROC] pid=11 exited(0)
 [PROC] fork pid=2 -> child=12
 [PROC] exec pid=12 -> /bin/cat (argc=2)
@@ -159,10 +159,14 @@ hello-arg
 [PROC] exec pid=14 -> /bin/pipe_test (argc=0)
 [PROC] fork pid=14 -> child=16
 [PROC] exec pid=15 -> /bin/ls (argc=1)
+[PROC] pid=16 exited(0)
+[TEST] pipe PASS
+[PROC] pid=14 exited(0)
 /:
 bin/
 README ok
 TESTDATA ok
+WD/
 /bin:
 init ok
 sh ok
@@ -177,9 +181,6 @@ persist ok
 [TEST] fstat PASS
 [TEST] ls PASS
 [PROC] pid=15 exited(0)
-[PROC] pid=16 exited(0)
-[TEST] pipe PASS
-[PROC] pid=14 exited(0)
 [TEST] bg PASS
 [TEST] sleep PASS
 [PROC] fork pid=2 -> child=17
@@ -194,4 +195,121 @@ persist ok
 [PROC] pid=18 exited(42)
 [TEST] waitpid PASS
 [TEST] df PASS
-sh$ 
+sh$ [TTY] Ctrl-C -> kill fg
+[PROC] pid=2 killed
+[PROC] pid=2 exited(130)
+[USER] init: sh exited, respawn
+[PROC] fork pid=1 -> child=19
+[PROC] exec pid=19 -> /bin/sh (argc=0)
+[USER] sh: Unix-v6 like shell. try: ls, cat /README, echo hi | grep hi, usertests
+[USER] sh: auto-run usertests
+[PROC] fork pid=19 -> child=20
+[PROC] exec pid=20 -> /bin/usertests (argc=0)
+[USER] usertests: start
+[PROC] fork pid=20 -> child=21
+[PROC] exec pid=21 -> /bin/fork_test (argc=0)
+[PROC] fork pid=21 -> child=22
+[USER] fork_test child alive
+[USER] fork_test child sbrk ok
+[PROC] pid=22 exited(42)
+[TEST] fork PASS
+[PROC] pid=21 exited(0)
+[PROC] fork pid=20 -> child=23
+[PROC] exec pid=23 -> /bin/pipe_test (argc=0)
+[PROC] fork pid=23 -> child=24
+[PROC] pid=24 exited(0)
+[TEST] pipe PASS
+[PROC] pid=23 exited(0)
+[PROC] fork pid=20 -> child=25
+[PROC] exec pid=25 -> /bin/ls (argc=0)
+/:
+bin/
+README ok
+TESTDATA ok
+WD/
+/bin:
+init ok
+sh ok
+ls ok
+cat ok
+echo ok
+grep ok
+fork_test ok
+pipe_test ok
+usertests ok
+persist ok
+[TEST] fstat PASS
+[TEST] ls PASS
+[PROC] pid=25 exited(0)
+[PROC] fork pid=20 -> child=26
+[PROC] exec pid=26 -> /bin/cat (argc=0)
+muse-riscv-os Unix-v6 like
+try: ls cat echo grep fork_test pipe_test usertests
+[TEST] cat PASS
+[PROC] pid=26 exited(0)
+[PROC] fork pid=20 -> child=27
+[PROC] exec pid=27 -> /bin/echo (argc=0)
+echo: hi from unix-v6
+[TEST] echo PASS
+[PROC] pid=27 exited(0)
+[TEST] usertests PASS
+[PROC] pid=20 exited(0)
+[PROC] fork pid=19 -> child=28
+[PROC] exec pid=28 -> /bin/persist (argc=0)
+[TEST] persist READ PASS
+[PROC] pid=28 exited(0)
+[PROC] fork pid=19 -> child=29
+[PROC] exec pid=29 -> /bin/cat (argc=2)
+PERSIST-v0.2-0123456789abcdef[TEST] cat ARG PASS
+[PROC] pid=29 exited(0)
+[PROC] fork pid=19 -> child=30
+[PROC] exec pid=30 -> /bin/echo (argc=2)
+hello-arg
+[TEST] echo PASS
+[PROC] pid=30 exited(0)
+[PROC] fork pid=19 -> child=31
+[bg] pipe_test &
+[PROC] fork pid=19 -> child=32
+[PROC] exec pid=31 -> /bin/pipe_test (argc=0)
+[PROC] fork pid=31 -> child=33
+[PROC] exec pid=32 -> /bin/ls (argc=1)
+/:
+bin/
+README ok
+TESTDATA ok
+WD/
+/bin:
+init ok
+sh ok
+ls ok
+cat ok
+echo ok
+grep[PROC] pid=33 exited(0)
+[TEST] pipe PASS
+[PROC] pid=31 exited(0)
+ ok
+fork_test ok
+pipe_test ok
+usertests ok
+persist ok
+[TEST] fstat PASS
+[TEST] ls PASS
+[PROC] pid=32 exited(0)
+[TEST] bg PASS
+[TEST] sleep PASS
+[PROC] fork pid=19 -> child=34
+[PROC] pid=34 killed
+[PROC] pid=34 exited(-9)
+[TEST] kill PASS
+[TEST] chdir PASS
+[TEST] append PASS
+[TEST] dup2 PASS
+[TEST] lseek PASS
+[PROC] fork pid=19 -> child=35
+[PROC] pid=35 exited(42)
+[TEST] waitpid PASS
+[TEST] df PASS
+sh$ sh: draining jobs
+sh: halting
+[SYS] shutdown
+[FS] marked clean

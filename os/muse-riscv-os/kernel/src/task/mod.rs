@@ -22,8 +22,13 @@ fn trap_stack_top() -> usize {
 pub enum State {
     Runnable,
     Running,
+    Blocked,
     Zombie,
 }
+
+/// block reasons for State::Blocked
+pub const BLOCK_STDIN: u8 = 1;
+pub const BLOCK_SLEEP: u8 = 2;
 
 pub struct Proc {
     pub pid: usize,
@@ -40,6 +45,12 @@ pub struct Proc {
     pub children: Vec<usize>,
     pub name: [u8; 32],
     pub killed: bool,
+    pub kill_code: i32,
+    pub blocked_on: u8,
+    pub wake_at: u64,
+    pub cwd: [u8; 128],
+    pub cwd_len: usize,
+    pub fd_cloexec: [bool; 16],
 }
 
 struct Sched {
@@ -184,10 +195,40 @@ fn finish_spawn(
         fd_path: [0; 16],
         children: Vec::new(),
         killed: false,
+        kill_code: -9,
+        blocked_on: 0,
+        wake_at: 0,
         name: nb,
+        cwd: {
+            let mut c = [0u8; 128];
+            if parent == 0 {
+                c[0] = b'/';
+                c
+            } else {
+                // inherit parent cwd (read before taking &mut below would
+                // deadlock; parent==0 only at boot so copy after insert)
+                c[0] = b'/';
+                c
+            }
+        },
+        cwd_len: 1,
+        fd_cloexec: [false; 16],
     };
     s.procs[pid] = Some(proc);
     if parent != 0 {
+        // inherit cwd from parent (lock already held, direct index)
+        let (cc, cl) = match s.procs.get(parent).and_then(|o| o.as_ref()) {
+            Some(p) => (p.cwd, p.cwd_len),
+            None => {
+                let mut c = [0u8; 128];
+                c[0] = b'/';
+                (c, 1)
+            }
+        };
+        if let Some(Some(me)) = s.procs.get_mut(pid) {
+            me.cwd = cc;
+            me.cwd_len = cl;
+        }
         if let Some(Some(pp)) = s.procs.get_mut(parent) {
             pp.children.push(pid);
         }
@@ -279,7 +320,7 @@ fn push_args(root: usize, args: &[Vec<u8>]) -> usize {
 /// Fork current process. Returns child pid. Caller sets child a0=0.
 pub fn fork(parent_pid: usize) -> usize {
     // gather parent info without holding lock across allocs
-    let (p_root, p_tf, p_brk, p_kind, p_fds, p_off, p_path, pname) = {
+    let (p_root, p_tf, p_brk, p_kind, p_fds, p_off, p_path, pname, p_cwd, p_cwd_len, p_cloexec) = {
         let s = sched().lock();
         let p = s.procs[parent_pid].as_ref().expect("no parent").clone_proc_info();
         p
@@ -315,7 +356,13 @@ pub fn fork(parent_pid: usize) -> usize {
         fd_path: p_path,
         children: Vec::new(),
         killed: false,
+        kill_code: -9,
+        blocked_on: 0,
+        wake_at: 0,
         name: nb,
+        cwd: p_cwd,
+        cwd_len: p_cwd_len,
+        fd_cloexec: p_cloexec,
     };
     s.procs[child] = Some(proc);
     if let Some(Some(pp)) = s.procs.get_mut(parent_pid) {
@@ -383,6 +430,16 @@ pub fn exec(pid: usize, path: &str, args: &[Vec<u8>]) -> bool {
     if let Some(Some(p)) = s.procs.get_mut(pid) {
         p.root = new_root;
         p.brk = brk.max(0x20000);
+        // close CLOEXEC fds (keep cwd, keep other fds incl. redirections)
+        for i in 0..16 {
+            if p.fd_cloexec[i] {
+                p.fd_kind[i] = 0;
+                p.fds[i] = -1;
+                p.fd_off[i] = 0;
+                p.fd_path[i] = 0;
+                p.fd_cloexec[i] = false;
+            }
+        }
         // reset fds? keep 0,1,2
     }
     // if this is current, activate immediately (trap exit will use new root only
@@ -434,8 +491,12 @@ pub fn yield_now() {
     set_yield_flag();
 }
 
-/// Mark target as killed; it exits with -9 on next trap.
+/// Mark target as killed; it exits on next trap entry. Wakes if blocked.
 pub fn kill(pid: usize) -> bool {
+    kill_with(pid, -9)
+}
+
+fn kill_with(pid: usize, code: i32) -> bool {
     let mut s = sched().lock();
     match s.procs.get_mut(pid) {
         Some(Some(p)) => {
@@ -443,6 +504,12 @@ pub fn kill(pid: usize) -> bool {
                 return false;
             }
             p.killed = true;
+            p.kill_code = code;
+            if p.state == State::Blocked {
+                p.state = State::Runnable;
+                p.blocked_on = 0;
+                s.queue.push_back(pid);
+            }
             true
         }
         _ => false,
@@ -452,6 +519,97 @@ pub fn kill(pid: usize) -> bool {
 pub fn is_killed(pid: usize) -> bool {
     let s = sched().lock();
     matches!(s.procs.get(pid), Some(Some(p)) if p.killed)
+}
+
+pub fn kill_code(pid: usize) -> i32 {
+    let s = sched().lock();
+    s.procs
+        .get(pid)
+        .and_then(|o| o.as_ref())
+        .map(|p| p.kill_code)
+        .unwrap_or(-9)
+}
+
+// ---- foreground pid for Ctrl-C ----
+static mut FG_PID: usize = 0;
+
+pub fn set_fg(pid: usize) {
+    unsafe {
+        FG_PID = pid;
+    }
+}
+
+/// Ctrl-C target: kill foreground (exit 130). Returns false if none.
+pub fn kill_fg() -> bool {
+    let fg = unsafe { FG_PID };
+    if fg == 0 {
+        return false;
+    }
+    kill_with(fg, 130)
+}
+
+// ---- blocking ----
+/// Block current task (trap context only); caller must yield.
+pub fn block_current(reason: u8, wake_at: u64) {
+    let mut s = sched().lock();
+    let cur = s.current;
+    if let Some(Some(p)) = s.procs.get_mut(cur) {
+        if p.state == State::Running {
+            p.state = State::Blocked;
+            p.blocked_on = reason;
+            p.wake_at = wake_at;
+        }
+    }
+}
+
+fn wake_locked(s: &mut Sched, pid: usize) {
+    if let Some(Some(p)) = s.procs.get_mut(pid) {
+        if p.state == State::Blocked {
+            p.state = State::Runnable;
+            p.blocked_on = 0;
+            s.queue.push_back(pid);
+        }
+    }
+}
+
+/// Wake stdin sleepers (UART ISR).
+pub fn wake_stdin() {
+    let mut s = sched().lock();
+    let ids: Vec<usize> = s
+        .procs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| match o {
+            Some(p) if p.state == State::Blocked && p.blocked_on == BLOCK_STDIN => Some(i),
+            _ => None,
+        })
+        .collect();
+    for pid in ids {
+        wake_locked(&mut s, pid);
+    }
+}
+
+/// Wake expired sleepers (timer tick).
+pub fn wake_sleepers(now: u64) {
+    let mut s = sched().lock();
+    let ids: Vec<usize> = s
+        .procs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| match o {
+            Some(p)
+                if p.state == State::Blocked
+                    && p.blocked_on == BLOCK_SLEEP
+                    && now >= p.wake_at =>
+            {
+                Some(i)
+            }
+            _ => None,
+        })
+        .collect();
+    for pid in ids {
+        wake_locked(&mut s, pid);
+    }
 }
 
 /// Called at end of trap handler with old TF ptr (VA).
@@ -642,61 +800,145 @@ pub fn with_current_mut<R>(f: impl FnOnce(&mut Proc) -> R) -> R {
 }
 
 trait CloneInfo {
-    fn clone_proc_info(&self) -> (usize, usize, usize, [u8; 16], [i32; 16], [usize; 16], [u64; 16], [u8; 32]);
+    fn clone_proc_info(&self) -> (usize, usize, usize, [u8; 16], [i32; 16], [usize; 16], [u64; 16], [u8; 32], [u8; 128], usize, [bool; 16]);
 }
 impl CloneInfo for Proc {
-    fn clone_proc_info(&self) -> (usize, usize, usize, [u8; 16], [i32; 16], [usize; 16], [u64; 16], [u8; 32]) {
-        (self.root, self.tf_pa, self.brk, self.fd_kind, self.fds, self.fd_off, self.fd_path, self.name)
+    fn clone_proc_info(&self) -> (usize, usize, usize, [u8; 16], [i32; 16], [usize; 16], [u64; 16], [u8; 32], [u8; 128], usize, [bool; 16]) {
+        (self.root, self.tf_pa, self.brk, self.fd_kind, self.fds, self.fd_off, self.fd_path, self.name, self.cwd, self.cwd_len, self.fd_cloexec)
     }
 }
 
 pub fn wait(pid: usize) -> (i32, usize) {
-    // returns (found, child_pid/code). Blocking poll with yield.
-    loop {
-        let child = {
-            let mut s = sched().lock();
-            let mut found: Option<(usize, i32)> = None;
-            let children = s.procs[pid].as_ref().unwrap().children.clone();
-            for c in children {
-                if let Some(Some(p)) = s.procs.get(c) {
-                    if p.state == State::Zombie {
-                        found = Some((c, p.exit_code));
-                        break;
-                    }
-                }
-            }
-            if let Some((c, code)) = found {
-                s.procs[c] = None;
-                // remove from children list
-                if let Some(Some(pp)) = s.procs.get_mut(pid) {
-                    pp.children.retain(|&x| x != c);
-                }
-                Some((c, code))
-            } else {
-                // any non-zombie children?
-                let any = s.procs[pid]
-                    .as_ref()
-                    .unwrap()
-                    .children
-                    .iter()
-                    .any(|&c| s.procs.get(c).and_then(|o| o.as_ref()).is_some());
-                if !any {
-                    Some((0, -1))
-                } else {
-                    None
-                }
-            }
+    waitpid(pid, -1, 0)
+}
+
+/// WNOHANG option bit for waitpid.
+pub const WNOHANG: usize = 1;
+
+/// Wait for a child: target>0 waits that pid, else any child.
+/// Returns (child_pid_or_status, code):
+/// - (c, code) zombie reaped; (-1, 0) no children; (-2, 0) would block
+///   (caller yields and retries); (0, 0) WNOHANG no zombie yet.
+pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
+    let nohang = options & WNOHANG != 0;
+    let child = {
+        let mut s = sched().lock();
+        let children = match s.procs.get(pid).and_then(|o| o.as_ref()) {
+            Some(p) => p.children.clone(),
+            None => return (-1, 0),
         };
-        if let Some((c, code)) = child {
-            if c == 0 {
-                return (-1, 0);
+        let mut found: Option<(usize, i32)> = None;
+        for c in &children {
+            if target > 0 && *c as isize != target {
+                continue;
             }
-            return (c as i32, code as usize);
+            if let Some(Some(p)) = s.procs.get(*c) {
+                if p.state == State::Zombie {
+                    found = Some((*c, p.exit_code));
+                    break;
+                }
+            }
         }
-        // no zombie yet: yield and return WouldBlock; user retries.
-        // Do NOT call schedule_point here (would switch satp and corrupt TF).
-        // Outer trap handler will switch after we return.
-        yield_now();
-        return (-2, 0);
+        if let Some((c, code)) = found {
+            s.procs[c] = None;
+            if let Some(Some(pp)) = s.procs.get_mut(pid) {
+                pp.children.retain(|&x| x != c);
+            }
+            Some((c as i32, code as usize))
+        } else {
+            // any live (non-zombie, slot present) matching children?
+            let mut any = false;
+            for c in &children {
+                if target > 0 && *c as isize != target {
+                    continue;
+                }
+                if s.procs.get(*c).and_then(|o| o.as_ref()).is_some() {
+                    any = true;
+                    break;
+                }
+            }
+            if !any {
+                Some((-1, 0))
+            } else if nohang {
+                Some((0, 0))
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(v) = child {
+        return (v.0, v.1);
     }
+    // no zombie yet: yield and return WouldBlock; user retries.
+    // Do NOT call schedule_point here (would switch satp and corrupt TF).
+    // Outer trap handler will switch after we return.
+    yield_now();
+    (-2, 0)
+}
+
+// ---- cwd + path resolution (v0.5) ----
+pub fn get_cwd(pid: usize) -> alloc::string::String {
+    let s = sched().lock();
+    match s.procs.get(pid).and_then(|o| o.as_ref()) {
+        Some(p) => {
+            let n = p.cwd_len.min(128);
+            alloc::string::String::from_utf8_lossy(&p.cwd[..n]).into_owned()
+        }
+        None => alloc::string::String::from("/"),
+    }
+}
+
+pub fn set_cwd(pid: usize, cwd: &str) -> bool {
+    if !cwd.starts_with('/') || cwd.len() > 127 {
+        return false;
+    }
+    let mut s = sched().lock();
+    match s.procs.get_mut(pid).and_then(|o| o.as_mut()) {
+        Some(p) => {
+            let b = cwd.as_bytes();
+            p.cwd[..b.len()].copy_from_slice(b);
+            for i in b.len()..128 {
+                p.cwd[i] = 0;
+            }
+            p.cwd_len = b.len();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Resolve user path against cwd: absolute stays, relative joins cwd;
+/// normalizes `.`/`..`/`//`/trailing `/` (root stays `/`).
+/// Output is always absolute; over-long (>127) returns root-relative clamp.
+pub fn resolve_path(cwd: &str, path: &str) -> alloc::string::String {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    let joined: String = if path.starts_with('/') {
+        String::from(path)
+    } else if cwd.ends_with('/') {
+        alloc::format!("{}{}", cwd, path)
+    } else {
+        alloc::format!("{}/{}", cwd, path)
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in joined.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&parts.join("/"));
+    if out.len() > 127 {
+        out.truncate(127);
+    }
+    out
+}
+
+pub fn resolve_for(pid: usize, path: &str) -> alloc::string::String {
+    let cwd = get_cwd(pid);
+    resolve_path(&cwd, path)
 }

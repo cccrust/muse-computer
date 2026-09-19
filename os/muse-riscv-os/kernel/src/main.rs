@@ -24,6 +24,8 @@ mod mem;
 #[cfg(not(test))]
 mod trap;
 #[cfg(not(test))]
+mod plic;
+#[cfg(not(test))]
 mod timer;
 #[cfg(not(test))]
 mod task;

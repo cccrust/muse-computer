@@ -76,6 +76,10 @@ pub fn shutdown() -> ! {
     ecall(23, 0, 0, 0);
     loop {}
 }
+/// set foreground pid for Ctrl-C delivery
+pub fn setfg(pid: isize) -> isize {
+    ecall(24, pid as usize, 0, 0)
+}
 /// fstat(fd, out: *mut u32[3]) -> out = [kind, size, nlink]
 pub fn fstat(fd: isize, out: *mut u32) -> isize {
     ecall(20, fd as usize, out as usize, 0)
@@ -83,6 +87,40 @@ pub fn fstat(fd: isize, out: *mut u32) -> isize {
 pub fn link(old: *const u8, new: *const u8) -> isize {
     ecall(18, old as usize, new as usize, 0)
 }
+
+/// v0.5: chdir / getcwd (SYS_CHDIR=16, SYS_GETCWD=25)
+pub fn chdir(path: *const u8) -> isize {
+    ecall(16, path as usize, 0, 0)
+}
+pub fn getcwd(buf: *mut u8, len: usize) -> isize {
+    ecall(25, buf as usize, len, 0)
+}
+
+/// v0.5: lseek (SYS_LSEEK=26). whence: 0=SET, 1=CUR, 2=END.
+pub fn lseek(fd: isize, off: isize, whence: usize) -> isize {
+    ecall(26, fd as usize, off as usize, whence)
+}
+
+/// v0.5: dup2 (SYS_DUP2=27)
+pub fn dup2(old: isize, new: isize) -> isize {
+    ecall(27, old as usize, new as usize, 0)
+}
+
+/// v0.5: waitpid (SYS_WAITPID=28). pid>0 specific, -1 any; options&1=WNOHANG.
+pub fn waitpid(pid: isize, code_out: *mut i32, options: usize) -> isize {
+    ecall(28, pid as usize, code_out as usize, options)
+}
+
+/// v0.5: fsstat (SYS_FSSTAT=29): writes "total=N free=M\n" into buf.
+pub fn fsstat(buf: *mut u8, len: usize) -> isize {
+    ecall(29, buf as usize, len, 0)
+}
+
+/// open flags (must match kernel sys_open)
+pub const O_CREATE: i32 = 0x40;
+pub const O_TRUNC: i32 = 0x200;
+pub const O_APPEND: i32 = 0x400;
+pub const O_CLOEXEC: i32 = 0x80000;
 
 pub fn print(s: &str) {
     let _ = write(1, s.as_ptr(), s.len());

@@ -24,6 +24,13 @@ pub const SYS_FSTAT: usize = 20;
 pub const SYS_YIELD: usize = 21;
 pub const SYS_GETDENTS: usize = 22;
 pub const SYS_SHUTDOWN: usize = 23;
+pub const SYS_SETFG: usize = 24;
+// v0.5
+pub const SYS_GETCWD: usize = 25;
+pub const SYS_LSEEK: usize = 26;
+pub const SYS_DUP2: usize = 27;
+pub const SYS_WAITPID: usize = 28;
+pub const SYS_FSSTAT: usize = 29;
 
 pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) -> isize {
     match id {
@@ -42,13 +49,14 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_EXEC => sys_exec(a0, a1) as isize,
         SYS_GETPID => crate::task::current_pid() as isize,
         SYS_SBRK => sys_sbrk(a0 as i32) as isize,
-        SYS_SLEEP => {
-            crate::timer::sleep_ticks(a0);
+        SYS_SLEEP => sys_sleep(a0) as isize,
+        SYS_SETFG => {
+            crate::task::set_fg(a0);
             0
         }
         SYS_KILL => sys_kill(a0) as isize,
         SYS_MKDIR => sys_mkdir(a0) as isize,
-        SYS_CHDIR => 0,
+        SYS_CHDIR => sys_chdir(a0) as isize,
         SYS_MKNOD => 0,
         SYS_LINK => sys_link(a0, a1) as isize,
         SYS_UNLINK => sys_unlink(a0) as isize,
@@ -58,6 +66,11 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
             0
         }
         SYS_GETDENTS => sys_getdents(a0, a1, a2) as isize,
+        SYS_GETCWD => sys_getcwd(a0, a1) as isize,
+        SYS_LSEEK => sys_lseek(a0 as i32, a1 as isize, a2) as isize,
+        SYS_DUP2 => sys_dup2(a0 as i32, a1 as i32) as isize,
+        SYS_WAITPID => sys_waitpid(a0 as isize, a1, a2) as isize,
+        SYS_FSSTAT => sys_fsstat(a0, a1) as isize,
         SYS_SHUTDOWN => {
             crate::println!("[SYS] shutdown");
             if crate::fs::use_disk() {
@@ -128,23 +141,30 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> usize {
         let dst = crate::fs::user_slice_mut(buf, len);
         match kind {
             1 => {
-                // stdin: poll uart, non-blocking (return 0 if empty, user retries)
+                // stdin: ISR-filled ring; block if empty (woken by UART ISR).
+                // EOF flag (Ctrl-D) yields available bytes, then 0.
                 let mut n = 0;
                 while n < len {
-                    if let Some(c) = crate::uart::getchar() {
-                        dst[n] = c;
-                        n += 1;
-                        if c == b'\n' {
-                            break;
+                    match crate::uart::getchar() {
+                        Some(c) => {
+                            dst[n] = c;
+                            n += 1;
+                            if c == b'\n' {
+                                break;
+                            }
                         }
-                    } else {
-                        break;
+                        None => break,
                     }
                 }
                 if n == 0 {
+                    if crate::uart::take_eof() {
+                        return 0;
+                    }
+                    // truly block: descheduled until ISR wakes us; the
+                    // pre-written 0 is delivered on resume, caller retries.
+                    crate::task::block_current(crate::task::BLOCK_STDIN, 0);
                     crate::task::yield_now();
                 }
-                // update offset? stdin no
                 n
             }
             4 => {
@@ -207,13 +227,18 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> usize {
 
 fn sys_open(path_ptr: usize, flags: i32) -> isize {
     unsafe {
-        let path = match crate::fs::user_str(path_ptr) {
+        let raw = match crate::fs::user_str(path_ptr) {
             Some(s) => s,
             None => return -1,
         };
+        let pid = crate::task::current_pid();
+        let path = crate::task::resolve_for(pid, &raw);
         // flags: 0=R,1=W,2=RW, 0x40=CREATE, 0x200=TRUNC (match user-lib)
+        // v0.5: 0x400=APPEND, 0x80000=CLOEXEC
         const O_CREATE: i32 = 0x40;
         const O_TRUNC: i32 = 0x200;
+        const O_APPEND: i32 = 0x400;
+        const O_CLOEXEC: i32 = 0x80000;
         if crate::fs::read_file(&path).is_none() {
             if flags & O_CREATE != 0 {
                 crate::fs::write_file(&path, b"");
@@ -229,9 +254,15 @@ fn sys_open(path_ptr: usize, flags: i32) -> isize {
             for i in 3..16 {
                 if p.fd_kind[i] == 0 {
                     p.fd_kind[i] = 4;
-                    p.fd_off[i] = 0;
+                    // APPEND starts at end (after possible TRUNC above)
+                    p.fd_off[i] = if flags & O_APPEND != 0 {
+                        crate::fs::file_len(&path).unwrap_or(0)
+                    } else {
+                        0
+                    };
                     p.fd_path[i] = register_path(&path);
                     p.fds[i] = i as i32;
+                    p.fd_cloexec[i] = flags & O_CLOEXEC != 0;
                     ret = i as isize;
                     break;
                 }
@@ -248,6 +279,7 @@ fn sys_close(fd: i32) -> isize {
     crate::task::with_current_mut(|p| {
         p.fd_kind[fd as usize] = 0;
         p.fds[fd as usize] = -1;
+        p.fd_cloexec[fd as usize] = false;
     });
     0
 }
@@ -267,6 +299,8 @@ fn sys_dup(fd: i32) -> isize {
                 p.fd_off[i] = p.fd_off[fd as usize];
                 p.fd_path[i] = p.fd_path[fd as usize];
                 p.fds[i] = i as i32;
+                // dup() new fd starts with CLOEXEC cleared
+                p.fd_cloexec[i] = false;
                 ret = i as isize;
                 break;
             }
@@ -316,7 +350,7 @@ fn sys_pipe(uaddr: usize) -> isize {
 
 fn sys_exec(path_ptr: usize, argv_ptr: usize) -> isize {
     unsafe {
-        let path = match crate::fs::user_str(path_ptr) {
+        let raw = match crate::fs::user_str(path_ptr) {
             Some(s) => s,
             None => return -1,
         };
@@ -340,6 +374,8 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize) -> isize {
             }
         }
         let pid = crate::task::current_pid();
+        // resolve against caller cwd before address space is replaced
+        let path = crate::task::resolve_for(pid, &raw);
         crate::println!("[PROC] exec pid={} -> {} (argc={})", pid, path, args.len());
         if crate::task::exec(pid, &path, &args) {
             0
@@ -347,6 +383,15 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize) -> isize {
             -1
         }
     }
+}
+
+fn sys_sleep(ticks: usize) -> isize {
+    // Block until target tick; return value is pre-written and delivered
+    // on resume, so from user view sleep() waited the full duration.
+    let target = crate::timer::ticks().saturating_add(ticks);
+    crate::task::block_current(crate::task::BLOCK_SLEEP, target as u64);
+    crate::task::yield_now();
+    0
 }
 
 fn sys_sbrk(inc: i32) -> isize {
@@ -379,7 +424,9 @@ fn sys_sbrk(inc: i32) -> isize {
 fn sys_mkdir(path_ptr: usize) -> isize {
     unsafe {
         match crate::fs::user_str(path_ptr) {
-            Some(p) => {
+            Some(raw) => {
+                let pid = crate::task::current_pid();
+                let p = crate::task::resolve_for(pid, &raw);
                 if crate::fs::mkdir(&p) {
                     0
                 } else {
@@ -391,10 +438,148 @@ fn sys_mkdir(path_ptr: usize) -> isize {
     }
 }
 
+fn sys_chdir(path_ptr: usize) -> isize {
+    unsafe {
+        match crate::fs::user_str(path_ptr) {
+            Some(raw) => {
+                let pid = crate::task::current_pid();
+                let p = crate::task::resolve_for(pid, &raw);
+                if !crate::fs::exists(&p) {
+                    return -1;
+                }
+                // must be a directory (stat kind: 2=dir; ramfs fallback (2,0,1))
+                let (k, _, _) = crate::fs::stat(&p);
+                if k != 2 {
+                    return -1;
+                }
+                if crate::task::set_cwd(pid, &p) {
+                    0
+                } else {
+                    -1
+                }
+            }
+            None => -1,
+        }
+    }
+}
+
+fn sys_getcwd(buf: usize, len: usize) -> isize {
+    if buf == 0 || len == 0 {
+        return -1;
+    }
+    let pid = crate::task::current_pid();
+    let cwd = crate::task::get_cwd(pid);
+    let b = cwd.as_bytes();
+    // need bytes incl. NUL
+    if b.len() + 1 > len {
+        return -1;
+    }
+    unsafe {
+        let dst = crate::fs::user_slice_mut(buf, len);
+        dst[..b.len()].copy_from_slice(b);
+        dst[b.len()] = 0;
+    }
+    (b.len() + 1) as isize
+}
+
+fn sys_lseek(fd: i32, off: isize, whence: usize) -> isize {
+    if fd < 0 || fd >= 16 {
+        return -1;
+    }
+    // SEEK_SET=0, SEEK_CUR=1, SEEK_END=2
+    if whence > 2 {
+        return -1;
+    }
+    let (kind, path_id, cur) = crate::task::with_current(|p| {
+        (p.fd_kind[fd as usize], p.fd_path[fd as usize], p.fd_off[fd as usize])
+    });
+    if kind != 4 {
+        return -1;
+    }
+    let path = fd_path_to_string(path_id);
+    let size = crate::fs::file_len(&path).unwrap_or(0) as isize;
+    let new_off: isize = match whence {
+        0 => off,
+        1 => cur as isize + off,
+        2 => size + off,
+        _ => return -1,
+    };
+    if new_off < 0 {
+        return -1;
+    }
+    crate::task::with_current_mut(|p| {
+        p.fd_off[fd as usize] = new_off as usize;
+    });
+    new_off
+}
+
+fn sys_dup2(old: i32, new: i32) -> isize {
+    if old < 0 || old >= 16 || new < 0 || new >= 16 {
+        return -1;
+    }
+    let (kind, off, path) = crate::task::with_current(|p| {
+        (p.fd_kind[old as usize], p.fd_off[old as usize], p.fd_path[old as usize])
+    });
+    if kind == 0 {
+        return -1;
+    }
+    if old == new {
+        return new as isize;
+    }
+    crate::task::with_current_mut(|p| {
+        p.fd_kind[new as usize] = kind;
+        p.fd_off[new as usize] = off;
+        p.fd_path[new as usize] = path;
+        p.fds[new as usize] = new;
+        // POSIX: dup2 clears CLOEXEC on the new fd
+        p.fd_cloexec[new as usize] = false;
+    });
+    new as isize
+}
+
+fn sys_waitpid(target: isize, status_ptr: usize, options: usize) -> isize {
+    let pid = crate::task::current_pid();
+    let (c, code) = crate::task::waitpid(pid, target, options);
+    if c == -2 {
+        return -2; // would block, user retries
+    }
+    if c == 0 {
+        return 0; // WNOHANG: no zombie yet
+    }
+    if c < 0 {
+        return -1;
+    }
+    if status_ptr != 0 {
+        unsafe {
+            *(status_ptr as *mut i32) = code as i32;
+        }
+    }
+    c as isize
+}
+
+fn sys_fsstat(buf: usize, len: usize) -> isize {
+    if buf == 0 || len == 0 {
+        return -1;
+    }
+    let (total, free) = crate::fs::blocks_stat();
+    let s = alloc::format!("total={} free={}\n", total, free);
+    let b = s.as_bytes();
+    if b.len() > len {
+        return -1;
+    }
+    unsafe {
+        let dst = crate::fs::user_slice_mut(buf, len);
+        dst[..b.len()].copy_from_slice(b);
+    }
+    b.len() as isize
+}
+
 fn sys_unlink(path_ptr: usize) -> isize {
     unsafe {
         match crate::fs::user_str(path_ptr) {
-            Some(p) => {
+            Some(raw) => {
+                let pid = crate::task::current_pid();
+                let p = crate::task::resolve_for(pid, &raw);
                 if crate::fs::unlink(&p) {
                     0
                 } else {
@@ -441,14 +626,17 @@ fn sys_fstat(fd: i32, out: usize) -> isize {
 
 fn sys_link(old_ptr: usize, new_ptr: usize) -> isize {
     unsafe {
-        let old = match crate::fs::user_str(old_ptr) {
+        let old_raw = match crate::fs::user_str(old_ptr) {
             Some(s) => s,
             None => return -1,
         };
-        let new = match crate::fs::user_str(new_ptr) {
+        let new_raw = match crate::fs::user_str(new_ptr) {
             Some(s) => s,
             None => return -1,
         };
+        let pid = crate::task::current_pid();
+        let old = crate::task::resolve_for(pid, &old_raw);
+        let new = crate::task::resolve_for(pid, &new_raw);
         if crate::fs::link(&old, &new) {
             0
         } else {
@@ -463,10 +651,12 @@ fn sys_getdents(path_ptr: usize, buf: usize, len: usize) -> isize {
         return -1;
     }
     unsafe {
-        let path = match crate::fs::user_str(path_ptr) {
+        let raw = match crate::fs::user_str(path_ptr) {
             Some(s) => s,
             None => return -1,
         };
+        let pid = crate::task::current_pid();
+        let path = crate::task::resolve_for(pid, &raw);
         let names = crate::fs::list_dir(&path);
         let dst = crate::fs::user_slice_mut(buf, len);
         let mut o = 0usize;

@@ -82,6 +82,12 @@ pub fn init_kernel_space() {
             pt::map_one(root, m, m, pt::PTE_R | pt::PTE_W);
             m += 4096;
         }
+        // PLIC (0x0c000000..0x0c300000): priority + enable + threshold/claim
+        let mut p = 0x0c00_0000usize;
+        while p < 0x0c30_0000 {
+            pt::map_one(root, p, p, pt::PTE_R | pt::PTE_W);
+            p += 4096;
+        }
         crate::println!("[MM] mmio mapped, activating...");
         KERNEL_ROOT = root;
         pt::activate(root);

@@ -40,13 +40,21 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
         run_pipe(&cmd[..p], &cmd[p + 1..], jobs);
         return;
     }
-    // redirection: prog > file  /  prog < file (single file, no pipe combo)
+    // redirection: prog > file / prog >> file (append) / prog < file
+    //   prog 2> file / prog 2>> file (stderr). single file, no pipe combo.
     let mut redir_out: Option<&[u8]> = None;
     let mut redir_in: Option<&[u8]> = None;
+    let mut append_out = false;
+    let mut redir_fd: isize = 1;
     let mut core_end = end;
     for i in 0..end {
         if cmd[i] == b'>' {
-            let f = trim(&cmd[i + 1..end]);
+            let mut j = i + 1;
+            if j < end && cmd[j] == b'>' {
+                append_out = true;
+                j += 1;
+            }
+            let f = trim(&cmd[j..end]);
             // filename = up to next space
             let mut fl = f.len();
             for k in 0..f.len() {
@@ -56,7 +64,13 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
                 }
             }
             redir_out = Some(&f[..fl]);
-            core_end = i;
+            // trailing "2>" means stderr
+            if i > 0 && cmd[i - 1] == b'2' && (i == 1 || cmd[i - 2] == b' ') {
+                redir_fd = 2;
+                core_end = i - 1;
+            } else {
+                core_end = i;
+            }
             break;
         }
         if cmd[i] == b'<' {
@@ -86,7 +100,7 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
     mkargv(&toks, ntok, &mut av);
     let pid = user_lib::fork();
     if pid == 0 {
-        // redirections first (close+dup trick: dup picks lowest free fd)
+        // redirections via dup2 (v0.5)
         if let Some(f) = redir_out {
             let mut fp = [0u8; 64];
             let mut L = 0;
@@ -97,10 +111,14 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
                 }
             }
             fp[L] = 0;
-            let fd = user_lib::open(fp.as_ptr(), 0x40 | 0x200 | 1);
+            let oflags = if append_out {
+                user_lib::O_CREATE | user_lib::O_APPEND | 1
+            } else {
+                0x40 | 0x200 | 1
+            };
+            let fd = user_lib::open(fp.as_ptr(), oflags);
             if fd >= 0 {
-                user_lib::close(1);
-                user_lib::dup(fd as isize);
+                user_lib::dup2(fd as isize, redir_fd);
                 user_lib::close(fd as isize);
             }
         }
@@ -116,8 +134,7 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
             fp[L] = 0;
             let fd = user_lib::open(fp.as_ptr(), 0);
             if fd >= 0 {
-                user_lib::close(0);
-                user_lib::dup(fd as isize);
+                user_lib::dup2(fd as isize, 0);
                 user_lib::close(fd as isize);
             }
         }
@@ -127,7 +144,9 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
         user_lib::print("sh: exec failed\n");
         user_lib::exit(-1);
     } else if pid > 0 {
+        user_lib::setfg(pid);
         wait_foreground(pid, jobs);
+        user_lib::setfg(user_lib::getpid());
     }
 }
 
@@ -142,8 +161,7 @@ fn run_pipe(left: &[u8], right: &[u8], jobs: &mut [isize; 8]) {
     let r = trim(right);
     let p1 = user_lib::fork();
     if p1 == 0 {
-        user_lib::close(1);
-        user_lib::dup(fds[1] as isize);
+        user_lib::dup2(fds[1] as isize, 1);
         user_lib::close(fds[0] as isize);
         user_lib::close(fds[1] as isize);
         exec_simple(l);
@@ -151,8 +169,7 @@ fn run_pipe(left: &[u8], right: &[u8], jobs: &mut [isize; 8]) {
     }
     let p2 = user_lib::fork();
     if p2 == 0 {
-        user_lib::close(0);
-        user_lib::dup(fds[0] as isize);
+        user_lib::dup2(fds[0] as isize, 0);
         user_lib::close(fds[0] as isize);
         user_lib::close(fds[1] as isize);
         exec_simple(r);
@@ -160,8 +177,10 @@ fn run_pipe(left: &[u8], right: &[u8], jobs: &mut [isize; 8]) {
     }
     user_lib::close(fds[0] as isize);
     user_lib::close(fds[1] as isize);
+    user_lib::setfg(p2);
     wait_foreground(p1, jobs);
     wait_foreground(p2, jobs);
+    user_lib::setfg(user_lib::getpid());
 }
 
 fn trim(s: &[u8]) -> &[u8] {
@@ -267,7 +286,9 @@ fn run_args(path: &[u8], args: &[&[u8]], jobs: &mut [isize; 8]) {
         let _ = user_lib::exec(path.as_ptr(), av.as_ptr() as usize);
         user_lib::exit(-1);
     } else if pid > 0 {
+        user_lib::setfg(pid);
         wait_foreground(pid, jobs);
+        user_lib::setfg(user_lib::getpid());
     }
 }
 
@@ -284,10 +305,11 @@ fn wait_pid() {
 }
 
 // pid-aware wait: reaps other (background) children into jobs table.
+// v0.5: uses waitpid(target) for precise reap.
 fn wait_foreground(pid: isize, jobs: &mut [isize; 8]) {
     let mut code: i32 = 0;
     loop {
-        let w = user_lib::wait(&mut code as *mut i32);
+        let w = user_lib::waitpid(pid, &mut code as *mut i32, 0);
         if w == -2 {
             user_lib::yield_();
             continue;
@@ -361,6 +383,9 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
         wait_foreground(bg, &mut jobs);
         user_lib::print("[TEST] bg PASS\n");
     }
+    // sleep coverage (blocking sleep, woken by timer)
+    user_lib::sleep(5);
+    user_lib::print("[TEST] sleep PASS\n");
     // kill coverage: spin child in user mode, kill it, expect -9
     {
         let k = user_lib::fork();
@@ -386,6 +411,144 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
             }
         }
     }
+    // ---- v0.5 coverage: chdir/getcwd, append, lseek, dup2, waitpid, fsstat ----
+    {
+        user_lib::mkdir(b"/WD\0".as_ptr());
+        // create /WD/F with "line1\n"
+        let fd = user_lib::open(
+            b"/WD/F\0".as_ptr(),
+            user_lib::O_CREATE | user_lib::O_TRUNC | 1,
+        );
+        if fd >= 0 {
+            let d = b"line1\n";
+            user_lib::write(fd, d.as_ptr(), d.len());
+            user_lib::close(fd);
+        }
+        // chdir + getcwd
+        let mut ok_chdir = false;
+        if user_lib::chdir(b"/WD\0".as_ptr()) == 0 {
+            let mut cb = [0u8; 128];
+            if user_lib::getcwd(cb.as_mut_ptr(), 128) > 0
+                && cb[0] == b'/' && cb[1] == b'W' && cb[2] == b'D' && cb[3] == 0
+            {
+                ok_chdir = true;
+            }
+        }
+        // relative open "F" (proves cwd-relative resolve)
+        let mut ok_rel = false;
+        let fr = user_lib::open(b"F\0".as_ptr(), 0);
+        if fr >= 0 {
+            let mut rb = [0u8; 6];
+            let n = user_lib::read(fr, rb.as_mut_ptr(), 6);
+            if n == 6 && rb == *b"line1\n" {
+                ok_rel = true;
+            }
+            user_lib::close(fr);
+        }
+        if ok_chdir && ok_rel {
+            user_lib::print("[TEST] chdir PASS\n");
+        } else {
+            user_lib::print("[TEST] chdir FAIL\n");
+        }
+        // append "line2\n" via relative path + O_APPEND
+        let fa = user_lib::open(b"F\0".as_ptr(), user_lib::O_CREATE | user_lib::O_APPEND | 1);
+        if fa >= 0 {
+            let d = b"line2\n";
+            user_lib::write(fa, d.as_ptr(), d.len());
+            user_lib::close(fa);
+        }
+        let mut ok_append = false;
+        let fr2 = user_lib::open(b"F\0".as_ptr(), 0);
+        if fr2 >= 0 {
+            let mut rb = [0u8; 12];
+            let n = user_lib::read(fr2, rb.as_mut_ptr(), 12);
+            if n == 12 && rb == *b"line1\nline2\n" {
+                ok_append = true;
+            }
+            user_lib::close(fr2);
+        }
+        if ok_append {
+            user_lib::print("[TEST] append PASS\n");
+        } else {
+            user_lib::print("[TEST] append FAIL\n");
+        }
+        // lseek: SET read first byte, END-1 read last byte
+        let mut ok_lseek = false;
+        let fl = user_lib::open(b"F\0".as_ptr(), 0);
+        if fl >= 0 {
+            let mut b1 = [0u8; 1];
+            let mut b2 = [0u8; 1];
+            user_lib::lseek(fl, 0, 0);
+            let n1 = user_lib::read(fl, b1.as_mut_ptr(), 1);
+            user_lib::lseek(fl, -1, 2);
+            let n2 = user_lib::read(fl, b2.as_mut_ptr(), 1);
+            if n1 == 1 && n2 == 1 && b1[0] == b'l' && b2[0] == b'\n' {
+                ok_lseek = true;
+            }
+            // dup2: alias fd 7, rewind via alias, read first byte
+            let mut ok_dup2 = false;
+            if user_lib::dup2(fl, 7) == 7 {
+                let mut b3 = [0u8; 1];
+                user_lib::lseek(7, 0, 0);
+                let n3 = user_lib::read(7, b3.as_mut_ptr(), 1);
+                if n3 == 1 && b3[0] == b'l' {
+                    ok_dup2 = true;
+                }
+                user_lib::close(7);
+            }
+            if ok_dup2 {
+                user_lib::print("[TEST] dup2 PASS\n");
+            } else {
+                user_lib::print("[TEST] dup2 FAIL\n");
+            }
+            user_lib::close(fl);
+        }
+        if ok_lseek {
+            user_lib::print("[TEST] lseek PASS\n");
+        } else {
+            user_lib::print("[TEST] lseek FAIL\n");
+        }
+        // waitpid: fast-exit child, precise reap + exit code
+        {
+            let k = user_lib::fork();
+            if k == 0 {
+                user_lib::exit(42);
+            } else if k > 0 {
+                let mut code: i32 = 0;
+                let mut ok_wp = false;
+                loop {
+                    let w = user_lib::waitpid(k, &mut code as *mut i32, 0);
+                    if w == -2 {
+                        user_lib::yield_();
+                        continue;
+                    }
+                    if w == k && code == 42 {
+                        ok_wp = true;
+                    }
+                    break;
+                }
+                if ok_wp {
+                    user_lib::print("[TEST] waitpid PASS\n");
+                } else {
+                    user_lib::print("[TEST] waitpid FAIL\n");
+                }
+            }
+        }
+        // fsstat/df
+        {
+            let mut sb = [0u8; 64];
+            let r = user_lib::fsstat(sb.as_mut_ptr(), 64);
+            if r > 6 && sb[0] == b't' && sb[1] == b'o' && sb[2] == b't' && sb[3] == b'a' && sb[4] == b'l' {
+                user_lib::print("[TEST] df PASS\n");
+            } else {
+                user_lib::print("[TEST] df FAIL\n");
+            }
+        }
+        // back to root for interactive prompt
+        user_lib::chdir(b"/\0".as_ptr());
+    }
+    // prompt runs as foreground for Ctrl-C
+    user_lib::setfg(user_lib::getpid());
     user_lib::print("sh$ ");
     let mut buf = [0u8; 128];
     loop {
@@ -414,6 +577,62 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
             }
             if !any {
                 user_lib::print("jobs: none\n");
+            }
+            user_lib::print("sh$ ");
+            continue;
+        }
+        // builtin: cd / pwd / df (v0.5)
+        if t.len() == 2 && t[0] == b'c' && t[1] == b'd' {
+            let r = user_lib::chdir(b"/\0".as_ptr());
+            if r != 0 {
+                user_lib::print("sh: cd failed\n");
+            }
+            user_lib::print("sh$ ");
+            continue;
+        }
+        if t.len() > 3 && t[0] == b'c' && t[1] == b'd' && t[2] == b' ' {
+            let arg = trim(&t[3..]);
+            let mut pb = [0u8; 128];
+            let m = arg.len().min(126);
+            pb[..m].copy_from_slice(&arg[..m]);
+            pb[m] = 0;
+            let r = user_lib::chdir(pb.as_ptr());
+            if r != 0 {
+                user_lib::print("sh: cd failed\n");
+            }
+            user_lib::print("sh$ ");
+            continue;
+        }
+        if t.len() == 3 && t[0] == b'p' && t[1] == b'w' && t[2] == b'd' {
+            let mut cb = [0u8; 128];
+            let r = user_lib::getcwd(cb.as_mut_ptr(), 128);
+            if r > 0 {
+                let mut n = 0;
+                while n < 127 && cb[n] != 0 {
+                    n += 1;
+                }
+                let s = unsafe { core::str::from_utf8_unchecked(&cb[..n]) };
+                user_lib::print(s);
+                user_lib::print("\n");
+            } else {
+                user_lib::print("sh: pwd failed\n");
+            }
+            user_lib::print("sh$ ");
+            continue;
+        }
+        if t.len() == 2 && t[0] == b'd' && t[1] == b'f' {
+            let mut sb = [0u8; 64];
+            let r = user_lib::fsstat(sb.as_mut_ptr(), 64);
+            if r > 0 {
+                let mut n = 0;
+                while n < 63 && sb[n] != 0 && sb[n] != b'\n' {
+                    n += 1;
+                }
+                let s = unsafe { core::str::from_utf8_unchecked(&sb[..n]) };
+                user_lib::print(s);
+                user_lib::print("\n");
+            } else {
+                user_lib::print("sh: df failed\n");
             }
             user_lib::print("sh$ ");
             continue;
