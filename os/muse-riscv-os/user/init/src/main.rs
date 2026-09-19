@@ -5,6 +5,8 @@ global_asm!(r#"
 .section .text.entry
 .globl _start
 _start:
+    ld a0, 0(sp)
+    addi a1, sp, 8
     call main
     li a0, 0
     li a7, 2
@@ -16,7 +18,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 #[no_mangle]
-pub extern "C" fn main() {
+pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     user_lib::print("[USER] init: starting sh\n");
     let sh = b"/bin/sh\0";
     loop {

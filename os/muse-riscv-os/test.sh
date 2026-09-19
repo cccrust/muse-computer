@@ -76,7 +76,13 @@ check "usertests PASS"
 check "VIRTIO"
 check "virtio-blk RW PASS"
 check "disk mount ok"
+check "fsck: bitmap rebuilt"
 check "persist WRITE PASS"
+check "link PASS"
+check "cat ARG PASS"
+check "hello-arg"
+check "bg PASS"
+check "kill PASS"
 if grep -q "PANIC" qemu.log; then
   echo "FAIL: PANIC found"; PASS=0
 else

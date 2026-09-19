@@ -4,6 +4,8 @@ use core::arch::global_asm;
 global_asm!(r#".section .text.entry
 .globl _start
 _start:
+    ld a0, 0(sp)
+    addi a1, sp, 8
     call main
     li a0, 0
     li a7, 2
@@ -63,7 +65,7 @@ fn show_dir(path: &[u8]) -> bool {
             full[L] = 0;
             let fd = user_lib::open(full.as_ptr(), 0);
             if fd >= 0 {
-                let mut st = [0u32; 2];
+                let mut st = [0u32; 3];
                 if user_lib::fstat(fd, st.as_mut_ptr()) == 0 && st[0] == 4 {
                     user_lib::print(" ok");
                 } else {
@@ -79,7 +81,7 @@ fn show_dir(path: &[u8]) -> bool {
 }
 
 #[no_mangle]
-pub extern "C" fn main() {
+pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     let mut ok = show_dir(b"/\0");
     if ok {
         ok = show_dir(b"/bin\0");

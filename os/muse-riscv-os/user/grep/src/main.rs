@@ -4,6 +4,8 @@ use core::arch::global_asm;
 global_asm!(r#".section .text.entry
 .globl _start
 _start:
+    ld a0, 0(sp)
+    addi a1, sp, 8
     call main
     li a0, 0
     li a7, 2
@@ -15,8 +17,16 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 #[no_mangle]
-pub extern "C" fn main() {
-    // grep hi: filter stdin for 'h'
+pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
+    // grep [pat]: filter stdin for pattern (default "h")
+    let mut pat = b"h".as_slice();
+    unsafe {
+        if let Some(s) = user_lib::argv_str(_argv, 1, _argc) {
+            if !s.is_empty() {
+                pat = s;
+            }
+        }
+    }
     let mut buf = [0u8; 512];
     let mut total = 0;
     loop {
@@ -34,10 +44,12 @@ pub extern "C" fn main() {
         }
     }
     let mut matched = false;
-    for i in 0..total {
-        if buf[i] == b'h' {
-            matched = true;
-            break;
+    if !pat.is_empty() && total >= pat.len() {
+        for i in 0..=total - pat.len() {
+            if &buf[i..i + pat.len()] == pat {
+                matched = true;
+                break;
+            }
         }
     }
     if matched {

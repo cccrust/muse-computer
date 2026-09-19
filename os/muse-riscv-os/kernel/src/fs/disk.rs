@@ -24,6 +24,7 @@ static mut BMAP_LBA: u32 = 0;
 static mut INO_LBA: u32 = 0;
 static mut NINODES: u32 = 0;
 static mut ROOT_INO: u32 = 1;
+static mut DATA_LBA: u32 = 0;
 
 fn r32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
@@ -41,12 +42,12 @@ pub fn mount() -> bool {
     crate::fs::blk::read(0, &mut sb);
     if &sb[..8] != MAGIC || r32(&sb, 8) != BLOCK as u32 {
         return false;
-    }
-    unsafe {
+    }    unsafe {
         NBLOCKS = r32(&sb, 12);
         BMAP_LBA = r32(&sb, 16);
         INO_LBA = r32(&sb, 24);
         NINODES = r32(&sb, 32);
+        DATA_LBA = r32(&sb, 36);
         ROOT_INO = r32(&sb, 40);
         if ROOT_INO == 0 {
             ROOT_INO = 1;
@@ -58,7 +59,102 @@ pub fn mount() -> bool {
     }
     MOUNTED.store(true, Ordering::Release);
     crate::println!("[FS] disk mount ok (MUSEFS01, {} blocks)", nblocks());
+    // fsck-lite: rebuild bitmap if dirty, then clear flag
+    let mut sb2 = [0u8; 512];
+    crate::fs::blk::read(0, &mut sb2);
+    if r32(&sb2, 48) != 0 {
+        rebuild_bitmap();
+        set_dirty(false);
+        crate::println!("[FS] fsck: bitmap rebuilt");
+    }
     true
+}
+
+/// Set superblock dirty flag (false = clean shutdown).
+pub fn set_dirty(v: bool) {
+    let mut sb = [0u8; 512];
+    crate::fs::blk::read(0, &mut sb);
+    w32(&mut sb, 48, if v { 1 } else { 0 });
+    crate::fs::blk::write(0, &sb);
+}
+
+/// Rebuild block bitmap from inode scan (fsck-lite).
+fn rebuild_bitmap() {
+    let nb = nblocks();
+    // clear bitmap area
+    let b0 = bmap_lba();
+    let b1 = b0 + ((nb / 8 + BLOCK as u32 - 1) / BLOCK as u32);
+    let zero = [0u8; 512];
+    let mut lb = b0;
+    while lb < b1 {
+        crate::fs::blk::write(lb, &zero);
+        lb += 1;
+    }
+    let mut mark = |lba: u32| {
+        let byte = (lba / 8) as usize;
+        let lb = bmap_lba() + (byte / BLOCK) as u32;
+        let off = byte % BLOCK;
+        let mut blk = [0u8; 512];
+        crate::fs::blk::read(lb, &mut blk);
+        blk[off] |= 1 << (lba % 8);
+        crate::fs::blk::write(lb, &blk);
+    };
+    // reserved: superblock + bitmap + inode table
+    let mut b = 0u32;
+    while b < data_start() {
+        mark(b);
+        b += 1;
+    }
+    // all inode data blocks
+    let mut ino = 1u32;
+    while ino <= ninodes() {
+        if let Some(rec) = get_ino_raw(ino) {
+            for i in 0..8 {
+                if rec.direct[i] != 0 {
+                    mark(rec.direct[i]);
+                }
+            }
+            if rec.indirect != 0 {
+                mark(rec.indirect);
+                let mut ib = [0u8; 512];
+                crate::fs::blk::read(rec.indirect, &mut ib);
+                let mut k = 0;
+                while k < BLOCK / 4 {
+                    let db = r32(&ib, k * 4);
+                    if db != 0 {
+                        mark(db);
+                    }
+                    k += 1;
+                }
+            }
+        }
+        ino += 1;
+    }
+}
+
+// raw inode read (no kind validation; used by rebuild)
+fn get_ino_raw(ino: u32) -> Option<Ino> {
+    if ino == 0 || ino > ninodes() {
+        return None;
+    }
+    let (lba, off) = ino_pos(ino);
+    let mut b = [0u8; 512];
+    crate::fs::blk::read(lba, &mut b);
+    if b[off] != KIND_FILE && b[off] != KIND_DIR {
+        return None;
+    }
+    let mut direct = [0u32; 8];
+    for i in 0..8 {
+        direct[i] = r32(&b, off + 8 + i * 4);
+    }
+    let nl = r32(&b, off + 44);
+    Some(Ino {
+        kind: b[off],
+        size: r32(&b, off + 4),
+        direct,
+        indirect: r32(&b, off + 40),
+        nlink: if nl == 0 { 1 } else { nl },
+    })
 }
 
 fn nblocks() -> u32 {
@@ -76,12 +172,16 @@ fn ninodes() -> u32 {
 fn root() -> u32 {
     unsafe { ROOT_INO }
 }
+fn data_start() -> u32 {
+    unsafe { DATA_LBA }
+}
 
 struct Ino {
     kind: u8,
     size: u32,
     direct: [u32; 8],
     indirect: u32,
+    nlink: u32,
 }
 
 fn ino_pos(ino: u32) -> (u32, usize) {
@@ -103,11 +203,14 @@ fn get_ino(ino: u32) -> Option<Ino> {
     for i in 0..8 {
         direct[i] = r32(&b, off + 8 + i * 4);
     }
+    // nlink at +44 (v2+); old images read 0 -> treat as 1
+    let nl = r32(&b, off + 44);
     Some(Ino {
         kind,
         size: r32(&b, off + 4),
         direct,
         indirect: r32(&b, off + 40),
+        nlink: if nl == 0 { 1 } else { nl },
     })
 }
 
@@ -122,6 +225,7 @@ fn put_ino(ino: u32, rec: &Ino) {
         w32(&mut b, off + 8 + i * 4, rec.direct[i]);
     }
     w32(&mut b, off + 40, rec.indirect);
+    w32(&mut b, off + 44, rec.nlink);
     crate::fs::blk::write(lba, &b);
 }
 
@@ -398,6 +502,7 @@ pub fn create_empty(path: &str) -> bool {
         crate::fs::blk::read(lba, &mut b);
         if b[off] == 0 {
             b[off] = KIND_FILE;
+            w32(&mut b, off + 44, 1); // nlink
             crate::fs::blk::write(lba, &b);
             new_ino = i;
             break;
@@ -507,6 +612,7 @@ pub fn mkdir(path: &str) -> bool {
         crate::fs::blk::read(lba, &mut b);
         if b[off] == 0 {
             b[off] = KIND_DIR;
+            w32(&mut b, off + 44, 1); // nlink
             crate::fs::blk::write(lba, &b);
             new_ino = i;
             break;
@@ -554,21 +660,59 @@ pub fn unlink(path: &str) -> bool {
                 *x = 0;
             }
             crate::fs::blk::write(b, &blk);
-            // free file blocks + inode
-            if let Some(crec) = get_ino(child) {
-                if crec.kind == KIND_FILE {
+            // drop one link; free blocks+inode only at last link
+            if let Some(mut crec) = get_ino(child) {
+                if crec.nlink > 1 {
+                    crec.nlink -= 1;
+                    put_ino(child, &crec);
+                } else if crec.kind == KIND_FILE {
                     free_ino_blocks(&crec);
+                    let (lba, off) = ino_pos(child);
+                    let mut ib = [0u8; 512];
+                    crate::fs::blk::read(lba, &mut ib);
+                    ib[off] = 0;
+                    crate::fs::blk::write(lba, &ib);
+                } else {
+                    // dir with nlink<=1: just clear inode
+                    let (lba, off) = ino_pos(child);
+                    let mut ib = [0u8; 512];
+                    crate::fs::blk::read(lba, &mut ib);
+                    ib[off] = 0;
+                    crate::fs::blk::write(lba, &ib);
                 }
-                let (lba, off) = ino_pos(child);
-                let mut ib = [0u8; 512];
-                crate::fs::blk::read(lba, &mut ib);
-                ib[off] = 0;
-                crate::fs::blk::write(lba, &ib);
             }
             return true;
         }
     }
     false
+}
+
+/// Hard link: new path points at old's inode. Old must be a file.
+pub fn link(old: &str, new: &str) -> bool {
+    let oino = match walk(old) {
+        Some(i) => i,
+        None => return false,
+    };
+    let mut orec = match get_ino(oino) {
+        Some(r) => r,
+        None => return false,
+    };
+    if orec.kind != KIND_FILE {
+        return false;
+    }
+    if walk(new).is_some() {
+        return false;
+    }
+    let (parent, name) = match split_parent(new) {
+        Some(x) => x,
+        None => return false,
+    };
+    if !dir_insert(parent, name, oino) {
+        return false;
+    }
+    orec.nlink += 1;
+    put_ino(oino, &orec);
+    true
 }
 
 pub fn exists(path: &str) -> bool {
@@ -587,14 +731,14 @@ pub fn file_len(path: &str) -> Option<usize> {
     Some(rec.size as usize)
 }
 
-/// (kind, size): kind 1=file 2=dir 0=missing
-pub fn stat(path: &str) -> (u8, u32) {
+/// (kind, size, nlink): kind 1=file 2=dir 0=missing
+pub fn stat(path: &str) -> (u8, u32, u32) {
     if path == "/" {
-        return (2, 0);
+        return (2, 0, 1);
     }
     match walk(path).and_then(get_ino) {
-        Some(r) if r.kind == KIND_FILE => (1, r.size),
-        Some(r) if r.kind == KIND_DIR => (2, r.size),
-        _ => (0, 0),
+        Some(r) if r.kind == KIND_FILE => (1, r.size, r.nlink),
+        Some(r) if r.kind == KIND_DIR => (2, r.size, r.nlink),
+        _ => (0, 0, 0),
     }
 }

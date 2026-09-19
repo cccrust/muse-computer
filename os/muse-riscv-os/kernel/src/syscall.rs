@@ -46,11 +46,11 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
             crate::timer::sleep_ticks(a0);
             0
         }
-        SYS_KILL => 0,
+        SYS_KILL => sys_kill(a0) as isize,
         SYS_MKDIR => sys_mkdir(a0) as isize,
         SYS_CHDIR => 0,
         SYS_MKNOD => 0,
-        SYS_LINK => 0,
+        SYS_LINK => sys_link(a0, a1) as isize,
         SYS_UNLINK => sys_unlink(a0) as isize,
         SYS_FSTAT => sys_fstat(a0 as i32, a1) as isize,
         SYS_YIELD => {
@@ -60,6 +60,10 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_GETDENTS => sys_getdents(a0, a1, a2) as isize,
         SYS_SHUTDOWN => {
             crate::println!("[SYS] shutdown");
+            if crate::fs::use_disk() {
+                crate::fs::disk::set_dirty(false);
+                crate::println!("[FS] marked clean");
+            }
             crate::sbi::shutdown();
         }
         _ => {
@@ -73,6 +77,14 @@ pub fn do_exit(code: i32) -> ! {
     let pid = crate::task::current_pid();
     crate::task::exit(pid, code);
     unreachable!()
+}
+
+fn sys_kill(pid: usize) -> isize {
+    if crate::task::kill(pid) {
+        0
+    } else {
+        -1
+    }
 }
 
 fn sys_fork() -> usize {
@@ -302,15 +314,34 @@ fn sys_pipe(uaddr: usize) -> isize {
     0
 }
 
-fn sys_exec(path_ptr: usize, _argv: usize) -> isize {
+fn sys_exec(path_ptr: usize, argv_ptr: usize) -> isize {
     unsafe {
         let path = match crate::fs::user_str(path_ptr) {
             Some(s) => s,
             None => return -1,
         };
+        // copy argv out of (soon replaced) user memory first
+        let mut args: Vec<Vec<u8>> = Vec::new();
+        if argv_ptr != 0 {
+            for i in 0..8 {
+                let p = *(argv_ptr as *const usize).add(i);
+                if p == 0 {
+                    break;
+                }
+                let mut v = Vec::new();
+                for k in 0..128 {
+                    let b = *((p as *const u8).add(k));
+                    if b == 0 {
+                        break;
+                    }
+                    v.push(b);
+                }
+                args.push(v);
+            }
+        }
         let pid = crate::task::current_pid();
-        crate::println!("[PROC] exec pid={} -> {}", pid, path);
-        if crate::task::exec(pid, &path) {
+        crate::println!("[PROC] exec pid={} -> {} (argc={})", pid, path, args.len());
+        if crate::task::exec(pid, &path, &args) {
             0
         } else {
             -1
@@ -375,8 +406,8 @@ fn sys_unlink(path_ptr: usize) -> isize {
     }
 }
 
-/// fstat(fd, out: *mut u32[2]) -> 0 ok / -1 err. out = [kind, size].
-/// kind: 1 stdin, 2 stdout/stderr, 4 file, 5/6 pipe.
+/// fstat(fd, out: *mut u32[3]) -> 0 ok / -1 err. out = [kind, size, nlink].
+/// kind: 1 stdin, 2 stdout/stderr/dir, 4 file, 5/6 pipe.
 fn sys_fstat(fd: i32, out: usize) -> isize {
     if out == 0 || fd < 0 || fd >= 16 {
         return -1;
@@ -388,23 +419,42 @@ fn sys_fstat(fd: i32, out: usize) -> isize {
             p.fd_off[fd as usize],
         )
     });
-    let (k, sz) = match kind {
-        1 => (1u32, 0u32),
-        2 => (2u32, 0u32),
+    let (k, sz, nl) = match kind {
+        1 => (1u32, 0u32, 1u32),
+        2 => (2u32, 0u32, 1u32),
         4 => {
             let path = fd_path_to_string(ipath);
-            let (dk, ds) = crate::fs::stat(&path);
-            (if dk == 2 { 2 } else { 4 }, ds)
+            let (dk, ds, dn) = crate::fs::stat(&path);
+            (if dk == 2 { 2 } else { 4 }, ds, dn)
         }
-        5 | 6 => (kind as u32, 0u32),
+        5 | 6 => (kind as u32, 0u32, 1u32),
         _ => return -1,
     };
     unsafe {
         let o = out as *mut u32;
         *o.add(0) = k;
         *o.add(1) = sz;
+        *o.add(2) = nl;
     }
     0
+}
+
+fn sys_link(old_ptr: usize, new_ptr: usize) -> isize {
+    unsafe {
+        let old = match crate::fs::user_str(old_ptr) {
+            Some(s) => s,
+            None => return -1,
+        };
+        let new = match crate::fs::user_str(new_ptr) {
+            Some(s) => s,
+            None => return -1,
+        };
+        if crate::fs::link(&old, &new) {
+            0
+        } else {
+            -1
+        }
+    }
 }
 
 /// getdents(path_ptr, buf, len): write NUL-separated names, return count.

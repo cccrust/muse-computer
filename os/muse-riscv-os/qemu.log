@@ -65,7 +65,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [BOOT] hart booted in S-mode, kernel @ 0x80200000
 [MM] heap init ok
 [MM] frame allocator ok
-[MM] root=0x80aac000
+[MM] root=0x80ab6000
 [MM] text mapped
 [MM] rodata mapped
 [MM] data mapped
@@ -80,19 +80,20 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [TEST] virtio-blk PASS
 [TEST] virtio-blk RW PASS
 [FS] disk mount ok (MUSEFS01, 8192 blocks)
+[FS] fsck: bitmap rebuilt
 [PROC] init pid=1
 [PROC] spawn init
 [TEST] boot markers ready
 [USER] init: starting sh
 [PROC] fork pid=1 -> child=2
-[PROC] exec pid=2 -> /bin/sh
+[PROC] exec pid=2 -> /bin/sh (argc=0)
 [USER] sh: Unix-v6 like shell. try: ls, cat /README, echo hi | grep hi, usertests
 [USER] sh: auto-run usertests
 [PROC] fork pid=2 -> child=3
-[PROC] exec pid=3 -> /bin/usertests
+[PROC] exec pid=3 -> /bin/usertests (argc=0)
 [USER] usertests: start
 [PROC] fork pid=3 -> child=4
-[PROC] exec pid=4 -> /bin/fork_test
+[PROC] exec pid=4 -> /bin/fork_test (argc=0)
 [PROC] fork pid=4 -> child=5
 [USER] fork_test child alive
 [USER] fork_test child sbrk ok
@@ -100,13 +101,13 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [TEST] fork PASS
 [PROC] pid=4 exited(0)
 [PROC] fork pid=3 -> child=6
-[PROC] exec pid=6 -> /bin/pipe_test
+[PROC] exec pid=6 -> /bin/pipe_test (argc=0)
 [PROC] fork pid=6 -> child=7
 [PROC] pid=7 exited(0)
 [TEST] pipe PASS
 [PROC] pid=6 exited(0)
 [PROC] fork pid=3 -> child=8
-[PROC] exec pid=8 -> /bin/ls
+[PROC] exec pid=8 -> /bin/ls (argc=0)
 /:
 bin/
 README ok
@@ -125,20 +126,63 @@ persist ok
 [TEST] ls PASS
 [PROC] pid=8 exited(0)
 [PROC] fork pid=3 -> child=9
-[PROC] exec pid=9 -> /bin/cat
+[PROC] exec pid=9 -> /bin/cat (argc=0)
 muse-riscv-os Unix-v6 like
 try: ls cat echo grep fork_test pipe_test usertests
 [TEST] cat PASS
 [PROC] pid=9 exited(0)
 [PROC] fork pid=3 -> child=10
-[PROC] exec pid=10 -> /bin/echo
+[PROC] exec pid=10 -> /bin/echo (argc=0)
 echo: hi from unix-v6
 [TEST] echo PASS
 [PROC] pid=10 exited(0)
 [TEST] usertests PASS
 [PROC] pid=3 exited(0)
 [PROC] fork pid=2 -> child=11
-[PROC] exec pid=11 -> /bin/persist
+[PROC] exec pid=11 -> /bin/persist (argc=0)
+[TEST] link PASS
 [TEST] persist WRITE PASS
 [PROC] pid=11 exited(0)
-sh$ qemu-system-riscv64: terminating on signal 15 from pid 97170 (<unknown process>)
+[PROC] fork pid=2 -> child=12
+[PROC] exec pid=12 -> /bin/cat (argc=2)
+PERSIST-v0.2-0123456789abcdef[TEST] cat ARG PASS
+[PROC] pid=12 exited(0)
+[PROC] fork pid=2 -> child=13
+[PROC] exec pid=13 -> /bin/echo (argc=2)
+hello-arg
+[TEST] echo PASS
+[PROC] pid=13 exited(0)
+[PROC] fork pid=2 -> child=14
+[bg] pipe_test &
+[PROC] fork pid=2 -> child=15
+[PROC] exec pid=14 -> /bin/pipe_test (argc=0)
+[PROC] fork pid=14 -> child=16
+[PROC] exec pid=15 -> /bin/ls (argc=1)
+/:
+bin/
+README ok
+TESTDATA ok
+/bin:
+init ok
+sh ok
+ls ok
+cat ok
+echo ok
+grep ok
+fork_test ok
+pipe_test[PROC] pid=16 exited(0)
+[TEST] pipe PASS
+[PROC] pid=14 exited(0)
+ ok
+usertests ok
+persist ok
+[TEST] fstat PASS
+[TEST] ls PASS
+[PROC] pid=15 exited(0)
+[bg] done
+[TEST] bg PASS
+[PROC] fork pid=2 -> child=17
+[PROC] pid=17 killed
+[PROC] pid=17 exited(-9)
+[TEST] kill PASS
+sh$ qemu-system-riscv64: terminating on signal 15 from pid 1322 (<unknown process>)

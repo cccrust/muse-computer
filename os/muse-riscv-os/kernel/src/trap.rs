@@ -74,6 +74,14 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
             match code {
                 8 => {
                     tfm.sepc += 4;
+                    // kill takes effect on entry (covers timer-only victims too)
+                    if crate::task::is_killed(crate::task::current_pid()) {
+                        crate::println!(
+                            "[PROC] pid={} killed",
+                            crate::task::current_pid()
+                        );
+                        crate::syscall::do_exit(-9);
+                    }
                     let id = tfm.syscall_id();
                     let a0 = tfm.arg(0);
                     let a1 = tfm.arg(1);

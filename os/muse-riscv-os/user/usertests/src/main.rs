@@ -4,6 +4,8 @@ use core::arch::global_asm;
 global_asm!(r#".section .text.entry
 .globl _start
 _start:
+    ld a0, 0(sp)
+    addi a1, sp, 8
     call main
     li a0, 0
     li a7, 2
@@ -34,7 +36,7 @@ fn run(path: &[u8]) {
 }
 
 #[no_mangle]
-pub extern "C" fn main() {
+pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     user_lib::print("[USER] usertests: start\n");
     run(b"/bin/fork_test\0");
     run(b"/bin/pipe_test\0");

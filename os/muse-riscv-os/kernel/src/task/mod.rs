@@ -39,6 +39,7 @@ pub struct Proc {
     pub fd_path: [u64; 16], // inode id for files
     pub children: Vec<usize>,
     pub name: [u8; 32],
+    pub killed: bool,
 }
 
 struct Sched {
@@ -131,11 +132,12 @@ fn finish_spawn(
         USER_STACK_PAGES * 4096,
         pt::PTE_R | pt::PTE_W,
     );
-    // init TF (via PA, identity)
+    // init TF (via PA, identity); empty argv on stack
+    let sp = push_args(root, &[]);
     unsafe {
         let tf = tf_pa as *mut TrapFrame;
         *tf = TrapFrame::empty();
-        (*tf).x[2] = USER_STACK_TOP;
+        (*tf).x[2] = sp;
         (*tf).sepc = entry;
         // SPP=0, SPIE=1, SUM=1
         (*tf).sstatus = (1 << 5) | (1 << 18);
@@ -181,6 +183,7 @@ fn finish_spawn(
         fd_kind: kind,
         fd_path: [0; 16],
         children: Vec::new(),
+        killed: false,
         name: nb,
     };
     s.procs[pid] = Some(proc);
@@ -239,6 +242,40 @@ fn write_byte_to(root: usize, va: usize, v: u8) {
     }
 }
 
+fn write_u64_to(root: usize, va: usize, v: u64) {
+    for k in 0..8 {
+        write_byte_to(root, va + k, (v >> (k * 8)) as u8);
+    }
+}
+
+/// Lay out argc/argv on the user stack (inactive root, via page walk).
+/// [sp]=argc u64, [sp+8..]=argv ptr array (NULL-terminated), strings above.
+/// Returns new sp (16B aligned). Stack pages must already be mapped.
+fn push_args(root: usize, args: &[Vec<u8>]) -> usize {
+    let argc = args.len().min(8);
+    let mut addrs = [0usize; 8];
+    let mut p = USER_STACK_TOP;
+    for i in 0..argc {
+        let n = args[i].len().min(127);
+        p -= n + 1;
+        for (k, &ch) in args[i].iter().take(n).enumerate() {
+            write_byte_to(root, p + k, ch);
+        }
+        write_byte_to(root, p + n, 0);
+        addrs[i] = p;
+    }
+    p &= !7usize;
+    p -= 8 * (argc + 1);
+    let argv_base = p;
+    for i in 0..argc {
+        write_u64_to(root, argv_base + i * 8, addrs[i] as u64);
+    }
+    write_u64_to(root, argv_base + argc * 8, 0);
+    p -= 8;
+    write_u64_to(root, p, argc as u64);
+    p & !15usize
+}
+
 /// Fork current process. Returns child pid. Caller sets child a0=0.
 pub fn fork(parent_pid: usize) -> usize {
     // gather parent info without holding lock across allocs
@@ -277,6 +314,7 @@ pub fn fork(parent_pid: usize) -> usize {
         fd_kind: p_kind,
         fd_path: p_path,
         children: Vec::new(),
+        killed: false,
         name: nb,
     };
     s.procs[child] = Some(proc);
@@ -288,8 +326,9 @@ pub fn fork(parent_pid: usize) -> usize {
     child
 }
 
-/// Exec path in current process. Returns entry or None.
-pub fn exec(pid: usize, path: &str) -> bool {
+/// Exec path in current process with argv. Args must already be copied out
+/// of user memory (address space is replaced here).
+pub fn exec(pid: usize, path: &str, args: &[Vec<u8>]) -> bool {
     let data = match crate::fs::read_file(path) {
         Some(d) => d,
         None => return false,
@@ -330,11 +369,12 @@ pub fn exec(pid: usize, path: &str) -> bool {
         USER_STACK_PAGES * 4096,
         pt::PTE_R | pt::PTE_W,
     );
-    // reset TF
+    // reset TF with argv on stack
+    let sp = push_args(new_root, args);
     unsafe {
         let tf = tf_pa as *mut TrapFrame;
         *tf = TrapFrame::empty();
-        (*tf).x[2] = USER_STACK_TOP;
+        (*tf).x[2] = sp;
         (*tf).sepc = info.entry;
         (*tf).sstatus = (1 << 5) | (1 << 18);
         (*tf).kernel_sp = crate::trap::trap_stack_top();
@@ -392,6 +432,26 @@ pub fn yield_now() {
     // called from trap context only (timer/syscall). Just set flag;
     // actual switch happens in schedule_point.
     set_yield_flag();
+}
+
+/// Mark target as killed; it exits with -9 on next trap.
+pub fn kill(pid: usize) -> bool {
+    let mut s = sched().lock();
+    match s.procs.get_mut(pid) {
+        Some(Some(p)) => {
+            if p.state == State::Zombie {
+                return false;
+            }
+            p.killed = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn is_killed(pid: usize) -> bool {
+    let s = sched().lock();
+    matches!(s.procs.get(pid), Some(Some(p)) if p.killed)
 }
 
 /// Called at end of trap handler with old TF ptr (VA).

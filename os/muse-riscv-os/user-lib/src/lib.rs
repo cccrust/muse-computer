@@ -30,6 +30,9 @@ pub fn wait(code_out: *mut i32) -> isize {
 pub fn pipe(fds: *mut i32) -> isize {
     ecall(4, fds as usize, 0, 0)
 }
+pub fn kill(pid: isize) -> isize {
+    ecall(8, pid as usize, 0, 0)
+}
 pub fn read(fd: isize, buf: *mut u8, len: usize) -> isize {
     ecall(5, fd as usize, buf as usize, len)
 }
@@ -73,9 +76,12 @@ pub fn shutdown() -> ! {
     ecall(23, 0, 0, 0);
     loop {}
 }
-/// fstat(fd, out: *mut u32[2]) -> out = [kind, size]
+/// fstat(fd, out: *mut u32[3]) -> out = [kind, size, nlink]
 pub fn fstat(fd: isize, out: *mut u32) -> isize {
     ecall(20, fd as usize, out as usize, 0)
+}
+pub fn link(old: *const u8, new: *const u8) -> isize {
+    ecall(18, old as usize, new as usize, 0)
 }
 
 pub fn print(s: &str) {
@@ -103,4 +109,24 @@ pub fn read_line(buf: &mut [u8]) -> usize {
         }
     }
     n
+}
+
+/// argv[i] as byte slice (NUL-terminated, cap 256). Bounds/NULL safe.
+pub unsafe fn argv_str(
+    argv: *const *const u8,
+    i: usize,
+    argc: usize,
+) -> Option<&'static [u8]> {
+    if i >= argc || argv.is_null() {
+        return None;
+    }
+    let p = *argv.add(i);
+    if p.is_null() {
+        return None;
+    }
+    let mut n = 0;
+    while n < 256 && *p.add(n) != 0 {
+        n += 1;
+    }
+    Some(core::slice::from_raw_parts(p, n))
 }

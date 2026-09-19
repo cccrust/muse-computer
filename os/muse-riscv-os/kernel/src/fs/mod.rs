@@ -132,19 +132,37 @@ pub fn file_len(path: &str) -> Option<usize> {
     }
 }
 
-pub fn stat(path: &str) -> (u8, u32) {
+pub fn stat(path: &str) -> (u8, u32, u32) {
     if use_disk() {
         disk::stat(path)
     } else {
         match ramfs::read_file(path) {
-            Some(d) => (1, d.len() as u32),
+            Some(d) => (1, d.len() as u32, 1),
             None => {
                 if ramfs::exists(path) {
-                    (2, 0)
+                    (2, 0, 1)
                 } else {
-                    (0, 0)
+                    (0, 0, 0)
                 }
             }
+        }
+    }
+}
+
+pub fn link(old: &str, new: &str) -> bool {
+    if use_disk() {
+        disk::link(old, new)
+    } else {
+        // ramfs: copy content (no shared inode)
+        if ramfs::read_file(new).is_some() || ramfs::exists(new) {
+            return false;
+        }
+        match ramfs::read_file(old) {
+            Some(d) => {
+                ramfs::write_file(new, &d);
+                true
+            }
+            None => false,
         }
     }
 }

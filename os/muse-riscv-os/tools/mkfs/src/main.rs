@@ -50,6 +50,8 @@ impl Image {
         w32(sb, 32, ninodes);
         w32(sb, 36, data_lba);
         w32(sb, 40, ROOT_INO);
+        w32(sb, 44, 2); // version 2: nlink field present
+        w32(sb, 48, 1); // dirty: needs bitmap check on first mount
         // mark reserved blocks used: 0..data_lba
         for b in 0..data_lba {
             img.set_used(b);
@@ -102,6 +104,7 @@ impl Image {
         self.data[o] = kind;
         self.data[o + 1..o + 4].copy_from_slice(&[0; 3]);
         w32(&mut self.data, o + 4, size);
+        w32(&mut self.data, o + 44, 1); // nlink = 1
         // direct/indirect already zero
     }
     fn inode_alloc(&mut self, kind: u8) -> u32 {
@@ -307,6 +310,12 @@ mod tests {
         let big = vec![0xabu8; 3000]; // multi-block incl. still direct
         img.add_file(2, "big", &big);
         assert!(img.check_magic());
+        // version 2 + nlink present
+        assert_eq!(r32(&img.data, 44), 2);
+        assert_eq!(r32(&img.data, 48), 1); // dirty: first mount rebuilds
+        let hello_ino = img.lookup(2, "hello").unwrap();
+        let ho = Image::ino_off(hello_ino);
+        assert_eq!(r32(&img.data, ho + 44), 1);
         assert_eq!(img.read_file(2, "hello").unwrap(), b"hello world");
         assert_eq!(img.read_file(1, "README").unwrap(), b"readme!");
         assert_eq!(img.read_file(2, "big").unwrap(), big);

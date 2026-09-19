@@ -4,6 +4,8 @@ use core::arch::global_asm;
 global_asm!(r#".section .text.entry
 .globl _start
 _start:
+    ld a0, 0(sp)
+    addi a1, sp, 8
     call main
     li a0, 0
     li a7, 2
@@ -15,7 +17,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 #[no_mangle]
-pub extern "C" fn main() {
+pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     let me = user_lib::getpid();
     let pid = user_lib::fork();
     if pid == 0 {
