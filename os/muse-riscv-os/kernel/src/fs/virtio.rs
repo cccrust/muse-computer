@@ -41,6 +41,8 @@ static mut AVAIL_IDX: u16 = 0;
 static mut LAST_USED: u16 = 0;
 static mut READY: bool = false;
 static mut NCAP: u64 = 0;
+// v0.6: completion-interrupt stats
+static mut IRQ_COUNT: u64 = 0;
 
 // single-flight request buffers (identity-mapped .bss, whole RAM mapped)
 static mut HDR: [u8; 16] = [0; 16];
@@ -207,18 +209,57 @@ unsafe fn submit(write: bool, lba: u32) -> bool {
     w16(a + 2, AVAIL_IDX);
     fence();
     w32(R_QNOTIFY, 0);
-    // poll used idx
+    // ---- completion wait (v0.6 hybrid) ----
     let u = used_pa();
+    // fast path: brief poll (covers boot + already-done device)
     let mut spins = 0u32;
-    loop {
+    while r16(u + 2) == LAST_USED && spins < 5000 {
         fence();
-        let idx = r16(u + 2);
-        if idx != LAST_USED {
-            break;
-        }
         spins += 1;
-        if spins > 20_000_000 {
-            return false;
+    }
+    if r16(u + 2) == LAST_USED {
+        if crate::task::scheduler_active() {
+            // running system: block until the completion ISR (or the
+            // timer-tick watchdog, see trap.rs) wakes us. The deadline is
+            // re-checked on every wake -- a sleeper cannot check time
+            // itself -- then we fall back to bounded poll (no hang even
+            // if the IRQ is lost entirely).
+            let deadline = crate::timer::ticks().wrapping_add(500);
+            loop {
+                fence();
+                if r16(u + 2) != LAST_USED {
+                    break;
+                }
+                if crate::timer::ticks() >= deadline {
+                    break;
+                }
+                crate::task::block_current(crate::task::BLOCK_VIRTIO, 0);
+                crate::task::yield_now();
+            }
+            let mut s2 = 0u32;
+            loop {
+                fence();
+                if r16(u + 2) != LAST_USED {
+                    break;
+                }
+                s2 += 1;
+                if s2 > 20_000_000 {
+                    return false;
+                }
+            }
+        } else {
+            // boot (kernel context, SIE=0 so no ISR can fire): pure poll
+            let mut s2 = 0u32;
+            loop {
+                fence();
+                if r16(u + 2) != LAST_USED {
+                    break;
+                }
+                s2 += 1;
+                if s2 > 20_000_000 {
+                    return false;
+                }
+            }
         }
     }
     fence();
@@ -229,6 +270,27 @@ unsafe fn submit(write: bool, lba: u32) -> bool {
     w32(R_INTACK, r32(R_INTSTAT));
     fence();
     id == 0 && STB[0] == 0
+}
+
+/// v0.6: completion ISR. Call from the external trap for PLIC IRQ 1.
+/// Acks a pending used-ring update (if still un-acked) and wakes blocked
+/// submitters. NOTE: the fast path / tick watchdog usually consumes+acks
+/// first, so this mostly observes INTSTAT==0; the delivery marker lives
+/// on the claim side (trap.rs).
+pub fn on_irq() {
+    unsafe {
+        let st = r32(R_INTSTAT);
+        if st & 1 != 0 {
+            IRQ_COUNT = IRQ_COUNT.wrapping_add(1);
+            w32(R_INTACK, st);
+            fence();
+        }
+    }
+    crate::task::wake_virtio();
+}
+
+pub fn irq_count() -> u64 {
+    unsafe { IRQ_COUNT }
 }
 
 /// Read one 512B sector.

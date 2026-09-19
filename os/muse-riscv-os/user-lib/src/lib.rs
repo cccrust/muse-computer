@@ -116,6 +116,23 @@ pub fn fsstat(buf: *mut u8, len: usize) -> isize {
     ecall(29, buf as usize, len, 0)
 }
 
+/// v0.8: anonymous mmap/munmap (SYS_MMAP=30, SYS_MUNMAP=31).
+/// prot bit0=R, bit1=W (0 => R|W). Returns base address or -1.
+pub fn mmap(hint: usize, len: usize, prot: usize) -> isize {
+    ecall(30, hint, len, prot)
+}
+pub fn munmap(addr: usize, len: usize) -> isize {
+    ecall(31, addr, len, 0)
+}
+
+/// v0.9: ps(buf, len) fills "pid ppid state brk cwd\n" lines; trace(pid, on).
+pub fn ps(buf: *mut u8, len: usize) -> isize {
+    ecall(32, buf as usize, len, 0)
+}
+pub fn trace(pid: isize, on: usize) -> isize {
+    ecall(33, pid as usize, on, 0)
+}
+
 /// open flags (must match kernel sys_open)
 pub const O_CREATE: i32 = 0x40;
 pub const O_TRUNC: i32 = 0x200;

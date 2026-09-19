@@ -5,7 +5,11 @@ const UART_BASE: usize = 0x1000_0000;
 // 16550A offsets
 const R_RBR: usize = 0; // rx (read) / thr (write)
 const R_IER: usize = 1; // interrupt enable
+const R_IIR: usize = 2; // interrupt ident (read)
 const R_LSR: usize = 5; // line status
+
+const IER_RX: u8 = 1;
+const IER_TX: u8 = 1 << 1;
 
 const LSR_RX_READY: u8 = 1;
 const LSR_TX_EMPTY: u8 = 1 << 5;
@@ -21,15 +25,121 @@ pub fn init() {}
 pub fn irq_enable() {
     unsafe {
         let ier = core::ptr::read_volatile(reg(R_IER));
-        core::ptr::write_volatile(reg(R_IER), ier | 1);
+        core::ptr::write_volatile(reg(R_IER), ier | IER_RX);
+    }
+}
+
+/// Enable TX-empty interrupt path. Before this, putchar() polls.
+pub fn tx_enable() {
+    unsafe {
+        TX_ON = true;
     }
 }
 
 pub fn putchar(c: u8) {
+    if !unsafe { TX_ON } {
+        // early boot: poll
+        unsafe {
+            while core::ptr::read_volatile(reg(R_LSR)) & LSR_TX_EMPTY == 0 {}
+            core::ptr::write_volatile(reg(R_RBR), c);
+        }
+        return;
+    }
+    let full = {
+        let mut g = TX.lock();
+        if g.n < TX_CAP {
+            let w = g.w;
+            g.buf[w] = c;
+            g.w = (w + 1) % TX_CAP;
+            g.n += 1;
+            false
+        } else {
+            true
+        }
+    };
+    if full {
+        // ring full: poll-write one byte directly (hardware always drains)
+        unsafe {
+            while core::ptr::read_volatile(reg(R_LSR)) & LSR_TX_EMPTY == 0 {}
+            core::ptr::write_volatile(reg(R_RBR), c);
+        }
+        return;
+    }
     unsafe {
-        // THR offset 0; LSR bit5 = THR empty
-        while core::ptr::read_volatile(reg(R_LSR)) & LSR_TX_EMPTY == 0 {}
-        core::ptr::write_volatile(reg(R_RBR), c);
+        // arm THRE interrupt, then kick the chain if THR is already empty
+        let ier = core::ptr::read_volatile(reg(R_IER));
+        core::ptr::write_volatile(reg(R_IER), ier | IER_TX);
+        if core::ptr::read_volatile(reg(R_LSR)) & LSR_TX_EMPTY != 0 {
+            if let Some(b) = tx_pop() {
+                core::ptr::write_volatile(reg(R_RBR), b);
+            }
+        }
+    }
+}
+
+// ---- TX ring (drained by THRE ISR, v0.6) ----
+const TX_CAP: usize = 512;
+
+struct TxRing {
+    buf: [u8; TX_CAP],
+    r: usize,
+    w: usize,
+    n: usize,
+}
+
+static TX: SpinMutex<TxRing> = SpinMutex::new(TxRing {
+    buf: [0; TX_CAP],
+    r: 0,
+    w: 0,
+    n: 0,
+});
+
+static mut TX_ON: bool = false;
+static mut TX_MARKED: bool = false;
+
+fn tx_pop() -> Option<u8> {
+    let mut g = TX.lock();
+    if g.n == 0 {
+        return None;
+    }
+    let c = g.buf[g.r];
+    g.r = (g.r + 1) % TX_CAP;
+    g.n -= 1;
+    Some(c)
+}
+
+/// THRE ISR: move ring bytes to THR while it is empty. Disarms the THRE
+/// IRQ when the ring runs dry (16550 THRE is level-ish: leaving it armed
+/// with an empty ring + empty THR would trap on every return to user).
+fn tx_drain() {
+    // first THRE entry proves TX-empty IRQ delivery (the kick path may have
+    // already moved the bytes, so don't gate the marker on moved > 0)
+    if !unsafe { TX_MARKED } {
+        unsafe {
+            TX_MARKED = true;
+        }
+        crate::println!("[TEST] uart-tx-irq PASS");
+    }
+    loop {
+        unsafe {
+            if core::ptr::read_volatile(reg(R_LSR)) & LSR_TX_EMPTY == 0 {
+                break;
+            }
+        }
+        match tx_pop() {
+            Some(b) => {
+                unsafe {
+                    core::ptr::write_volatile(reg(R_RBR), b);
+                }
+            }
+            None => {
+                unsafe {
+                    let ier = core::ptr::read_volatile(reg(R_IER));
+                    core::ptr::write_volatile(reg(R_IER), ier & !IER_TX);
+                }
+                break;
+            }
+        }
     }
 }
 
@@ -81,9 +191,50 @@ pub fn take_eof() -> bool {
     v
 }
 
-/// UART ISR: drain hardware FIFO. Ctrl-C kills foreground, Ctrl-D = EOF.
+/// UART ISR: IIR-dispatched. RX fills the input ring (Ctrl-C kills
+/// foreground, Ctrl-D = EOF); THRE drains the TX ring.
 pub fn on_irq() {
     let mut woke = false;
+    let mut n = 0u32;
+    loop {
+        let iir = unsafe { core::ptr::read_volatile(reg(R_IIR)) };
+        if iir & 1 == 1 {
+            break; // no interrupt pending
+        }
+        match (iir >> 1) & 0x7 {
+            0x2 => tx_drain(), // THR empty
+            0x4 | 0xC => {
+                rx_drain();
+                woke = true;
+            }
+            0x6 => {
+                // receiver line status: read LSR to clear
+                unsafe {
+                    core::ptr::read_volatile(reg(R_LSR));
+                }
+            }
+            _ => break,
+        }
+        n += 1;
+        if n > 64 {
+            break;
+        }
+    }
+    // LSR fallback: an RX byte visible without IIR (shouldn't happen,
+    // but keeps the old polling-drain behavior as insurance).
+    unsafe {
+        if core::ptr::read_volatile(reg(R_LSR)) & LSR_RX_READY != 0 {
+            rx_drain();
+            woke = true;
+        }
+    }
+    if woke {
+        crate::task::wake_stdin();
+    }
+}
+
+/// RX drain: move hardware FIFO to the input ring.
+fn rx_drain() {
     loop {
         unsafe {
             if core::ptr::read_volatile(reg(R_LSR)) & LSR_RX_READY == 0 {
@@ -98,16 +249,11 @@ pub fn on_irq() {
             } else if c == 0x04 {
                 // Ctrl-D
                 RING.lock().eof = true;
-                woke = true;
             } else {
                 // translate CR -> LF for terminal friendliness
                 push(if c == b'\r' { b'\n' } else { c });
-                woke = true;
             }
         }
-    }
-    if woke {
-        crate::task::wake_stdin();
     }
 }
 

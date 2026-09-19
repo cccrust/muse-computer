@@ -73,7 +73,9 @@ check "spawn init"
 check "fork PASS"
 check "pipe PASS"
 check "usertests PASS"
+check "mmap PASS"
 check "VIRTIO"
+check "virtio-irq PASS"
 check "virtio-blk RW PASS"
 check "disk mount ok"
 check "fsck: bitmap rebuilt"
@@ -90,6 +92,12 @@ check "lseek PASS"
 check "dup2 PASS"
 check "waitpid PASS"
 check "df PASS"
+check "quote PASS"
+check "env PASS"
+check "fg PASS"
+check "history PASS"
+check "ps PASS"
+check "STRACE"
 if grep -q "PANIC" qemu.log; then
   echo "FAIL: PANIC found"; PASS=0
 else
@@ -157,6 +165,21 @@ else
     echo "OK: halted cleanly"
   else
     echo "FAIL: missing [halting]";
+    PASS=0
+  fi
+  # v0.10: cache stats print on clean shutdown (numbers vary; presence only)
+  if grep -q "cache stats" qemu3.log; then
+    echo "OK: cache stats (run3)"
+  else
+    echo "FAIL: missing [cache stats] in qemu3.log";
+    PASS=0
+  fi
+  # v0.6: THRE delivery is only observable when an external trap claims it;
+  # run3's RX traffic (Ctrl-C + halt) forces claim passes (see _doc/v0.6.md)
+  if grep -q "uart-tx-irq PASS" qemu3.log; then
+    echo "OK: uart-tx-irq delivered (run3)"
+  else
+    echo "FAIL: missing [uart-tx-irq PASS] in qemu3.log";
     PASS=0
   fi
   if grep -q "PANIC" qemu3.log; then

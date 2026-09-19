@@ -160,6 +160,40 @@ fn ensure_next(root: usize, idx: usize) -> usize {
     }
 }
 
+/// Unmap one user page. Only clears U leaves (never kernel mappings).
+/// Returns the freed PA (caller decides whether to dealloc). sfence included.
+pub fn unmap_page(root_pa: usize, va: usize) -> Option<usize> {
+    let mut cur = root_pa;
+    for level in [2, 1].iter().cloned() {
+        let idx = vpn(va, level);
+        unsafe {
+            let t = table_at(cur);
+            let e = *t.add(idx);
+            if e & PTE_V == 0 {
+                return None;
+            }
+            if e & (PTE_R | PTE_W | PTE_X) != 0 {
+                return None; // unexpected mid-level leaf
+            }
+            cur = pte_pa(e);
+        }
+    }
+    let idx = vpn(va, 0);
+    unsafe {
+        let t = table_at(cur);
+        let e = *t.add(idx);
+        if e & PTE_V == 0 || e & PTE_U == 0 {
+            return None;
+        }
+        if e & (PTE_R | PTE_W | PTE_X) == 0 {
+            return None; // table pointer where leaf expected
+        }
+        *t.add(idx) = 0;
+        core::arch::asm!("sfence.vma");
+        Some(pte_pa(e))
+    }
+}
+
 pub fn activate(root_pa: usize) {
     let satp = (8usize << 60) | (root_pa >> 12);
     unsafe {

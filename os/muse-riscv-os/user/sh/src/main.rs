@@ -18,7 +18,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
+fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8], env: &Env) {
     // trim \n
     let mut end = n;
     while end > 0 && (line[end - 1] == b'\n' || line[end - 1] == b'\r' || line[end - 1] == b' ') {
@@ -28,69 +28,71 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
         return;
     }
     let cmd = &line[..end];
-    // check pipe '|'
-    let mut pipe_at: Option<usize> = None;
-    for i in 0..end {
-        if cmd[i] == b'|' {
-            pipe_at = Some(i);
-            break;
-        }
-    }
-    if let Some(p) = pipe_at {
-        run_pipe(&cmd[..p], &cmd[p + 1..], jobs);
+    // check pipe '|' (quote-aware, v0.7)
+    if let Some(p) = find_unquoted(cmd, b'|') {
+        run_pipe(&cmd[..p], &cmd[p + 1..], jobs, env);
         return;
     }
     // redirection: prog > file / prog >> file (append) / prog < file
     //   prog 2> file / prog 2>> file (stderr). single file, no pipe combo.
+    // v0.7: operator scan is quote-aware; quoted filenames with spaces
+    // are NOT supported (name runs to next space as before).
     let mut redir_out: Option<&[u8]> = None;
     let mut redir_in: Option<&[u8]> = None;
     let mut append_out = false;
     let mut redir_fd: isize = 1;
     let mut core_end = end;
-    for i in 0..end {
-        if cmd[i] == b'>' {
-            let mut j = i + 1;
-            if j < end && cmd[j] == b'>' {
-                append_out = true;
-                j += 1;
-            }
-            let f = trim(&cmd[j..end]);
-            // filename = up to next space
-            let mut fl = f.len();
-            for k in 0..f.len() {
-                if f[k] == b' ' {
-                    fl = k;
-                    break;
-                }
-            }
-            redir_out = Some(&f[..fl]);
-            // trailing "2>" means stderr
-            if i > 0 && cmd[i - 1] == b'2' && (i == 1 || cmd[i - 2] == b' ') {
-                redir_fd = 2;
-                core_end = i - 1;
-            } else {
-                core_end = i;
-            }
-            break;
+    // first unquoted operator wins (either direction), as before
+    let gt = find_unquoted(cmd, b'>');
+    let lt = find_unquoted(cmd, b'<');
+    let use_out = match (gt, lt) {
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (Some(g), Some(l)) => g < l,
+        (None, None) => false,
+    };
+    if gt.is_some() && use_out {
+        let i = gt.unwrap();
+        let mut j = i + 1;
+        if j < end && cmd[j] == b'>' {
+            append_out = true;
+            j += 1;
         }
-        if cmd[i] == b'<' {
-            let f = trim(&cmd[i + 1..end]);
-            let mut fl = f.len();
-            for k in 0..f.len() {
-                if f[k] == b' ' {
-                    fl = k;
-                    break;
-                }
+        let f = trim(&cmd[j..end]);
+        // filename = up to next space
+        let mut fl = f.len();
+        for k in 0..f.len() {
+            if f[k] == b' ' {
+                fl = k;
+                break;
             }
-            redir_in = Some(&f[..fl]);
+        }
+        redir_out = Some(&f[..fl]);
+        // trailing "2>" means stderr
+        if i > 0 && cmd[i - 1] == b'2' && (i == 1 || cmd[i - 2] == b' ') {
+            redir_fd = 2;
+            core_end = i - 1;
+        } else {
             core_end = i;
-            break;
         }
+    } else if lt.is_some() {
+        let i = lt.unwrap();
+        let f = trim(&cmd[i + 1..end]);
+        // filename = up to next space
+        let mut fl = f.len();
+        for k in 0..f.len() {
+            if f[k] == b' ' {
+                fl = k;
+                break;
+            }
+        }
+        redir_in = Some(&f[..fl]);
+        core_end = i;
     }
     let core = trim(&cmd[..core_end]);
     // tokenize core into argv
     let mut toks = [[0u8; 64]; 8];
-    let ntok = tokenize(core, &mut toks);
+    let ntok = tokenize_env(core, &mut toks, env);
     if ntok == 0 {
         return;
     }
@@ -141,6 +143,12 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
         let _ = user_lib::exec(path.as_ptr(), av.as_ptr() as usize);
         // try token itself as path (e.g. absolute path typed)
         let _ = user_lib::exec(toks[0].as_ptr(), av.as_ptr() as usize);
+        // v0.9: output-only builtin fallback so run_capture("ps") works
+        // (stateful builtins like cd/export stay prompt-only)
+        if ntok == 1 && toks[0][0] == b'p' && toks[0][1] == b's' && toks[0][2] == 0 {
+            builtin_ps();
+            user_lib::exit(0);
+        }
         user_lib::print("sh: exec failed\n");
         user_lib::exit(-1);
     } else if pid > 0 {
@@ -150,7 +158,7 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
     }
 }
 
-fn run_pipe(left: &[u8], right: &[u8], jobs: &mut [isize; 8]) {
+fn run_pipe(left: &[u8], right: &[u8], jobs: &mut [isize; 8], env: &Env) {
     let mut fds = [0i32; 2];
     if user_lib::pipe(fds.as_mut_ptr()) != 0 {
         user_lib::print("sh: pipe failed\n");
@@ -164,7 +172,7 @@ fn run_pipe(left: &[u8], right: &[u8], jobs: &mut [isize; 8]) {
         user_lib::dup2(fds[1] as isize, 1);
         user_lib::close(fds[0] as isize);
         user_lib::close(fds[1] as isize);
-        exec_simple(l);
+        exec_simple(l, env);
         user_lib::exit(-1);
     }
     let p2 = user_lib::fork();
@@ -172,7 +180,7 @@ fn run_pipe(left: &[u8], right: &[u8], jobs: &mut [isize; 8]) {
         user_lib::dup2(fds[0] as isize, 0);
         user_lib::close(fds[0] as isize);
         user_lib::close(fds[1] as isize);
-        exec_simple(r);
+        exec_simple(r, env);
         user_lib::exit(-1);
     }
     user_lib::close(fds[0] as isize);
@@ -195,8 +203,115 @@ fn trim(s: &[u8]) -> &[u8] {
     &s[a..b]
 }
 
-// split s into up to 8 NUL-terminated tokens; returns count.
-fn tokenize(s: &[u8], toks: &mut [[u8; 64]]) -> usize {
+// ---- v0.7: shell-local environment (16 entries, passed by ref, no globals)
+struct Env {
+    n: usize,
+    names: [[u8; 32]; 16],
+    nlen: [usize; 16],
+    vals: [[u8; 64]; 16],
+    vlen: [usize; 16],
+}
+
+impl Env {
+    fn new() -> Self {
+        Self {
+            n: 0,
+            names: [[0; 32]; 16],
+            nlen: [0; 16],
+            vals: [[0; 64]; 16],
+            vlen: [0; 16],
+        }
+    }
+    fn get(&self, name: &[u8]) -> Option<&[u8]> {
+        for i in 0..self.n {
+            if &self.names[i][..self.nlen[i]] == name {
+                return Some(&self.vals[i][..self.vlen[i]]);
+            }
+        }
+        None
+    }
+    fn set(&mut self, name: &[u8], val: &[u8]) -> bool {
+        if name.is_empty() || name.len() > 31 || val.len() > 63 {
+            return false;
+        }
+        for i in 0..self.n {
+            if &self.names[i][..self.nlen[i]] == name {
+                self.vals[i][..val.len()].copy_from_slice(val);
+                self.vlen[i] = val.len();
+                return true;
+            }
+        }
+        if self.n >= 16 {
+            return false;
+        }
+        let i = self.n;
+        self.names[i][..name.len()].copy_from_slice(name);
+        self.nlen[i] = name.len();
+        self.vals[i][..val.len()].copy_from_slice(val);
+        self.vlen[i] = val.len();
+        self.n += 1;
+        true
+    }
+    fn unset(&mut self, name: &[u8]) -> bool {
+        for i in 0..self.n {
+            if &self.names[i][..self.nlen[i]] == name {
+                // swap-remove with last
+                let l = self.n - 1;
+                if i != l {
+                    self.names[i] = self.names[l];
+                    self.nlen[i] = self.nlen[l];
+                    self.vals[i] = self.vals[l];
+                    self.vlen[i] = self.vlen[l];
+                }
+                self.n -= 1;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn is_name_byte(b: u8) -> bool {
+    (b >= b'a' && b <= b'z')
+        || (b >= b'A' && b <= b'Z')
+        || (b >= b'0' && b <= b'9')
+        || b == b'_'
+}
+
+// first index of `target` outside quotes/backslash-escape. None if absent.
+fn find_unquoted(s: &[u8], target: u8) -> Option<usize> {
+    let mut q = 0u8; // 0 none, 1 single, 2 double
+    let mut i = 0;
+    while i < s.len() {
+        let b = s[i];
+        if q == 1 {
+            if b == b'\'' {
+                q = 0;
+            }
+        } else if q == 2 {
+            if b == b'"' {
+                q = 0;
+            } else if b == b'\\' {
+                i += 1;
+            }
+        } else if b == b'\'' {
+            q = 1;
+        } else if b == b'"' {
+            q = 2;
+        } else if b == b'\\' {
+            i += 1;
+        } else if b == target {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+// split s into up to 8 NUL-terminated tokens with quote/$VAR/backslash
+// handling (v0.7). Returns count. Redirection filenames with quoted spaces
+// are NOT supported (only argv quoting); see _doc/v0.7.md.
+fn tokenize_env(s: &[u8], toks: &mut [[u8; 64]], env: &Env) -> usize {
     let mut n = 0;
     let mut i = 0;
     while i < s.len() && n < 8 {
@@ -207,18 +322,112 @@ fn tokenize(s: &[u8], toks: &mut [[u8; 64]]) -> usize {
             break;
         }
         let mut l = 0;
-        while i < s.len() && s[i] != b' ' && l < 62 {
-            toks[n][l] = s[i];
-            l += 1;
-            i += 1;
+        let mut q = 0u8;
+        while i < s.len() && l < 62 {
+            let b = s[i];
+            if q == 1 {
+                if b == b'\'' {
+                    q = 0;
+                } else {
+                    toks[n][l] = b;
+                    l += 1;
+                }
+                i += 1;
+            } else if q == 2 {
+                if b == b'"' {
+                    q = 0;
+                    i += 1;
+                } else if b == b'\\' && i + 1 < s.len() {
+                    i += 1;
+                    toks[n][l] = s[i];
+                    l += 1;
+                    i += 1;
+                } else if b == b'$' {
+                    i = expand_var(s, i, toks, n, &mut l, env);
+                } else {
+                    toks[n][l] = b;
+                    l += 1;
+                    i += 1;
+                }
+            } else if b == b' ' {
+                break;
+            } else if b == b'\'' {
+                q = 1;
+                i += 1;
+            } else if b == b'"' {
+                q = 2;
+                i += 1;
+            } else if b == b'\\' && i + 1 < s.len() {
+                i += 1;
+                toks[n][l] = s[i];
+                l += 1;
+                i += 1;
+            } else if b == b'$' {
+                i = expand_var(s, i, toks, n, &mut l, env);
+            } else {
+                toks[n][l] = b;
+                l += 1;
+                i += 1;
+            }
         }
-        while i < s.len() && s[i] != b' ' {
-            i += 1;
+        // token too long: skip rest of it (quoted or not)
+        if l >= 62 {
+            let mut qq = q;
+            while i < s.len() {
+                let b = s[i];
+                if qq == 1 {
+                    if b == b'\'' {
+                        qq = 0;
+                    }
+                } else if qq == 2 {
+                    if b == b'"' {
+                        qq = 0;
+                    } else if b == b'\\' {
+                        i += 1;
+                    }
+                } else if b == b' ' {
+                    break;
+                } else if b == b'\'' {
+                    qq = 1;
+                } else if b == b'"' {
+                    qq = 2;
+                } else if b == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
         }
         toks[n][l] = 0;
         n += 1;
     }
     n
+}
+
+// expand $NAME at s[i]=='$'; appends value to toks[n] (cap 62 via l).
+// Returns new i (past the name, or past '$' if no name follows).
+fn expand_var(s: &[u8], i: usize, toks: &mut [[u8; 64]], n: usize, l: &mut usize, env: &Env) -> usize {
+    let mut j = i + 1;
+    while j < s.len() && is_name_byte(s[j]) {
+        j += 1;
+    }
+    if j == i + 1 {
+        // lone '$': literal
+        if *l < 62 {
+            toks[n][*l] = b'$';
+            *l += 1;
+        }
+        return i + 1;
+    }
+    if let Some(v) = env.get(&s[i + 1..j]) {
+        for &b in v {
+            if *l >= 62 {
+                break;
+            }
+            toks[n][*l] = b;
+            *l += 1;
+        }
+    }
+    j
 }
 
 // argv pointers for exec (toks must outlive the call).
@@ -245,10 +454,10 @@ fn resolve(prog: &[u8], path: &mut [u8; 64]) {
     path[l] = 0;
 }
 
-fn exec_simple(cmd: &[u8]) {
+fn exec_simple(cmd: &[u8], env: &Env) {
     let cmd = trim(cmd);
     let mut toks = [[0u8; 64]; 8];
-    let ntok = tokenize(cmd, &mut toks);
+    let ntok = tokenize_env(cmd, &mut toks, env);
     if ntok == 0 {
         user_lib::exit(-1);
     }
@@ -304,8 +513,21 @@ fn wait_pid() {
     }
 }
 
+// print process table (shared by the `ps` builtin and run_capture, v0.9)
+fn builtin_ps() {
+    let mut pb = [0u8; 512];
+    let r = user_lib::ps(pb.as_mut_ptr(), 512);
+    if r > 0 {
+        write_bytes(1, &pb[..r as usize]);
+    } else {
+        user_lib::print("sh: ps failed\n");
+    }
+}
+
 // pid-aware wait: reaps other (background) children into jobs table.
 // v0.5: uses waitpid(target) for precise reap.
+// v0.7: also clears the target's own jobs slot (stale reaped pids used to
+// linger because only non-target reaps went through bg_done).
 fn wait_foreground(pid: isize, jobs: &mut [isize; 8]) {
     let mut code: i32 = 0;
     loop {
@@ -317,10 +539,10 @@ fn wait_foreground(pid: isize, jobs: &mut [isize; 8]) {
         if w < 0 {
             break;
         }
+        bg_done(jobs, w);
         if w == pid {
             break;
         }
-        bg_done(jobs, w);
     }
 }
 
@@ -342,6 +564,289 @@ fn jobs_add(jobs: &mut [isize; 8], pid: isize) -> bool {
         }
     }
     false
+}
+
+// write raw bytes to fd (avoids &str UTF-8 constraints)
+fn write_bytes(fd: isize, b: &[u8]) {
+    if !b.is_empty() {
+        user_lib::write(fd, b.as_ptr(), b.len());
+    }
+}
+
+fn print_isize(v: isize) {
+    print_isize_to(1, v);
+}
+
+fn print_isize_to(fd: isize, v: isize) {
+    let mut tmp = [0u8; 20];
+    let mut s = v;
+    let neg = s < 0;
+    if neg {
+        s = -s;
+    }
+    let mut l = 0;
+    if s == 0 {
+        tmp[0] = b'0';
+        l = 1;
+    } else {
+        let mut rev = [0u8; 20];
+        let mut rl = 0;
+        while s > 0 && rl < 20 {
+            rev[rl] = b'0' + (s % 10) as u8;
+            s /= 10;
+            rl += 1;
+        }
+        let mut k = 0;
+        if neg && l < 20 {
+            tmp[0] = b'-';
+            l = 1;
+        }
+        while rl > 0 && l < 20 {
+            rl -= 1;
+            tmp[l] = rev[rl];
+            l += 1;
+            k += 1;
+        }
+        let _ = k;
+    }
+    write_bytes(fd, &tmp[..l]);
+}
+
+// bring a bg job to foreground. arg=None => most recent. Returns pid or -1.
+fn fg_job(jobs: &mut [isize; 8], arg: Option<isize>) -> isize {
+    let target = match arg {
+        Some(p) => {
+            let mut found = false;
+            for j in jobs.iter() {
+                if *j == p {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                user_lib::print("fg: no such job\n");
+                return -1;
+            }
+            p
+        }
+        None => {
+            let mut t = -1;
+            for j in jobs.iter() {
+                if *j != 0 {
+                    t = *j;
+                }
+            }
+            if t < 0 {
+                user_lib::print("fg: no jobs\n");
+                return -1;
+            }
+            t
+        }
+    };
+    user_lib::setfg(target);
+    wait_foreground(target, jobs);
+    user_lib::setfg(user_lib::getpid());
+    target
+}
+
+// ---- v0.7: history (16 lines) + line editor ----
+struct Hist {
+    lines: [[u8; 128]; 16],
+    lens: [usize; 16],
+    n: usize, // total pushed (cap display at 16)
+}
+
+impl Hist {
+    fn new() -> Self {
+        Self {
+            lines: [[0; 128]; 16],
+            lens: [0; 16],
+            n: 0,
+        }
+    }
+    fn push(&mut self, line: &[u8]) {
+        if line.is_empty() {
+            return;
+        }
+        // skip consecutive duplicates
+        if self.n > 0 {
+            let l = (self.n - 1) % 16;
+            if self.lens[l] == line.len() && self.lines[l][..line.len()] == *line {
+                return;
+            }
+        }
+        let i = self.n % 16;
+        let m = line.len().min(127);
+        self.lines[i][..m].copy_from_slice(&line[..m]);
+        self.lens[i] = m;
+        self.n += 1;
+    }
+    // k=1 => newest. None if out of range.
+    fn get_rel(&self, k: usize) -> Option<&[u8]> {
+        let avail = self.n.min(16);
+        if k == 0 || k > avail {
+            return None;
+        }
+        let i = (self.n - k) % 16;
+        Some(&self.lines[i][..self.lens[i]])
+    }
+}
+
+// read one byte with bounded retries (ESC-sequence guard); -1 on give-up
+fn read_byte_retry() -> isize {
+    let mut b = [0u8; 1];
+    let mut tries = 0;
+    loop {
+        let r = user_lib::read(0, b.as_mut_ptr(), 1);
+        if r > 0 {
+            return b[0] as isize;
+        }
+        tries += 1;
+        if tries > 200 {
+            return -1;
+        }
+        user_lib::yield_();
+    }
+}
+
+fn redraw(buf: &[u8]) {
+    write_bytes(1, b"\r");
+    user_lib::print("sh$ ");
+    write_bytes(1, buf);
+    write_bytes(1, b"\x1b[K");
+}
+
+// prompt line editor: echo, backspace, ESC[A/B history. Returns line len
+// (0 = EOF-empty, caller yields). Non-empty lines enter history.
+fn read_edit(buf: &mut [u8; 128], hist: &mut Hist) -> usize {
+    let mut len = 0;
+    let mut nav = 0usize; // 0 = draft, else 1-based history depth
+    let mut draft = [0u8; 128];
+    let mut draft_len = 0;
+    let mut draft_saved = false;
+    loop {
+        let mut b = [0u8; 1];
+        let r = user_lib::read(0, b.as_mut_ptr(), 1);
+        if r <= 0 {
+            if len == 0 {
+                return 0;
+            }
+            user_lib::yield_();
+            continue;
+        }
+        let c = b[0];
+        if c == b'\n' || c == b'\r' {
+            write_bytes(1, b"\n");
+            break;
+        } else if c == 0x7f || c == 0x08 {
+            if len > 0 {
+                len -= 1;
+                write_bytes(1, b"\x08 \x08");
+            }
+        } else if c == 0x1b {
+            // ESC sequence: expect [A (up) / [B (down); ignore the rest
+            let c1 = read_byte_retry();
+            if c1 != b'[' as isize {
+                continue;
+            }
+            let c2 = read_byte_retry();
+            if c2 == b'A' as isize {
+                let avail = hist.n.min(16);
+                if nav < avail {
+                    if !draft_saved {
+                        draft[..len].copy_from_slice(&buf[..len]);
+                        draft_len = len;
+                        draft_saved = true;
+                    }
+                    nav += 1;
+                    if let Some(h) = hist.get_rel(nav) {
+                        len = h.len().min(127);
+                        buf[..len].copy_from_slice(&h[..len]);
+                        redraw(&buf[..len]);
+                    } else {
+                        nav -= 1;
+                    }
+                }
+            } else if c2 == b'B' as isize {
+                if nav > 1 {
+                    nav -= 1;
+                    if let Some(h) = hist.get_rel(nav) {
+                        len = h.len().min(127);
+                        buf[..len].copy_from_slice(&h[..len]);
+                        redraw(&buf[..len]);
+                    }
+                } else if nav == 1 {
+                    nav = 0;
+                    len = draft_len;
+                    buf[..len].copy_from_slice(&draft[..len]);
+                    redraw(&buf[..len]);
+                }
+            }
+        } else if c >= 0x20 && c < 0x7f {
+            if len < 127 {
+                buf[len] = c;
+                len += 1;
+                write_bytes(1, &buf[len - 1..len]);
+            }
+        }
+        // other control bytes ignored (Ctrl-C/D handled by kernel)
+    }
+    if len > 0 {
+        hist.push(&buf[..len]);
+    }
+    len
+}
+
+// run `line` with stdout captured into `out` (cap). Returns bytes captured.
+// v0.7 test helper: outputs are small (<1KB), pipe never fills.
+fn run_capture(line: &[u8], jobs: &mut [isize; 8], env: &Env, out: &mut [u8]) -> usize {
+    let mut fds = [0i32; 2];
+    if user_lib::pipe(fds.as_mut_ptr()) != 0 {
+        return 0;
+    }
+    let pid = user_lib::fork();
+    if pid == 0 {
+        user_lib::dup2(fds[1] as isize, 1);
+        user_lib::close(fds[0] as isize);
+        user_lib::close(fds[1] as isize);
+        let mut dj = [0isize; 8];
+        exec_cmd(line, line.len(), &mut dj, env);
+        user_lib::exit(0);
+    }
+    if pid < 0 {
+        user_lib::close(fds[0] as isize);
+        user_lib::close(fds[1] as isize);
+        return 0;
+    }
+    user_lib::close(fds[1] as isize);
+    let mut n = 0;
+    loop {
+        if n < out.len() {
+            let r = user_lib::read(fds[0] as isize, unsafe { out.as_mut_ptr().add(n) }, out.len() - n);
+            if r > 0 {
+                n += r as usize;
+                continue;
+            }
+        }
+        // pipe empty (or full): child done?
+        let mut code: i32 = 0;
+        let w = user_lib::waitpid(pid, &mut code as *mut i32, 1);
+        if w == pid || w < 0 {
+            // reaped (or lost): drain once more then stop
+            if n < out.len() {
+                let r = user_lib::read(fds[0] as isize, unsafe { out.as_mut_ptr().add(n) }, out.len() - n);
+                if r > 0 {
+                    n += r as usize;
+                }
+            }
+            break;
+        }
+        user_lib::yield_();
+    }
+    user_lib::close(fds[0] as isize);
+    // restore fg (child's exec_cmd clobbered the shared fg pid)
+    user_lib::setfg(user_lib::getpid());
+    n
 }
 
 // single non-blocking reap attempt (for `jobs` builtin)
@@ -366,7 +871,10 @@ fn spawn_one(path: &[u8]) -> isize {
 #[no_mangle]
 pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     user_lib::print("[USER] sh: Unix-v6 like shell. try: ls, cat /README, echo hi | grep hi, usertests\n");
+    user_lib::print("[USER] sh: builtins: cd pwd df jobs fg kill halt export unset env; quotes + $VAR + history\n");
     let mut jobs = [0isize; 8];
+    let mut env = Env::new();
+    let mut hist = Hist::new();
     // auto-run usertests + persist + argv coverage once for test.sh markers
     user_lib::print("[USER] sh: auto-run usertests\n");
     run_one(b"/bin/usertests\0", &mut jobs);
@@ -547,13 +1055,98 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
         // back to root for interactive prompt
         user_lib::chdir(b"/\0".as_ptr());
     }
+    // ---- v0.7 coverage: quotes, env, fg, history ----
+    {
+        // quote: single quotes preserve inner spaces as one argv
+        // (note: echo appends its own "[TEST] echo PASS" line)
+        let mut cb = [0u8; 64];
+        let n = run_capture(b"echo 'a  b'\n", &mut jobs, &env, &mut cb);
+        if n == 22 && cb[..22] == *b"a  b\n[TEST] echo PASS\n" {
+            user_lib::print("[TEST] quote PASS\n");
+        } else {
+            user_lib::print("[TEST] quote FAIL\n");
+        }
+        // env: export + $VAR expansion (double quotes + bare)
+        env.set(b"F", b"/WD/QQ");
+        let mut cb2 = [0u8; 64];
+        let n2 = run_capture(b"echo pre-$F-post\n", &mut jobs, &env, &mut cb2);
+        if n2 == 33 && cb2[..33] == *b"pre-/WD/QQ-post\n[TEST] echo PASS\n" {
+            user_lib::print("[TEST] env PASS\n");
+        } else {
+            user_lib::print("[TEST] env FAIL\n");
+        }
+        // fg: fast-exit bg job, bring to foreground, jobs table drains
+        let bg2 = exec_bg(b"echo hi", 7, &mut jobs, &env);
+        if bg2 > 0 && fg_job(&mut jobs, Some(bg2)) == bg2 {
+            let mut drained = true;
+            for j in jobs.iter() {
+                if *j != 0 {
+                    drained = false;
+                }
+            }
+            if drained {
+                user_lib::print("[TEST] fg PASS\n");
+            } else {
+                user_lib::print("[TEST] fg FAIL\n");
+            }
+        } else {
+            user_lib::print("[TEST] fg FAIL\n");
+        }
+        // history: buffer unit ops (push/nav/dup-skip)
+        {
+            let mut h = Hist::new();
+            h.push(b"aaa");
+            h.push(b"bb");
+            h.push(b"bb"); // dup skipped
+            let ok = h.get_rel(1) == Some(&b"bb"[..])
+                && h.get_rel(2) == Some(&b"aaa"[..])
+                && h.get_rel(3).is_none();
+            if ok {
+                user_lib::print("[TEST] history PASS\n");
+            } else {
+                user_lib::print("[TEST] history FAIL\n");
+            }
+        }
+        // v0.9: ps lists init (pid 1 => line starts with "1 ");
+        // strace observes getpid (log assertion in test.sh)
+        {
+            let mut pb = [0u8; 512];
+            let n = run_capture(b"ps\n", &mut jobs, &env, &mut pb);
+            let mut found = false;
+            let mut ls = 0;
+            while ls < n {
+                let mut le = ls;
+                while le < n && pb[le] != b'\n' {
+                    le += 1;
+                }
+                // line "1 0 R ..." (pid=1 is always init)
+                if le > ls + 1 && pb[ls] == b'1' && pb[ls + 1] == b' ' {
+                    found = true;
+                    break;
+                }
+                ls = le + 1;
+            }
+            if found {
+                user_lib::print("[TEST] ps PASS\n");
+            } else {
+                user_lib::print("[TEST] ps FAIL\n");
+            }
+        }
+        {
+            let me = user_lib::getpid();
+            user_lib::trace(me, 1);
+            let _ = user_lib::getpid();
+            user_lib::trace(me, 0);
+            user_lib::print("[TEST] strace DONE\n");
+        }
+    }
     // prompt runs as foreground for Ctrl-C
     user_lib::setfg(user_lib::getpid());
     user_lib::print("sh$ ");
     let mut buf = [0u8; 128];
     loop {
         reap_poll(&mut jobs);
-        let n = user_lib::read_line(&mut buf);
+        let n = read_edit(&mut buf, &mut hist);
         if n == 0 {
             user_lib::yield_();
             continue;
@@ -572,7 +1165,9 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
             for j in jobs.iter() {
                 if *j != 0 {
                     any = true;
-                    break;
+                    user_lib::print("job pid=");
+                    print_isize(*j);
+                    user_lib::print("\n");
                 }
             }
             if !any {
@@ -637,6 +1232,80 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
             user_lib::print("sh$ ");
             continue;
         }
+        // builtin: export NAME=val / unset NAME / env (v0.7)
+        if t.len() > 7 && &t[..7] == b"export " {
+            let rest = trim(&t[7..]);
+            let mut eq: Option<usize> = None;
+            for k in 0..rest.len() {
+                if rest[k] == b'=' {
+                    eq = Some(k);
+                    break;
+                }
+            }
+            if let Some(e) = eq {
+                let name = trim(&rest[..e]);
+                let val = &rest[e + 1..];
+                if name.is_empty() || !env.set(name, val) {
+                    user_lib::print("sh: export failed\n");
+                }
+            } else {
+                user_lib::print("sh: usage: export NAME=val\n");
+            }
+            user_lib::print("sh$ ");
+            continue;
+        }
+        if t.len() > 6 && &t[..6] == b"unset " {
+            let name = trim(&t[6..]);
+            if !env.unset(name) {
+                user_lib::print("sh: unset failed\n");
+            }
+            user_lib::print("sh$ ");
+            continue;
+        }
+        if t.len() == 3 && &t[..3] == b"env" {
+            for i in 0..env.n {
+                write_bytes(1, &env.names[i][..env.nlen[i]]);
+                write_bytes(1, b"=");
+                write_bytes(1, &env.vals[i][..env.vlen[i]]);
+                write_bytes(1, b"\n");
+            }
+            user_lib::print("sh$ ");
+            continue;
+        }
+        // builtin: ps (v0.9)
+        if t.len() == 2 && &t[..2] == b"ps" {
+            builtin_ps();
+            user_lib::print("sh$ ");
+            continue;
+        }
+        // builtin: fg [pid] (v0.7)
+        if (t.len() == 2 && &t[..2] == b"fg")
+            || (t.len() > 3 && &t[..3] == b"fg " && t[2] == b' ')
+        {
+            let mut arg: Option<isize> = None;
+            if t.len() > 3 {
+                let mut pid: isize = 0;
+                let mut ok = false;
+                for &b in trim(&t[3..]) {
+                    if b >= b'0' && b <= b'9' {
+                        pid = pid * 10 + (b - b'0') as isize;
+                        ok = true;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    user_lib::print("sh: usage: fg [pid]\n");
+                    user_lib::print("sh$ ");
+                    continue;
+                }
+                arg = Some(pid);
+            }
+            fg_job(&mut jobs, arg);
+            user_lib::print("sh$ ");
+            continue;
+        }
         // builtin: kill <pid>
         if t.len() > 5 && t[0] == b'k' && t[1] == b'i' && t[2] == b'l' && t[3] == b'l' && t[4] == b' ' {
             let mut pid: isize = 0;
@@ -658,42 +1327,52 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
             user_lib::print("sh$ ");
             continue;
         }
-        // background: trailing &
+        // background: trailing & outside quotes (v0.7 quote-aware)
         let mut bgmode = false;
         let mut m = n;
         {
             let tt = trim(&buf[..n]);
             if !tt.is_empty() && tt[tt.len() - 1] == b'&' {
-                bgmode = true;
-                // strip & (trim handles trailing spaces before it? re-trim)
-                m = tt.len() - 1;
-                // map back into buf: buf[..n] trimmed is tt; & is last of tt
-                // find its index from the end of buf
+                // map back into buf: find trailing & index, check unquoted
                 let mut k = n;
                 while k > 0 && (buf[k - 1] == b'\n' || buf[k - 1] == b'\r' || buf[k - 1] == b' ') {
                     k -= 1;
                 }
-                // buf[k-1] == '&'
-                m = k - 1;
+                // buf[k-1] == '&'; bg only if the LAST & is outside quotes
+                let mut last_amp: Option<usize> = None;
+                let mut off = 0;
+                while off < k {
+                    match find_unquoted(&buf[off..k], b'&') {
+                        Some(p) => {
+                            last_amp = Some(off + p);
+                            off += p + 1;
+                        }
+                        None => break,
+                    }
+                }
+                if last_amp == Some(k - 1) {
+                    bgmode = true;
+                    m = k - 1;
+                }
             }
         }
         if bgmode {
-            exec_bg(&buf, m, &mut jobs);
+            exec_bg(&buf, m, &mut jobs, &env);
         } else {
-            exec_cmd(&buf, n, &mut jobs);
+            exec_cmd(&buf, n, &mut jobs, &env);
         }
         user_lib::print("sh$ ");
     }
 }
 
-// run line in background (no waiting); record pid.
-fn exec_bg(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
+// run line in background (no waiting); record pid. Returns child pid or -1.
+fn exec_bg(line: &[u8], n: usize, jobs: &mut [isize; 8], env: &Env) -> isize {
     // reuse exec_cmd machinery via fork here is complex; support simple prog+args
     let core = trim(&line[..n]);
     let mut toks = [[0u8; 64]; 8];
-    let ntok = tokenize(core, &mut toks);
+    let ntok = tokenize_env(core, &mut toks, env);
     if ntok == 0 {
-        return;
+        return -1;
     }
     let mut path = [0u8; 64];
     resolve(&toks[0], &mut path);
@@ -712,6 +1391,7 @@ fn exec_bg(line: &[u8], n: usize, jobs: &mut [isize; 8]) {
             wait_foreground(pid, jobs);
         }
     }
+    pid
 }
 
 fn drain_jobs(jobs: &mut [isize; 8]) {

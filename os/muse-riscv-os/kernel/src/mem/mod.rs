@@ -205,3 +205,17 @@ pub fn alloc_map_user(root: usize, va: usize, len: usize, flags: u64) {
         cur += 4096;
     }
 }
+
+/// v0.8: unmap user pages in [va, va+len) and recycle their frames.
+/// Skips unmapped / non-U pages (partial ranges are safe).
+pub fn unmap_free_user(root: usize, va: usize, len: usize) {
+    let start = va & !0xfff;
+    let end = (va + len + 0xfff) & !0xfff;
+    let mut cur = start;
+    while cur < end {
+        if let Some(pa) = pt::unmap_page(root, cur) {
+            crate::mem::frame::dealloc_frame(pa);
+        }
+        cur += 4096;
+    }
+}

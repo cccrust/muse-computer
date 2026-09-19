@@ -29,6 +29,7 @@ pub enum State {
 /// block reasons for State::Blocked
 pub const BLOCK_STDIN: u8 = 1;
 pub const BLOCK_SLEEP: u8 = 2;
+pub const BLOCK_VIRTIO: u8 = 3;
 
 pub struct Proc {
     pub pid: usize,
@@ -51,6 +52,9 @@ pub struct Proc {
     pub cwd: [u8; 128],
     pub cwd_len: usize,
     pub fd_cloexec: [bool; 16],
+    pub mmap_base: usize, // v0.8: top-down anonymous mmap frontier
+    pub brk_min: usize,   // v0.8: sbrk may not shrink below this
+    pub traced: bool,     // v0.9: strace-lite prints this proc's syscalls
 }
 
 struct Sched {
@@ -213,6 +217,11 @@ fn finish_spawn(
         },
         cwd_len: 1,
         fd_cloexec: [false; 16],
+        // v0.8: mmap grows down from below the user stack; brk floor =
+        // initial brk (brk is finish_spawn's param, in scope here)
+        mmap_base: USER_STACK_TOP - USER_STACK_PAGES * 4096,
+        brk_min: brk,
+        traced: false,
     };
     s.procs[pid] = Some(proc);
     if parent != 0 {
@@ -306,21 +315,28 @@ fn push_args(root: usize, args: &[Vec<u8>]) -> usize {
         addrs[i] = p;
     }
     p &= !7usize;
-    p -= 8 * (argc + 1);
-    let argv_base = p;
+    // Reserve argv array + argc slot so the final sp is 16B aligned.
+    // (Old code masked sp with !15 AFTER layout, which could slide sp up
+    // to 8B below the argc slot whenever the string bytes totalled 0..7
+    // mod 16 -- entry then read argc from the wrong address. v0.7 #1.)
+    if p.wrapping_sub(8 * (argc + 1) + 8) & 15 != 0 {
+        p -= 8; // pad between strings and argv (inside mapped stack pages)
+    }
+    let argv_base = p - 8 * (argc + 1);
     for i in 0..argc {
         write_u64_to(root, argv_base + i * 8, addrs[i] as u64);
     }
     write_u64_to(root, argv_base + argc * 8, 0);
-    p -= 8;
-    write_u64_to(root, p, argc as u64);
-    p & !15usize
+    let sp = argv_base - 8;
+    write_u64_to(root, sp, argc as u64);
+    debug_assert!(sp & 15 == 0);
+    sp
 }
 
 /// Fork current process. Returns child pid. Caller sets child a0=0.
 pub fn fork(parent_pid: usize) -> usize {
     // gather parent info without holding lock across allocs
-    let (p_root, p_tf, p_brk, p_kind, p_fds, p_off, p_path, pname, p_cwd, p_cwd_len, p_cloexec) = {
+    let (p_root, p_tf, p_brk, p_kind, p_fds, p_off, p_path, pname, p_cwd, p_cwd_len, p_cloexec, p_mmap_base, p_brk_min) = {
         let s = sched().lock();
         let p = s.procs[parent_pid].as_ref().expect("no parent").clone_proc_info();
         p
@@ -363,6 +379,12 @@ pub fn fork(parent_pid: usize) -> usize {
         cwd: p_cwd,
         cwd_len: p_cwd_len,
         fd_cloexec: p_cloexec,
+        // v0.8: child shares copies of all user pages (clone_user); the
+        // mmap frontier must match or parent/child would map the same area
+        mmap_base: p_mmap_base,
+        brk_min: p_brk_min,
+        // v0.9: never inherit trace (avoid log explosion)
+        traced: false,
     };
     s.procs[child] = Some(proc);
     if let Some(Some(pp)) = s.procs.get_mut(parent_pid) {
@@ -429,7 +451,11 @@ pub fn exec(pid: usize, path: &str, args: &[Vec<u8>]) -> bool {
     let mut s = sched().lock();
     if let Some(Some(p)) = s.procs.get_mut(pid) {
         p.root = new_root;
-        p.brk = brk.max(0x20000);
+        let new_brk = brk.max(0x20000);
+        p.brk = new_brk;
+        // v0.8: fresh address space => reset mmap frontier + brk floor
+        p.mmap_base = USER_STACK_TOP - USER_STACK_PAGES * 4096;
+        p.brk_min = new_brk;
         // close CLOEXEC fds (keep cwd, keep other fds incl. redirections)
         for i in 0..16 {
             if p.fd_cloexec[i] {
@@ -589,6 +615,31 @@ pub fn wake_stdin() {
     }
 }
 
+/// Wake virtio-block sleepers (virtio completion ISR).
+pub fn wake_virtio() {
+    let mut s = sched().lock();
+    let ids: Vec<usize> = s
+        .procs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| match o {
+            Some(p) if p.state == State::Blocked && p.blocked_on == BLOCK_VIRTIO => Some(i),
+            _ => None,
+        })
+        .collect();
+    for pid in ids {
+        wake_locked(&mut s, pid);
+    }
+}
+
+/// v0.6: true once the scheduler has started (task::run). Drivers use it
+/// to pick polling (boot, kernel context) vs interrupt-blocked wait.
+pub fn scheduler_active() -> bool {
+    unsafe { SCHED_ACTIVE }
+}
+
+static mut SCHED_ACTIVE: bool = false;
+
 /// Wake expired sleepers (timer tick).
 pub fn wake_sleepers(now: u64) {
     let mut s = sched().lock();
@@ -707,6 +758,9 @@ pub fn run() -> ! {
         (p.root, p.tf_pa)
     };
     pt::activate(root);
+    unsafe {
+        SCHED_ACTIVE = true;
+    }
     enter_user(first);
     unreachable!();
 }
@@ -800,11 +854,58 @@ pub fn with_current_mut<R>(f: impl FnOnce(&mut Proc) -> R) -> R {
 }
 
 trait CloneInfo {
-    fn clone_proc_info(&self) -> (usize, usize, usize, [u8; 16], [i32; 16], [usize; 16], [u64; 16], [u8; 32], [u8; 128], usize, [bool; 16]);
+    #[allow(clippy::type_complexity)]
+    fn clone_proc_info(
+        &self,
+    ) -> (
+        usize,
+        usize,
+        usize,
+        [u8; 16],
+        [i32; 16],
+        [usize; 16],
+        [u64; 16],
+        [u8; 32],
+        [u8; 128],
+        usize,
+        [bool; 16],
+        usize,
+        usize,
+    );
 }
 impl CloneInfo for Proc {
-    fn clone_proc_info(&self) -> (usize, usize, usize, [u8; 16], [i32; 16], [usize; 16], [u64; 16], [u8; 32], [u8; 128], usize, [bool; 16]) {
-        (self.root, self.tf_pa, self.brk, self.fd_kind, self.fds, self.fd_off, self.fd_path, self.name, self.cwd, self.cwd_len, self.fd_cloexec)
+    fn clone_proc_info(
+        &self,
+    ) -> (
+        usize,
+        usize,
+        usize,
+        [u8; 16],
+        [i32; 16],
+        [usize; 16],
+        [u64; 16],
+        [u8; 32],
+        [u8; 128],
+        usize,
+        [bool; 16],
+        usize,
+        usize,
+    ) {
+        (
+            self.root,
+            self.tf_pa,
+            self.brk,
+            self.fd_kind,
+            self.fds,
+            self.fd_off,
+            self.fd_path,
+            self.name,
+            self.cwd,
+            self.cwd_len,
+            self.fd_cloexec,
+            self.mmap_base,
+            self.brk_min,
+        )
     }
 }
 
@@ -941,4 +1042,43 @@ pub fn resolve_path(cwd: &str, path: &str) -> alloc::string::String {
 pub fn resolve_for(pid: usize, path: &str) -> alloc::string::String {
     let cwd = get_cwd(pid);
     resolve_path(&cwd, path)
+}
+
+// ---- v0.9: strace flag + ps snapshot ----
+pub fn set_traced(pid: usize, on: bool) -> bool {
+    let mut s = sched().lock();
+    match s.procs.get_mut(pid).and_then(|o| o.as_mut()) {
+        Some(p) => {
+            p.traced = on;
+            true
+        }
+        None => false,
+    }
+}
+
+pub fn is_traced(pid: usize) -> bool {
+    let s = sched().lock();
+    matches!(s.procs.get(pid), Some(Some(p)) if p.traced)
+}
+
+/// One line per live proc: "pid ppid state brk cwd\n". state: R/B/Z.
+pub fn ps_snapshot() -> alloc::string::String {
+    let s = sched().lock();
+    let mut out = alloc::string::String::new();
+    for slot in s.procs.iter() {
+        if let Some(p) = slot {
+            let st = match p.state {
+                State::Running | State::Runnable => "R",
+                State::Blocked => "B",
+                State::Zombie => "Z",
+            };
+            let n = p.cwd_len.min(128);
+            let cwd = alloc::string::String::from_utf8_lossy(&p.cwd[..n]);
+            out.push_str(&alloc::format!(
+                "{} {} {} {} {}\n",
+                p.pid, p.parent, st, p.brk, cwd
+            ));
+        }
+    }
+    out
 }

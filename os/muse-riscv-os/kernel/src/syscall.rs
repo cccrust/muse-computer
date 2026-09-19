@@ -31,6 +31,12 @@ pub const SYS_LSEEK: usize = 26;
 pub const SYS_DUP2: usize = 27;
 pub const SYS_WAITPID: usize = 28;
 pub const SYS_FSSTAT: usize = 29;
+// v0.8
+pub const SYS_MMAP: usize = 30;
+pub const SYS_MUNMAP: usize = 31;
+// v0.9
+pub const SYS_PS: usize = 32;
+pub const SYS_TRACE: usize = 33;
 
 pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) -> isize {
     match id {
@@ -71,9 +77,14 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_DUP2 => sys_dup2(a0 as i32, a1 as i32) as isize,
         SYS_WAITPID => sys_waitpid(a0 as isize, a1, a2) as isize,
         SYS_FSSTAT => sys_fsstat(a0, a1) as isize,
+        SYS_MMAP => sys_mmap(a0, a1, a2) as isize,
+        SYS_MUNMAP => sys_munmap(a0, a1) as isize,
+        SYS_PS => sys_ps(a0, a1) as isize,
+        SYS_TRACE => sys_trace(a0, a1) as isize,
         SYS_SHUTDOWN => {
             crate::println!("[SYS] shutdown");
             if crate::fs::use_disk() {
+                crate::fs::blk::sync();
                 crate::fs::disk::set_dirty(false);
                 crate::println!("[FS] marked clean");
             }
@@ -417,8 +428,132 @@ fn sys_sbrk(inc: i32) -> isize {
             core::arch::asm!("sfence.vma");
         }
         let _ = pid;
+    } else {
+        // v0.8: shrink: unmap [new, old) and recycle frames; never below brk_min
+        let dec = (-(inc as isize)) as usize;
+        if dec > old {
+            return -1;
+        }
+        let new_brk = old - dec;
+        let brk_min = crate::task::with_current(|p| p.brk_min);
+        if new_brk < brk_min {
+            return -1;
+        }
+        let root = crate::task::with_current(|p| p.root);
+        crate::mem::unmap_free_user(root, new_brk, dec);
+        crate::task::with_current_mut(|p| {
+            p.brk = new_brk;
+        });
     }
     old as isize
+}
+
+/// v0.8: anonymous mmap. hint ignored (always top-down); prot bit0=R,
+/// bit1=W (0 => R|W); X never granted. Returns base or -1.
+fn sys_mmap(_hint: usize, len: usize, prot: usize) -> isize {
+    if len == 0 || len > 64 * 1024 * 1024 {
+        return -1;
+    }
+    if prot & !0x3 != 0 {
+        return -1;
+    }
+    let _flags = if prot == 0 {
+        crate::mem::pagetable::PTE_R | crate::mem::pagetable::PTE_W
+    } else {
+        let mut f = 0;
+        if prot & 0x1 != 0 {
+            f |= crate::mem::pagetable::PTE_R;
+        }
+        if prot & 0x2 != 0 {
+            f |= crate::mem::pagetable::PTE_W;
+        }
+        if f == 0 {
+            return -1;
+        }
+        f
+    };
+    let pages = (len + 0xfff) & !0xfff;
+    let pid = crate::task::current_pid();
+    let (root, base) = crate::task::with_current(|p| (p.root, p.mmap_base));
+    if pages > base {
+        return -1;
+    }
+    // guard against colliding with the heap top (brk): mmap region must
+    // stay strictly above brk. Estimate brk via fresh read (same lock order
+    // as elsewhere: with_current twice is fine, no nesting).
+    let brk = crate::task::with_current(|p| p.brk);
+    let new_base = base - pages;
+    if new_base < brk {
+        return -1;
+    }
+    crate::mem::alloc_map_user(root, new_base, pages, _flags);
+    // fresh frames are zeroed by the frame allocator; ensure visibility
+    unsafe {
+        core::arch::asm!("sfence.vma");
+    }
+    crate::task::with_current_mut(|p| {
+        if p.mmap_base == base {
+            p.mmap_base = new_base;
+        }
+    });
+    let _ = pid;
+    new_base as isize
+}
+
+/// v0.8: munmap(addr, len). Unmaps user pages, recycles frames. Always 0
+/// for in-range calls (unmapped/non-U pages skipped); -1 only if the range
+/// is absurd (>256MB) to catch wild pointers.
+fn sys_munmap(addr: usize, len: usize) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    if len > 256 * 1024 * 1024 {
+        return -1;
+    }
+    let root = crate::task::with_current(|p| p.root);
+    crate::mem::unmap_free_user(root, addr, len);
+    0
+}
+
+/// v0.9: ps(buf, len). Writes "pid ppid state brk cwd\n" lines; truncates
+/// at line boundary if short; returns bytes written.
+fn sys_ps(buf: usize, len: usize) -> isize {
+    if buf == 0 || len == 0 {
+        return -1;
+    }
+    let snap = crate::task::ps_snapshot();
+    let b = snap.as_bytes();
+    // truncate to last full line that fits
+    let mut n = b.len().min(len);
+    if n < b.len() {
+        let mut cut = 0;
+        for (i, &c) in b.iter().enumerate() {
+            if i >= len {
+                break;
+            }
+            if c == b'\n' {
+                cut = i + 1;
+            }
+        }
+        n = cut;
+    }
+    if n == 0 && !b.is_empty() {
+        return -1;
+    }
+    unsafe {
+        let dst = crate::fs::user_slice_mut(buf, len);
+        dst[..n].copy_from_slice(&b[..n]);
+    }
+    n as isize
+}
+
+/// v0.9: trace(pid, on). Sets the strace-lite flag. Returns 0/-1.
+fn sys_trace(pid: usize, on: usize) -> isize {
+    if crate::task::set_traced(pid, on != 0) {
+        0
+    } else {
+        -1
+    }
 }
 
 fn sys_mkdir(path_ptr: usize) -> isize {
