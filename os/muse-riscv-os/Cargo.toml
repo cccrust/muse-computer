@@ -1,0 +1,17 @@
+[workspace]
+members = [
+  "kernel",
+  "user-lib",
+  "user/init",
+  "user/sh",
+  "user/ls",
+  "user/cat",
+  "user/echo",
+  "user/grep",
+  "user/fork_test",
+  "user/pipe_test",
+  "user/usertests",
+  "tools/mkfs",
+  "host-tests",
+]
+resolver = "2"

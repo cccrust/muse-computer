@@ -1,0 +1,5 @@
+# Intentionally minimal. Linker scripts are injected per-crate via build.rs
+# so kernel and user apps can use different layouts on the same target.
+[build]
+# do NOT set default target here: host-tests must build for host,
+# kernel/user are built with --target riscv64gc-unknown-none-elf in run.sh

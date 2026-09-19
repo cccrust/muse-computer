@@ -1,0 +1,135 @@
+
+OpenSBI v1.7
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name               : riscv-virtio,qemu
+Platform Features           : medeleg
+Platform HART Count         : 1
+Platform IPI Device         : aclint-mswi
+Platform Timer Device       : aclint-mtimer @ 10000000Hz
+Platform Console Device     : uart8250
+Platform HSM Device         : ---
+Platform PMU Device         : ---
+Platform Reboot Device      : syscon-reboot
+Platform Shutdown Device    : syscon-poweroff
+Platform Suspend Device     : ---
+Platform CPPC Device        : ---
+Firmware Base               : 0x80000000
+Firmware Size               : 317 KB
+Firmware RW Offset          : 0x40000
+Firmware RW Size            : 61 KB
+Firmware Heap Offset        : 0x46000
+Firmware Heap Size          : 37 KB (total), 2 KB (reserved), 11 KB (used), 23 KB (free)
+Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
+Runtime SBI Version         : 3.0
+Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
+Experimental SBI Extensions : none
+
+Domain0 Name                : root
+Domain0 Boot HART           : 0
+Domain0 HARTs               : 0*
+Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
+Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
+Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008004ffff M: (R,W) S/U: ()
+Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
+Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
+Domain0 Region07            : 0x0000000000000000-0xffffffffffffffff M: () S/U: (R,W,X)
+Domain0 Next Address        : 0x0000000080200000
+Domain0 Next Arg1           : 0x0000000087e00000
+Domain0 Next Mode           : S-mode
+Domain0 SysReset            : yes
+Domain0 SysSuspend          : yes
+
+Boot HART ID                : 0
+Boot HART Domain            : root
+Boot HART Priv Version      : v1.12
+Boot HART Base ISA          : rv64imafdch
+Boot HART ISA Extensions    : sstc,zicntr,zihpm,zicboz,zicbom,sdtrig,svadu
+Boot HART PMP Count         : 16
+Boot HART PMP Granularity   : 2 bits
+Boot HART PMP Address Bits  : 54
+Boot HART MHPM Info         : 16 (0x0007fff8)
+Boot HART Debug Triggers    : 2 triggers
+Boot HART MIDELEG           : 0x0000000000001666
+Boot HART MEDELEG           : 0x0000000000f4b509
+--- muse-riscv-os (RV64, SV39, Unix-v6) ---
+[BOOT] hart booted in S-mode, kernel @ 0x80200000
+[MM] heap init ok
+[MM] frame allocator ok
+[MM] root=0x80a51000
+[MM] text mapped
+[MM] rodata mapped
+[MM] data mapped
+[MM] bss mapped
+[MM] ram mapped
+[MM] mmio mapped, activating...
+[MM] activated
+[MMU] SV39 enabled (satp MODE=8, 3-level)
+[TRAP] stvec set
+[TIMER] enabled (10ms tick)
+[FS] ramfs init: /bin /etc README
+[VIRTIO] blk device found @ 0x10001000 (ver=1, block device)
+[TEST] virtio-blk PASS
+[PROC] init pid=1
+[PROC] spawn init
+[TEST] boot markers ready
+[USER] init: starting sh
+[PROC] fork pid=1 -> child=2
+[PROC] exec pid=2 -> /bin/sh
+[USER] sh: Unix-v6 like shell. try: ls, cat /README, echo hi | grep hi, usertests
+[USER] sh: auto-run usertests
+[PROC] fork pid=2 -> child=3
+[PROC] exec pid=3 -> /bin/usertests
+[USER] usertests: start
+[PROC] fork pid=3 -> child=4
+[PROC] exec pid=4 -> /bin/fork_test
+[PROC] fork pid=4 -> child=5
+[USER] fork_test child alive
+[USER] fork_test child sbrk ok
+[PROC] pid=5 exited(42)
+[TEST] fork PASS
+[PROC] pid=4 exited(0)
+[PROC] fork pid=3 -> child=6
+[PROC] exec pid=6 -> /bin/pipe_test
+[PROC] fork pid=6 -> child=7
+[PROC] pid=7 exited(0)
+[TEST] pipe PASS
+[PROC] pid=6 exited(0)
+[PROC] fork pid=3 -> child=8
+[PROC] exec pid=8 -> /bin/ls
+bin:
+/bin/init
+/bin/sh
+/bin/ls
+/bin/cat
+/bin/echo
+/bin/grep
+/bin/fork_test
+/bin/pipe_test
+/bin/usertests
+/README
+[TEST] ls PASS
+[PROC] pid=8 exited(0)
+[PROC] fork pid=3 -> child=9
+[PROC] exec pid=9 -> /bin/cat
+muse-riscv-os Unix-v6 like
+try: ls cat echo grep fork_test pipe_test usertests
+[TEST] cat PASS
+[PROC] pid=9 exited(0)
+[PROC] fork pid=3 -> child=10
+[PROC] exec pid=10 -> /bin/echo
+echo: hi from unix-v6
+[TEST] echo PASS
+[PROC] pid=10 exited(0)
+[TEST] usertests PASS
+[PROC] pid=3 exited(0)
+sh$ qemu-system-riscv64: terminating on signal 15 from pid 0 (<unknown process>)
