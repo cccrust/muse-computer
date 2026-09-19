@@ -110,6 +110,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 /:
 bin/
 README ok
+TESTDATA ok
 /bin:
 init ok
 sh ok
@@ -139,6 +140,6 @@ echo: hi from unix-v6
 [PROC] pid=3 exited(0)
 [PROC] fork pid=2 -> child=11
 [PROC] exec pid=11 -> /bin/persist
-[TEST] persist WRITE PASS
+[TEST] persist READ PASS
 [PROC] pid=11 exited(0)
-sh$ qemu-system-riscv64: terminating on signal 15 from pid 97170 (<unknown process>)
+sh$ qemu-system-riscv64: terminating on signal 15

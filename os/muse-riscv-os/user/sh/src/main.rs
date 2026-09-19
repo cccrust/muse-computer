@@ -38,15 +38,49 @@ fn exec_cmd(line: &[u8], n: usize) {
         run_pipe(&cmd[..p], &cmd[p + 1..]);
         return;
     }
-    // split by space
-    let mut prog_end = end;
+    // redirection: prog > file  /  prog < file (single file, no pipe combo)
+    let mut redir_out: Option<&[u8]> = None;
+    let mut redir_in: Option<&[u8]> = None;
+    let mut core_end = end;
     for i in 0..end {
-        if cmd[i] == b' ' {
+        if cmd[i] == b'>' {
+            let f = trim(&cmd[i + 1..end]);
+            // filename = up to next space
+            let mut fl = f.len();
+            for k in 0..f.len() {
+                if f[k] == b' ' {
+                    fl = k;
+                    break;
+                }
+            }
+            redir_out = Some(&f[..fl]);
+            core_end = i;
+            break;
+        }
+        if cmd[i] == b'<' {
+            let f = trim(&cmd[i + 1..end]);
+            let mut fl = f.len();
+            for k in 0..f.len() {
+                if f[k] == b' ' {
+                    fl = k;
+                    break;
+                }
+            }
+            redir_in = Some(&f[..fl]);
+            core_end = i;
+            break;
+        }
+    }
+    let core = trim(&cmd[..core_end]);
+    // split by space
+    let mut prog_end = core.len();
+    for i in 0..core.len() {
+        if core[i] == b' ' {
             prog_end = i;
             break;
         }
     }
-    let prog = &cmd[..prog_end];
+    let prog = &core[..prog_end];
     // build /bin/<prog> path
     let mut path = [0u8; 64];
     let pre = b"/bin/";
@@ -64,7 +98,41 @@ fn exec_cmd(line: &[u8], n: usize) {
     path[L] = 0;
     let pid = user_lib::fork();
     if pid == 0 {
-        // child: handle '>' redirect? simplified: ignore, just exec with raw line args
+        // redirections first (close+dup trick: dup picks lowest free fd)
+        if let Some(f) = redir_out {
+            let mut fp = [0u8; 64];
+            let mut L = 0;
+            for &b in f {
+                if L < 62 {
+                    fp[L] = b;
+                    L += 1;
+                }
+            }
+            fp[L] = 0;
+            let fd = user_lib::open(fp.as_ptr(), 0x40 | 0x200 | 1);
+            if fd >= 0 {
+                user_lib::close(1);
+                user_lib::dup(fd as isize);
+                user_lib::close(fd as isize);
+            }
+        }
+        if let Some(f) = redir_in {
+            let mut fp = [0u8; 64];
+            let mut L = 0;
+            for &b in f {
+                if L < 62 {
+                    fp[L] = b;
+                    L += 1;
+                }
+            }
+            fp[L] = 0;
+            let fd = user_lib::open(fp.as_ptr(), 0);
+            if fd >= 0 {
+                user_lib::close(0);
+                user_lib::dup(fd as isize);
+                user_lib::close(fd as isize);
+            }
+        }
         let r = user_lib::exec(path.as_ptr(), 0);
         // try direct path (e.g. /bin/sh typed full)
         let mut full = [0u8; 64];
@@ -176,29 +244,31 @@ fn exec_simple(cmd: &[u8]) {
     user_lib::exit(-1);
 }
 
+fn run_one(path: &[u8]) {
+    let pid = user_lib::fork();
+    if pid == 0 {
+        let _ = user_lib::exec(path.as_ptr(), 0);
+        user_lib::exit(-1);
+    } else if pid > 0 {
+        let mut code: i32 = 0;
+        loop {
+            let w = user_lib::wait(&mut code as *mut i32);
+            if w == -2 {
+                user_lib::yield_();
+                continue;
+            }
+            break;
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn main() {
     user_lib::print("[USER] sh: Unix-v6 like shell. try: ls, cat /README, echo hi | grep hi, usertests\n");
-    // auto-run usertests once for test.sh markers
+    // auto-run usertests + persist once for test.sh markers
     user_lib::print("[USER] sh: auto-run usertests\n");
-    {
-        let p = b"/bin/usertests\0";
-        let pid = user_lib::fork();
-        if pid == 0 {
-            let _ = user_lib::exec(p.as_ptr(), 0);
-            user_lib::exit(-1);
-        } else if pid > 0 {
-            let mut code: i32 = 0;
-            loop {
-                let w = user_lib::wait(&mut code as *mut i32);
-                if w == -2 {
-                    user_lib::yield_();
-                    continue;
-                }
-                break;
-            }
-        }
-    }
+    run_one(b"/bin/usertests\0");
+    run_one(b"/bin/persist\0");
     user_lib::print("sh$ ");
     let mut buf = [0u8; 128];
     loop {
@@ -206,6 +276,12 @@ pub extern "C" fn main() {
         if n == 0 {
             user_lib::yield_();
             continue;
+        }
+        // builtins
+        let t = trim(&buf[..n]);
+        if t.len() == 4 && t[0] == b'h' && t[1] == b'a' && t[2] == b'l' && t[3] == b't' {
+            user_lib::print("sh: halting\n");
+            user_lib::shutdown();
         }
         exec_cmd(&buf, n);
         user_lib::print("sh$ ");

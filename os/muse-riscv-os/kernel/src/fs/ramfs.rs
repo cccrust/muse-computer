@@ -162,6 +162,17 @@ pub fn unlink(path: &str) -> bool {
     false
 }
 
+pub fn truncate(path: &str) -> bool {
+    let mut fs = files().lock();
+    for f in fs.iter_mut() {
+        if f.path == path {
+            f.data.clear();
+            return true;
+        }
+    }
+    false
+}
+
 pub fn exists(path: &str) -> bool {
     if path == "/" {
         return true;

@@ -22,6 +22,8 @@ pub const SYS_LINK: usize = 18;
 pub const SYS_UNLINK: usize = 19;
 pub const SYS_FSTAT: usize = 20;
 pub const SYS_YIELD: usize = 21;
+pub const SYS_GETDENTS: usize = 22;
+pub const SYS_SHUTDOWN: usize = 23;
 
 pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) -> isize {
     match id {
@@ -50,10 +52,15 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_MKNOD => 0,
         SYS_LINK => 0,
         SYS_UNLINK => sys_unlink(a0) as isize,
-        SYS_FSTAT => 0,
+        SYS_FSTAT => sys_fstat(a0 as i32, a1) as isize,
         SYS_YIELD => {
             crate::task::yield_now();
             0
+        }
+        SYS_GETDENTS => sys_getdents(a0, a1, a2) as isize,
+        SYS_SHUTDOWN => {
+            crate::println!("[SYS] shutdown");
+            crate::sbi::shutdown();
         }
         _ => {
             crate::println!("[SYSCALL] unknown {}", id);
@@ -131,7 +138,7 @@ fn sys_read(fd: i32, buf: usize, len: usize) -> usize {
             4 => {
                 // file: need path from id
                 let path = fd_path_to_string(path_id);
-                let n = crate::fs::ramfs::read_at(&path, off, dst);
+                let n = crate::fs::read_at(&path, off, dst);
                 crate::task::with_current_mut(|p| {
                     p.fd_off[fd as usize] = off + n;
                 });
@@ -171,7 +178,7 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> usize {
             }
             4 => {
                 let path = fd_path_to_string(path_id);
-                let n = crate::fs::ramfs::write_at(&path, off, src);
+                let n = crate::fs::write_at(&path, off, src);
                 crate::task::with_current_mut(|p| {
                     p.fd_off[fd as usize] = off + n;
                 });
@@ -192,14 +199,17 @@ fn sys_open(path_ptr: usize, flags: i32) -> isize {
             Some(s) => s,
             None => return -1,
         };
-        // flags: 0=R,1=W,2=RW, 0x40=CREATE (match user-lib)
+        // flags: 0=R,1=W,2=RW, 0x40=CREATE, 0x200=TRUNC (match user-lib)
         const O_CREATE: i32 = 0x40;
-        if crate::fs::ramfs::read_file(&path).is_none() {
+        const O_TRUNC: i32 = 0x200;
+        if crate::fs::read_file(&path).is_none() {
             if flags & O_CREATE != 0 {
-                crate::fs::ramfs::write_file(&path, b"");
+                crate::fs::write_file(&path, b"");
             } else {
                 return -1;
             }
+        } else if flags & O_TRUNC != 0 {
+            crate::fs::truncate(&path);
         }
         // alloc fd
         let mut ret: isize = -1;
@@ -339,7 +349,7 @@ fn sys_mkdir(path_ptr: usize) -> isize {
     unsafe {
         match crate::fs::user_str(path_ptr) {
             Some(p) => {
-                if crate::fs::ramfs::mkdir(&p) {
+                if crate::fs::mkdir(&p) {
                     0
                 } else {
                     -1
@@ -354,7 +364,7 @@ fn sys_unlink(path_ptr: usize) -> isize {
     unsafe {
         match crate::fs::user_str(path_ptr) {
             Some(p) => {
-                if crate::fs::ramfs::unlink(&p) {
+                if crate::fs::unlink(&p) {
                     0
                 } else {
                     -1
@@ -362,6 +372,66 @@ fn sys_unlink(path_ptr: usize) -> isize {
             }
             None => -1,
         }
+    }
+}
+
+/// fstat(fd, out: *mut u32[2]) -> 0 ok / -1 err. out = [kind, size].
+/// kind: 1 stdin, 2 stdout/stderr, 4 file, 5/6 pipe.
+fn sys_fstat(fd: i32, out: usize) -> isize {
+    if out == 0 || fd < 0 || fd >= 16 {
+        return -1;
+    }
+    let (kind, ipath, _) = crate::task::with_current(|p| {
+        (
+            p.fd_kind[fd as usize],
+            p.fd_path[fd as usize],
+            p.fd_off[fd as usize],
+        )
+    });
+    let (k, sz) = match kind {
+        1 => (1u32, 0u32),
+        2 => (2u32, 0u32),
+        4 => {
+            let path = fd_path_to_string(ipath);
+            let (dk, ds) = crate::fs::stat(&path);
+            (if dk == 2 { 2 } else { 4 }, ds)
+        }
+        5 | 6 => (kind as u32, 0u32),
+        _ => return -1,
+    };
+    unsafe {
+        let o = out as *mut u32;
+        *o.add(0) = k;
+        *o.add(1) = sz;
+    }
+    0
+}
+
+/// getdents(path_ptr, buf, len): write NUL-separated names, return count.
+fn sys_getdents(path_ptr: usize, buf: usize, len: usize) -> isize {
+    if buf == 0 {
+        return -1;
+    }
+    unsafe {
+        let path = match crate::fs::user_str(path_ptr) {
+            Some(s) => s,
+            None => return -1,
+        };
+        let names = crate::fs::list_dir(&path);
+        let dst = crate::fs::user_slice_mut(buf, len);
+        let mut o = 0usize;
+        let mut cnt = 0isize;
+        for n in names.iter() {
+            let b = n.as_bytes();
+            if o + b.len() + 1 > len {
+                break;
+            }
+            dst[o..o + b.len()].copy_from_slice(b);
+            dst[o + b.len()] = 0;
+            o += b.len() + 1;
+            cnt += 1;
+        }
+        cnt
     }
 }
 

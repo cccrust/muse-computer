@@ -57,6 +57,13 @@ name = "mkfs"
 version = "0.1.0"
 
 [[package]]
+name = "persist"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
 name = "pipe_test"
 version = "0.1.0"
 dependencies = [

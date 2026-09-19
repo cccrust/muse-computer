@@ -66,6 +66,17 @@ pub fn unlink(path: *const u8) -> isize {
 pub fn yield_() -> isize {
     ecall(21, 0, 0, 0)
 }
+pub fn getdents(path: *const u8, buf: *mut u8, len: usize) -> isize {
+    ecall(22, path as usize, buf as usize, len)
+}
+pub fn shutdown() -> ! {
+    ecall(23, 0, 0, 0);
+    loop {}
+}
+/// fstat(fd, out: *mut u32[2]) -> out = [kind, size]
+pub fn fstat(fd: isize, out: *mut u32) -> isize {
+    ecall(20, fd as usize, out as usize, 0)
+}
 
 pub fn print(s: &str) {
     let _ = write(1, s.as_ptr(), s.len());

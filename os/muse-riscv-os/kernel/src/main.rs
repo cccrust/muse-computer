@@ -69,8 +69,6 @@ pub extern "C" fn rust_main() -> ! {
     timer::init();
     println!("[TIMER] enabled (10ms tick)");
     fs::init();
-    println!("[FS] ramfs init: /bin /etc README");
-    fs::virtio_probe();
     task::init();
     println!("[PROC] spawn init");
     println!("[TEST] boot markers ready");

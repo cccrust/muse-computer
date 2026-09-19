@@ -1,13 +1,28 @@
 pub mod ramfs;
 pub mod pipe;
 pub mod virtio;
+pub mod blk;
+pub mod disk;
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static USE_DISK: AtomicBool = AtomicBool::new(false);
+
+pub fn use_disk() -> bool {
+    USE_DISK.load(Ordering::Acquire)
+}
 
 pub fn init() {
-    ramfs::init();
     pipe::init();
-    // populate /bin with embedded ELFs
+    virtio::init();
+    if disk::mount() {
+        USE_DISK.store(true, Ordering::Release);
+        return;
+    }
+    // fallback: in-memory fs populated from embedded ELFs
+    crate::println!("[FS] disk mount failed, ramfs fallback");
+    ramfs::init();
     ramfs::write_file("/bin/init", crate::embed::INIT_ELF);
     ramfs::write_file("/bin/sh", crate::embed::SH_ELF);
     ramfs::write_file("/bin/ls", crate::embed::LS_ELF);
@@ -17,15 +32,121 @@ pub fn init() {
     ramfs::write_file("/bin/fork_test", crate::embed::FORK_ELF);
     ramfs::write_file("/bin/pipe_test", crate::embed::PIPE_ELF);
     ramfs::write_file("/bin/usertests", crate::embed::USERTESTS_ELF);
+    ramfs::write_file("/bin/persist", crate::embed::PERSIST_ELF);
     ramfs::write_file("/README", b"muse-riscv-os Unix-v6 like\ntry: ls cat echo grep fork_test pipe_test usertests\n");
 }
 
 pub fn read_file(path: &str) -> Option<Vec<u8>> {
-    ramfs::read_file(path)
+    if use_disk() {
+        // embed fallback for /bin when disk lacks the file
+        match disk::read_file(path) {
+            Some(d) => Some(d),
+            None => crate::embed::get_by_name(basename(path)),
+        }
+    } else {
+        ramfs::read_file(path)
+    }
 }
 
-pub fn virtio_probe() {
-    virtio::probe();
+fn basename(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        Some((_, n)) => n,
+        None => path,
+    }
+}
+
+pub fn write_file(path: &str, data: &[u8]) {
+    if use_disk() {
+        if disk::read_file(path).is_none() {
+            disk::create_empty(path);
+        } else {
+            disk::truncate_path(path);
+        }
+        disk::write_at(path, 0, data);
+    } else {
+        ramfs::write_file(path, data);
+    }
+}
+
+pub fn read_at(path: &str, off: usize, buf: &mut [u8]) -> usize {
+    if use_disk() {
+        disk::read_at(path, off, buf)
+    } else {
+        ramfs::read_at(path, off, buf)
+    }
+}
+
+pub fn write_at(path: &str, off: usize, buf: &[u8]) -> usize {
+    if use_disk() {
+        disk::write_at(path, off, buf)
+    } else {
+        ramfs::write_at(path, off, buf)
+    }
+}
+
+pub fn truncate(path: &str) -> bool {
+    if use_disk() {
+        disk::truncate_path(path)
+    } else {
+        ramfs::truncate(path)
+    }
+}
+
+pub fn list_dir(path: &str) -> Vec<alloc::string::String> {
+    if use_disk() {
+        disk::list_dir(path)
+    } else {
+        ramfs::list_dir(path)
+    }
+}
+
+pub fn mkdir(path: &str) -> bool {
+    if use_disk() {
+        disk::mkdir(path)
+    } else {
+        ramfs::mkdir(path)
+    }
+}
+
+pub fn unlink(path: &str) -> bool {
+    if use_disk() {
+        disk::unlink(path)
+    } else {
+        ramfs::unlink(path)
+    }
+}
+
+pub fn exists(path: &str) -> bool {
+    if use_disk() {
+        disk::exists(path)
+    } else {
+        ramfs::exists(path)
+    }
+}
+
+pub fn file_len(path: &str) -> Option<usize> {
+    if use_disk() {
+        disk::file_len(path)
+    } else {
+        ramfs::file_len(path)
+    }
+}
+
+pub fn stat(path: &str) -> (u8, u32) {
+    if use_disk() {
+        disk::stat(path)
+    } else {
+        match ramfs::read_file(path) {
+            Some(d) => (1, d.len() as u32),
+            None => {
+                if ramfs::exists(path) {
+                    (2, 0)
+                } else {
+                    (0, 0)
+                }
+            }
+        }
+    }
 }
 
 // user-memory helpers (SUM=1 so direct deref works)

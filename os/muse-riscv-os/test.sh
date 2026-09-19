@@ -5,10 +5,10 @@ TARGET=riscv64gc-unknown-none-elf
 PASS=1
 
 echo "=== 1. host unit tests ==="
-cargo test -p kernel -p host-tests || PASS=0
+cargo test -p kernel -p host-tests -p mkfs || PASS=0
 
 echo "=== 2. build user ELFs ==="
-cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests || PASS=0
+cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist || PASS=0
 
 echo "=== 3. mkfs ==="
 cargo run --release -p mkfs -- fs.img || PASS=0
@@ -46,7 +46,7 @@ $TO qemu-system-riscv64 \
   -nographic \
   -bios default \
   -kernel "$KBIN" \
-  -drive file=fs.img,if=none,format=raw,id=x0,file.locking=off \
+  -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   < /dev/null 2>&1 | tee qemu.log || true
 END=$(date +%s)
@@ -74,10 +74,41 @@ check "fork PASS"
 check "pipe PASS"
 check "usertests PASS"
 check "VIRTIO"
+check "virtio-blk RW PASS"
+check "disk mount ok"
+check "persist WRITE PASS"
 if grep -q "PANIC" qemu.log; then
   echo "FAIL: PANIC found"; PASS=0
 else
   echo "OK: no PANIC"
+fi
+
+echo "=== 7. persistence: second boot on SAME fs.img (no rebuild) ==="
+rm -f qemu2.log
+$TO qemu-system-riscv64 \
+  -machine virt \
+  -nographic \
+  -bios default \
+  -kernel "$KBIN" \
+  -drive file=fs.img,if=none,format=raw,id=x0 \
+  -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  < /dev/null 2>&1 | tee qemu2.log || true
+
+if [ ! -s qemu2.log ]; then
+  echo "FAIL: qemu2.log empty"
+  PASS=0
+else
+  if grep -q "persist READ PASS" qemu2.log; then
+    echo "OK: persist READ PASS"
+  else
+    echo "FAIL: missing [persist READ PASS] (data did not survive reboot)";
+    PASS=0
+  fi
+  if grep -q "PANIC" qemu2.log; then
+    echo "FAIL: PANIC in second boot"; PASS=0
+  else
+    echo "OK: no PANIC (second boot)"
+  fi
 fi
 
 if [ "$PASS" = "1" ]; then
