@@ -72,3 +72,14 @@ run.sh/test.sh         # -smp 2；QEMU 版本需求註明
 5. `test.sh` 斷言 + 整理文件。
 - 風險：AP 競態（3 個副核啟動時序交錯，比 2 核更容易撞；HSM 逐個起、每核印 banner 確認）、IPI 遺失（RFENCE 是 SBI 保證，比自幹可靠）、TLB 殘留症狀=幽靈 fault（沿用 v0.11 playbook：pid 印字、strace、`objdump`）、QEMU smp 下時序變慢（MTTCG 調度、超時窗口要留餘量，`test.sh` 的 25s 可能要放寬）、QEMU 版本差異（smp/topology，`qemu --version` 先記）。
 - 非目標（v1.0）：4 核以上調優、NUMA（無）、CPU 熱插拔、affinity API、per-CPU 排程（v1.1）、virtio-net、journal（v1.2+ 候選，v0.12 已鋪好測試前提）。
+
+## 8. 版本落點（v1.1 之後；重排版：數據優先，用戶可見優先）
+
+- v1.0：SMP bring-up（全域 queue + 大鎖，正確性先行）——已結案。
+- v1.1：per-CPU runqueue + 偷工作 + IPI 喚醒 + RFENCE 補帳——已結案。
+- v1.2：exit 記憶體回收 + 孤兒 reparent，附帶爭用計數器 + `stress` 燒機
+  （`v1.2.md`；test.sh 55 項：+reclaim、+stress）。
+- v1.3：virtio-net + 靜態 IPv4 + UDP（`v1.3.md`；56 項；建在大鎖上，不自創鎖序）。
+- v1.4：鎖判決——讀 v1.2/v1.3 的 `contention` 數據，熱才拆、冷就轉 TCP/journal
+  （`v1.4.md`；不預設寫碼）。
+- v1.5+ 候選：journal、TCP、ASID、affinity、swap（按需排序，另立版本檔）。

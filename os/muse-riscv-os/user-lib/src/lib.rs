@@ -172,6 +172,11 @@ pub fn munmap(addr: usize, len: usize) -> isize {
     ecall(31, addr, len, 0)
 }
 
+/// v1.2: memstat (SYS_MEMSTAT=36): returns free frame count (or -1).
+pub fn memstat() -> isize {
+    ecall(36, 0, 0, 0)
+}
+
 /// v0.9: ps(buf, len) fills "pid ppid state brk cwd\n" lines; trace(pid, on).
 pub fn ps(buf: *mut u8, len: usize) -> isize {
     ecall(32, buf as usize, len, 0)

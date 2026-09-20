@@ -8,7 +8,11 @@ static ALLOC: SpinMutex<FrameAlloc> = SpinMutex::new(FrameAlloc::empty());
 struct FrameAlloc {
     cur: usize,
     end: usize,
-    recycled: [usize; 4096],
+    // v1.2: recycle cache sized for all of RAM (128M = 32768 frames, 256K
+    // .bss). The old 4096 cap silently DROPPED frees past 16MB recycled --
+    // fine when nothing was ever freed, fatal once teardown frees whole
+    // address spaces. Within physical limits dealloc can no longer drop.
+    recycled: [usize; 32768],
     rlen: usize,
 }
 
@@ -17,7 +21,7 @@ impl FrameAlloc {
         Self {
             cur: 0,
             end: 0,
-            recycled: [0; 4096],
+            recycled: [0; 32768],
             rlen: 0,
         }
     }
@@ -45,7 +49,7 @@ impl FrameAlloc {
         }
     }
     fn dealloc(&mut self, ppn_addr: usize) {
-        if self.rlen < 4096 {
+        if self.rlen < 32768 {
             unsafe {
                 core::ptr::write_bytes(ppn_addr as *mut u8, 0, PAGE_SIZE);
             }
@@ -70,4 +74,11 @@ pub fn dealloc_frame(pa: usize) {
 pub fn frames_used() -> usize {
     let a = ALLOC.lock();
     (a.cur) as usize
+}
+
+/// v1.2: free frames = untouched high region + recycle cache.
+/// Backs SYS_MEMSTAT (reclaim_test asserts post-reap recovery).
+pub fn free_frames() -> usize {
+    let a = ALLOC.lock();
+    a.rlen + a.end.saturating_sub(a.cur) / PAGE_SIZE
 }

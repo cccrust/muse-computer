@@ -78,6 +78,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "reclaim_test"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
 name = "sh"
 version = "0.1.0"
 dependencies = [
@@ -86,6 +93,13 @@ dependencies = [
 
 [[package]]
 name = "smp_test"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
+name = "stress"
 version = "0.1.0"
 dependencies = [
  "user-lib",

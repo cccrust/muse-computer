@@ -36,6 +36,11 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
             user_lib::print("[USER] init: exec sh failed\n");
             user_lib::exit(-1);
         } else if pid > 0 {
+            // v1.2: wait specifically for sh; reparented orphans are
+            // reaped (and ignored) here so their address spaces recycle.
+            // Without the pid check, each orphan reap would spawn a
+            // duplicate sh.
+            let sh_pid = pid;
             let mut code: i32 = 0;
             loop {
                 let w = user_lib::wait(&mut code as *mut i32);
@@ -43,7 +48,10 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
                     user_lib::yield_();
                     continue;
                 }
-                break;
+                if w == sh_pid || w < 0 {
+                    break;
+                }
+                // reaped an orphaned child; keep waiting for sh
             }
             user_lib::print("[USER] init: sh exited, respawn\n");
         } else {

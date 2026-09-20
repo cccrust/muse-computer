@@ -206,6 +206,64 @@ pub fn alloc_map_user(root: usize, va: usize, len: usize, flags: u64) {
     }
 }
 
+/// v1.2: tear down a dead user address space. Walks L2/L1/L0 (mirror of
+/// clone_user/copy_kernel_tables), deallocating every U leaf frame and
+/// every intermediate table page, then the root itself. Non-U leaves
+/// (kernel copies, TF mapping) are SKIPPED -- their frames are borrowed,
+/// not owned (TF is freed separately via tf_pa).
+/// The intermediate table PAGES are always owned: every valid non-leaf
+/// PTE in a user root was allocated for that root (fresh root + ensure
+/// tables), even tables that also hold borrowed non-U leaves.
+/// Caller: waitpid reap, AFTER the slot is gone and WITHOUT the sched
+/// lock; followed by pt::remote_flush_all() (freed frames are reused
+/// under ASID 0 -- stale remote TLB entries would alias the next mapping).
+pub fn free_user_space(root: usize) {
+    unsafe {
+        for v2 in 0..512 {
+            let e2 = *((root as *const u64).add(v2));
+            if e2 & pt::PTE_V == 0 {
+                continue;
+            }
+            if e2 & (pt::PTE_R | pt::PTE_W | pt::PTE_X) != 0 {
+                // L2 leaf (1G; we never create U ones, but be thorough)
+                if e2 & pt::PTE_U != 0 {
+                    crate::mem::frame::dealloc_frame(pt::pte_pa(e2));
+                }
+                continue;
+            }
+            let l1 = pt::pte_pa(e2);
+            for v1 in 0..512 {
+                let e1 = *((l1 as *const u64).add(v1));
+                if e1 & pt::PTE_V == 0 {
+                    continue;
+                }
+                if e1 & (pt::PTE_R | pt::PTE_W | pt::PTE_X) != 0 {
+                    if e1 & pt::PTE_U != 0 {
+                        crate::mem::frame::dealloc_frame(pt::pte_pa(e1));
+                    }
+                    continue;
+                }
+                let l0 = pt::pte_pa(e1);
+                for v0 in 0..512 {
+                    let e0 = *((l0 as *const u64).add(v0));
+                    if e0 & pt::PTE_V == 0 {
+                        continue;
+                    }
+                    // U leaf with permissions = owned page; anything else
+                    // (borrowed TF/kernel leaf, table pointers) skipped
+                    if e0 & pt::PTE_U != 0
+                        && e0 & (pt::PTE_R | pt::PTE_W | pt::PTE_X) != 0
+                    {
+                        crate::mem::frame::dealloc_frame(pt::pte_pa(e0));
+                    }
+                }
+                crate::mem::frame::dealloc_frame(l0);
+            }
+            crate::mem::frame::dealloc_frame(l1);
+        }
+        crate::mem::frame::dealloc_frame(root);
+    }
+}
 /// v0.8: unmap user pages in [va, va+len) and recycle their frames.
 /// Skips unmapped / non-U pages (partial ranges are safe).
 /// v1.1: remote-flushes all harts afterwards (freed frames are reused for

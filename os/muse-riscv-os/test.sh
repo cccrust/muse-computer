@@ -8,7 +8,7 @@ echo "=== 1. host unit tests ==="
 cargo test -p kernel -p host-tests -p mkfs || PASS=0
 
 echo "=== 2. build user ELFs ==="
-cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test || PASS=0
+cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress || PASS=0
 
 echo "=== 3. mkfs ==="
 cargo run --release -p mkfs -- fs.img || PASS=0
@@ -78,6 +78,8 @@ check "fork PASS"
 check "pipe PASS"
 check "usertests PASS"
 check "smp PASS"
+check "reclaim PASS"
+check "stress DONE"
 check "ipi PASS"
 check "hart0 up"
 check "hart1 up"
@@ -185,6 +187,20 @@ else
     echo "OK: cache stats (run3)"
   else
     echo "FAIL: missing [cache stats] in qemu3.log";
+    PASS=0
+  fi
+  # v1.2: scheduler balance + contention verdict lines on clean shutdown
+  # (numbers vary; presence only -- values feed the v1.4 lock decision)
+  if grep -q "steals=" qemu3.log; then
+    echo "OK: steals line (run3)"
+  else
+    echo "FAIL: missing [steals=] in qemu3.log";
+    PASS=0
+  fi
+  if grep -q "contention sched=" qemu3.log; then
+    echo "OK: contention line (run3)"
+  else
+    echo "FAIL: missing [contention sched=] in qemu3.log";
     PASS=0
   fi
   # v0.6: THRE delivery is only observable when an external trap claims it;

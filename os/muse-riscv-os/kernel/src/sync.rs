@@ -27,6 +27,25 @@ impl<T> SpinMutex<T> {
         }
         Guard { m: self }
     }
+    /// v1.2: counted lock for contention verdicts (v1.4). Counts every
+    /// failed CAS (total spin pressure, not just first miss). The counter
+    /// is caller-chosen so hot locks (UART/TX) stay uncounted.
+    pub fn lock_counted(&self, miss: &core::sync::atomic::AtomicU64) -> Guard<'_, T> {
+        loop {
+            match self.locked.compare_exchange(
+                false,
+                true,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Guard { m: self },
+                Err(_) => {
+                    miss.fetch_add(1, Ordering::Relaxed);
+                    core::hint::spin_loop();
+                }
+            }
+        }
+    }
 }
 
 pub struct Guard<'a, T> {

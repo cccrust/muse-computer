@@ -41,6 +41,8 @@ pub const SYS_TRACE: usize = 33;
 pub const SYS_EXECVE: usize = 34;
 // v1.0
 pub const SYS_GETHART: usize = 35;
+// v1.2
+pub const SYS_MEMSTAT: usize = 36;
 
 pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) -> isize {
     match id {
@@ -87,6 +89,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_TRACE => sys_trace(a0, a1) as isize,
         SYS_EXECVE => sys_execve(a0, a1, a2) as isize,
         SYS_GETHART => (crate::task::hartid() % crate::MAX_HART) as isize,
+        SYS_MEMSTAT => crate::mem::frame::free_frames() as isize,
         SYS_SHUTDOWN => {
             crate::println!("[SYS] shutdown");
             if crate::fs::use_disk() {

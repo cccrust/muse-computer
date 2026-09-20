@@ -14,6 +14,8 @@ members = [
   "user/persist",
   "user/printenv",
   "user/smp_test",
+  "user/reclaim_test",
+  "user/stress",
   "tools/mkfs",
   "host-tests",
 ]

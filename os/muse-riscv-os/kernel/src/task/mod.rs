@@ -75,10 +75,16 @@ struct Sched {
 static STEALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// v1.1: scheduler balance stats line (called on the halt path).
+/// v1.2: plus the SCHED-lock contention verdict line (v1.4 decision data).
 pub fn print_stats() {
     crate::println!(
         "[SMP] steals={}",
         STEALS.load(core::sync::atomic::Ordering::SeqCst)
+    );
+    crate::println!(
+        "[SMP] contention sched={}/{}",
+        SCHED_MISS.load(core::sync::atomic::Ordering::SeqCst),
+        SCHED_ACQ.load(core::sync::atomic::Ordering::SeqCst)
     );
 }
 
@@ -116,6 +122,16 @@ fn sched() -> &'static crate::sync::SpinMutex<Sched> {
     unsafe { SCHED.as_ref().unwrap() }
 }
 
+// v1.2: contention verdict data (v1.4 lock decision). Every SCHED
+// acquisition goes through here; failed CAS spins are counted.
+static SCHED_MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SCHED_ACQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn sched_lock() -> crate::sync::Guard<'static, Sched> {
+    SCHED_ACQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    sched().lock_counted(&SCHED_MISS)
+}
+
 /// v1.0: current hart id, from tp (set at entry for every hart).
 #[inline(always)]
 pub fn hartid() -> usize {
@@ -127,18 +143,18 @@ pub fn hartid() -> usize {
 }
 
 pub fn set_yield_flag() {
-    sched().lock().yield_flag[hartid() % crate::MAX_HART] = true;
+    sched_lock().yield_flag[hartid() % crate::MAX_HART] = true;
 }
 pub fn take_yield_flag() -> bool {
     let h = hartid() % crate::MAX_HART;
-    let mut s = sched().lock();
+    let mut s = sched_lock();
     let v = s.yield_flag[h];
     s.yield_flag[h] = false;
     v
 }
 
 pub fn current_pid() -> usize {
-    sched().lock().current[hartid() % crate::MAX_HART]
+    sched_lock().current[hartid() % crate::MAX_HART]
 }
 
 /// v1.1: enqueue pid on hart hq's runqueue. Caller holds the sched lock.
@@ -218,7 +234,7 @@ fn pick_locked(s: &mut Sched, h: usize) -> Option<usize> {
 fn kick_idle() {
     let mut mask = 0usize;
     {
-        let s = sched().lock();
+        let s = sched_lock();
         for h in 0..crate::MAX_HART {
             if s.idle[h] && !s.queues[h].is_empty() {
                 mask |= 1 << h;
@@ -270,7 +286,7 @@ pub fn init() {
 
 fn new_proc(name: &str, parent: usize) -> (usize, usize, usize) {
     // returns (pid, root, tf_pa)
-    let mut s = sched().lock();
+    let mut s = sched_lock();
     let pid = s.next_pid;
     s.next_pid += 1;
     let root = mem::new_user_space();
@@ -316,7 +332,7 @@ fn finish_spawn(
     let bs = name.as_bytes();
     let n = bs.len().min(31);
     nb[..n].copy_from_slice(&bs[..n]);
-    let mut s = sched().lock();
+    let mut s = sched_lock();
     let mut fds = [-1i32; 16];
     let mut kind = [0u8; 16];
     if parent == 0 {
@@ -521,7 +537,7 @@ fn push_args(root: usize, args: &[Vec<u8>], env: &[Vec<u8>]) -> usize {
 pub fn fork(parent_pid: usize) -> usize {
     // gather parent info without holding lock across allocs
     let (p_root, p_tf, p_brk, p_kind, p_fds, p_off, p_path, pname, p_cwd, p_cwd_len, p_cloexec, p_mmap_base, p_brk_min) = {
-        let s = sched().lock();
+        let s = sched_lock();
         let p = s.procs[parent_pid].as_ref().expect("no parent").clone_proc_info();
         p
     };
@@ -538,7 +554,7 @@ pub fn fork(parent_pid: usize) -> usize {
     }
     // user stack already cloned via clone_user; ensure stack mapping exists
     // brk etc
-    let mut s = sched().lock();
+    let mut s = sched_lock();
     // re-fetch name
     let mut nb = [0u8; 32];
     nb.copy_from_slice(&pname);
@@ -597,7 +613,7 @@ pub fn exec(pid: usize, path: &str, args: &[Vec<u8>], env: &[Vec<u8>]) -> bool {
     // new address space
     let new_root = mem::new_user_space();
     let tf_pa = {
-        let s = sched().lock();
+        let s = sched_lock();
         s.procs[pid].as_ref().unwrap().tf_pa
     };
     // remap TF into new root
@@ -638,7 +654,7 @@ pub fn exec(pid: usize, path: &str, args: &[Vec<u8>], env: &[Vec<u8>]) -> bool {
         (*tf).sstatus = (1 << 5) | (1 << 18);
         (*tf).kernel_sp = crate::trap::trap_stack_top();
     }
-    let mut s = sched().lock();
+    let mut s = sched_lock();
     if let Some(Some(p)) = s.procs.get_mut(pid) {
         p.root = new_root;
         let new_brk = brk.max(0x20000);
@@ -673,10 +689,40 @@ pub fn exec(pid: usize, path: &str, args: &[Vec<u8>], env: &[Vec<u8>]) -> bool {
 
 pub fn exit(pid: usize, code: i32) {
     let next = {
-        let mut s = sched().lock();
+        let mut s = sched_lock();
         if let Some(Some(p)) = s.procs.get_mut(pid) {
             p.state = State::Zombie;
             p.exit_code = code;
+        }
+        // v1.2: reparent live children to init (pid 1) so orphan zombies
+        // are reaped by init's wait loop instead of leaking forever.
+        // (If init itself is dying there is no one left to reap; the
+        // children stay until the machine halts -- acceptable.)
+        if pid != 1 {
+            let orphans: Vec<usize> = match s.procs.get(pid).and_then(|o| o.as_ref()) {
+                Some(p) => p.children.clone(),
+                None => Vec::new(),
+            };
+            for c in orphans {
+                // Move live AND zombie children: init's wait(-1) loop
+                // reaps the zombies; a zombie left here would leak both
+                // its slot and (unreaped) address space.
+                let mut moved = false;
+                if let Some(Some(ch)) = s.procs.get_mut(c) {
+                    ch.parent = 1;
+                    moved = true;
+                }
+                if moved {
+                    if let Some(Some(init)) = s.procs.get_mut(1) {
+                        if !init.children.contains(&c) {
+                            init.children.push(c);
+                        }
+                    }
+                }
+            }
+            if let Some(Some(me)) = s.procs.get_mut(pid) {
+                me.children.clear();
+            }
         }
         // wake parent if waiting? parent polls.
         // pick next runnable
@@ -741,7 +787,7 @@ pub fn kill(pid: usize) -> bool {
 fn kill_with(pid: usize, code: i32) -> bool {
     let h = hartid() % crate::MAX_HART;
     let queued = {
-        let mut s = sched().lock();
+        let mut s = sched_lock();
         let blocked = match s.procs.get_mut(pid) {
             Some(Some(p)) => {
                 if p.state == State::Zombie {
@@ -773,12 +819,12 @@ fn kill_with(pid: usize, code: i32) -> bool {
 }
 
 pub fn is_killed(pid: usize) -> bool {
-    let s = sched().lock();
+    let s = sched_lock();
     matches!(s.procs.get(pid), Some(Some(p)) if p.killed)
 }
 
 pub fn kill_code(pid: usize) -> i32 {
-    let s = sched().lock();
+    let s = sched_lock();
     s.procs
         .get(pid)
         .and_then(|o| o.as_ref())
@@ -805,7 +851,7 @@ pub fn kill_fg() -> bool {
 // ---- blocking ----
 /// Block current task (trap context only); caller must yield.
 pub fn block_current(reason: u8, wake_at: u64) {
-    let mut s = sched().lock();
+    let mut s = sched_lock();
     let cur = s.current[hartid() % crate::MAX_HART];
     if let Some(Some(p)) = s.procs.get_mut(cur) {
         if p.state == State::Running {
@@ -841,7 +887,7 @@ fn wake_locked(s: &mut Sched, pid: usize, hq: usize) -> bool {
 pub fn wake_stdin() {
     let h = hartid() % crate::MAX_HART;
     let queued = {
-        let mut s = sched().lock();
+        let mut s = sched_lock();
         let ids: Vec<usize> = s
             .procs
             .iter()
@@ -866,7 +912,7 @@ pub fn wake_stdin() {
 pub fn wake_virtio() {
     let h = hartid() % crate::MAX_HART;
     let queued = {
-        let mut s = sched().lock();
+        let mut s = sched_lock();
         let ids: Vec<usize> = s
             .procs
             .iter()
@@ -901,7 +947,7 @@ static SCHED_ACTIVE: core::sync::atomic::AtomicBool =
 pub fn wake_sleepers(now: u64) {
     let h = hartid() % crate::MAX_HART;
     let queued = {
-        let mut s = sched().lock();
+        let mut s = sched_lock();
         let ids: Vec<usize> = s
             .procs
             .iter()
@@ -938,7 +984,7 @@ pub fn schedule_point(_old_tf: *mut TrapFrame) {
     // v1.1: local runqueue first, steal on empty (big lock retained).
     let h = hartid() % crate::MAX_HART;
     let next = {
-        let mut s = sched().lock();
+        let mut s = sched_lock();
         // TEMP DBG v1.0-2: exclusion check on the hottest path
         unsafe {
             if DEBUG_SCHED_IN {
@@ -1028,7 +1074,7 @@ pub fn schedule_point(_old_tf: *mut TrapFrame) {
     };
     if let Some(pid) = next {
         let root = {
-            let s = sched().lock();
+            let s = sched_lock();
             s.procs[pid].as_ref().unwrap().root
         };
         pt::activate(root);
@@ -1128,7 +1174,7 @@ fn switch_to(next: Option<usize>) {    match next {
             // v1.0: exiting task's hart takes the next task
             let h = hartid() % crate::MAX_HART;
             let root = {
-                let mut s = sched().lock();
+                let mut s = sched_lock();
                 // re-validate under lock: the pick was made under lock in
                 // find_next, but the lock dropped before we got here; a
                 // reaped pid must never be entered (paused here as Running
@@ -1166,7 +1212,7 @@ fn switch_to(next: Option<usize>) {    match next {
             // the explicit SYS_SHUTDOWN (halt) path.
             // v1.1: mark idle under lock so kick_idle() can target us.
             let h = hartid() % crate::MAX_HART;
-            sched().lock().idle[h] = true;
+            sched_lock().idle[h] = true;
             idle_on_hart(h);
         }
     }
@@ -1181,7 +1227,7 @@ fn switch_to(next: Option<usize>) {    match next {
 pub fn run_on(hart: usize) -> ! {
     let h = hart % crate::MAX_HART;
     loop {
-        let mut s = sched().lock();
+        let mut s = sched_lock();
         // TEMP DBG: exclusion check
         unsafe {
             if DEBUG_IN_CRIT {
@@ -1226,7 +1272,7 @@ fn enter_user(_pid: usize) -> ! {
     unsafe {
         let cur = current_pid();
         let (tf_pa, sepc, sstatus) = {
-            let s = sched().lock();
+            let s = sched_lock();
             let p = s.procs[cur].as_ref().unwrap();
             (p.tf_pa, (p.tf_pa as *const TrapFrame).as_ref().unwrap().sepc, (p.tf_pa as *const TrapFrame).as_ref().unwrap().sstatus)
         };
@@ -1300,13 +1346,13 @@ __enter_user_asm:
 
 // helpers for syscall layer (v1.0: per-hart current)
 pub fn with_current<R>(f: impl FnOnce(&Proc) -> R) -> R {
-    let s = sched().lock();
+    let s = sched_lock();
     let pid = s.current[hartid() % crate::MAX_HART];
     let p: &Proc = s.procs[pid].as_ref().unwrap();
     f(p)
 }
 pub fn with_current_mut<R>(f: impl FnOnce(&mut Proc) -> R) -> R {
-    let mut s = sched().lock();
+    let mut s = sched_lock();
     let pid = s.current[hartid() % crate::MAX_HART];
     let p: &mut Proc = s.procs[pid].as_mut().unwrap();
     f(p)
@@ -1382,7 +1428,7 @@ pub const WNOHANG: usize = 1;
 pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
     let nohang = options & WNOHANG != 0;
     let child = {
-        let mut s = sched().lock();
+        let mut s = sched_lock();
         let children = match s.procs.get(pid).and_then(|o| o.as_ref()) {
             Some(p) => p.children.clone(),
             None => return (-1, 0),
@@ -1400,7 +1446,12 @@ pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
             }
         }
         if let Some((c, code)) = found {
-            s.procs[c] = None;
+            // v1.2: capture the dead address space, THEN release everything
+            // without the sched lock (slot is gone; nobody can touch it).
+            let dead = match s.procs[c].take() {
+                Some(p) => Some((p.root, p.tf_pa)),
+                None => None,
+            };
             // v1.1: purge stale entries from ALL runqueues (pick paths
             // filter strays, but keep the queues clean anyway).
             for q in s.queues.iter_mut() {
@@ -1408,6 +1459,14 @@ pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
             }
             if let Some(Some(pp)) = s.procs.get_mut(pid) {
                 pp.children.retain(|&x| x != c);
+            }
+            if let Some((root, tf_pa)) = dead {
+                drop(s);
+                crate::mem::free_user_space(root);
+                crate::mem::frame::dealloc_frame(tf_pa);
+                // freed frames are reused under ASID 0: flush remotes so
+                // stale TLB entries cannot alias the next mappings.
+                crate::mem::pagetable::remote_flush_all();
             }
             Some((c as i32, code as usize))
         } else {
@@ -1443,7 +1502,7 @@ pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
 
 // ---- cwd + path resolution (v0.5) ----
 pub fn get_cwd(pid: usize) -> alloc::string::String {
-    let s = sched().lock();
+    let s = sched_lock();
     match s.procs.get(pid).and_then(|o| o.as_ref()) {
         Some(p) => {
             let n = p.cwd_len.min(128);
@@ -1457,7 +1516,7 @@ pub fn set_cwd(pid: usize, cwd: &str) -> bool {
     if !cwd.starts_with('/') || cwd.len() > 127 {
         return false;
     }
-    let mut s = sched().lock();
+    let mut s = sched_lock();
     match s.procs.get_mut(pid).and_then(|o| o.as_mut()) {
         Some(p) => {
             let b = cwd.as_bytes();
@@ -1510,7 +1569,7 @@ pub fn resolve_for(pid: usize, path: &str) -> alloc::string::String {
 
 // ---- v0.9: strace flag + ps snapshot ----
 pub fn set_traced(pid: usize, on: bool) -> bool {
-    let mut s = sched().lock();
+    let mut s = sched_lock();
     match s.procs.get_mut(pid).and_then(|o| o.as_mut()) {
         Some(p) => {
             p.traced = on;
@@ -1521,13 +1580,13 @@ pub fn set_traced(pid: usize, on: bool) -> bool {
 }
 
 pub fn is_traced(pid: usize) -> bool {
-    let s = sched().lock();
+    let s = sched_lock();
     matches!(s.procs.get(pid), Some(Some(p)) if p.traced)
 }
 
 /// One line per live proc: "pid ppid state brk cwd\n". state: R/B/Z.
 pub fn ps_snapshot() -> alloc::string::String {
-    let s = sched().lock();
+    let s = sched_lock();
     let mut out = alloc::string::String::new();
     for slot in s.procs.iter() {
         if let Some(p) = slot {

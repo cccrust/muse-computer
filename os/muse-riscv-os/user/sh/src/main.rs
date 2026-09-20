@@ -1143,6 +1143,8 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     user_lib::print("[USER] sh: auto-run usertests\n");
     run_one(b"/bin/usertests\0", &mut jobs);
     run_one(b"/bin/smp_test\0", &mut jobs);
+    run_one(b"/bin/reclaim_test\0", &mut jobs);
+    run_one(b"/bin/stress\0", &mut jobs);
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);
