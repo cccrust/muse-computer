@@ -39,6 +39,8 @@ pub const SYS_PS: usize = 32;
 pub const SYS_TRACE: usize = 33;
 // v0.11
 pub const SYS_EXECVE: usize = 34;
+// v1.0
+pub const SYS_GETHART: usize = 35;
 
 pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) -> isize {
     match id {
@@ -84,6 +86,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_PS => sys_ps(a0, a1) as isize,
         SYS_TRACE => sys_trace(a0, a1) as isize,
         SYS_EXECVE => sys_execve(a0, a1, a2) as isize,
+        SYS_GETHART => (crate::task::hartid() % crate::MAX_HART) as isize,
         SYS_SHUTDOWN => {
             crate::println!("[SYS] shutdown");
             if crate::fs::use_disk() {
@@ -142,6 +145,21 @@ fn sys_wait(uaddr: usize) -> isize {
 fn sys_read(fd: i32, buf: usize, len: usize) -> usize {
     if len == 0 {
         return 0;
+    }
+    // TEMP DBG v1.0-2: wild userlen writes corrupt kernel memory (S-mode
+    // can touch anything); freeze hotel for inspection instead of mayhem.
+    if len > 65536 {
+        crate::println!(
+            "[DBG] HUGE-READ fd={} buf={:#x} len={} pid={} hart={}",
+            fd,
+            buf,
+            len,
+            crate::task::current_pid(),
+            crate::task::hartid() % crate::MAX_HART
+        );
+        loop {
+            unsafe { core::arch::asm!("wfi") };
+        }
     }
     let pid = crate::task::current_pid();
     let (kind, path_id, off) = crate::task::with_current(|p| {
@@ -204,6 +222,20 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> usize {
     if len == 0 {
         return 0;
     }
+    // TEMP DBG v1.0-2: see sys_read note.
+    if len > 65536 {
+        crate::println!(
+            "[DBG] HUGE-WRITE fd={} buf={:#x} len={} pid={} hart={}",
+            fd,
+            buf,
+            len,
+            crate::task::current_pid(),
+            crate::task::hartid() % crate::MAX_HART
+        );
+        loop {
+            unsafe { core::arch::asm!("wfi") };
+        }
+    }
     let pid = crate::task::current_pid();
     let (kind, path_id, off) = crate::task::with_current(|p| {
         if fd < 0 || fd >= 16 {
@@ -216,10 +248,10 @@ fn sys_write(fd: i32, buf: usize, len: usize) -> usize {
         let src = crate::fs::user_slice(buf, len);
         match kind {
             2 => {
-                // stdout/stderr -> console
-                for &b in src {
-                    crate::uart::putchar(b);
-                }
+                // stdout/stderr -> console (whole write under one lock;
+                // see console::write_bytes -- byte-wise putchar here
+                // would tear lines against other harts' prints)
+                crate::console::write_bytes(src);
                 len
             }
             4 => {

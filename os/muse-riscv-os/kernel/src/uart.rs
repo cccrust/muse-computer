@@ -31,13 +31,11 @@ pub fn irq_enable() {
 
 /// Enable TX-empty interrupt path. Before this, putchar() polls.
 pub fn tx_enable() {
-    unsafe {
-        TX_ON = true;
-    }
+    TX_ON.store(true, core::sync::atomic::Ordering::SeqCst);
 }
 
 pub fn putchar(c: u8) {
-    if !unsafe { TX_ON } {
+    if !TX_ON.load(core::sync::atomic::Ordering::SeqCst) {
         // early boot: poll
         unsafe {
             while core::ptr::read_volatile(reg(R_LSR)) & LSR_TX_EMPTY == 0 {}
@@ -45,6 +43,10 @@ pub fn putchar(c: u8) {
         }
         return;
     }
+    // v1.0: enqueue + arm + kick under ONE lock acquisition. The kick
+    // (THR write) must be mutually exclusive with the ISR drain, or two
+    // harts can both observe THR-empty and one byte gets overwritten.
+    // Short critical section, never blocks: safe under SMP.
     let full = {
         let mut g = TX.lock();
         if g.n < TX_CAP {
@@ -52,6 +54,18 @@ pub fn putchar(c: u8) {
             g.buf[w] = c;
             g.w = (w + 1) % TX_CAP;
             g.n += 1;
+            unsafe {
+                let ier = core::ptr::read_volatile(reg(R_IER));
+                core::ptr::write_volatile(reg(R_IER), ier | IER_TX);
+                if core::ptr::read_volatile(reg(R_LSR)) & LSR_TX_EMPTY != 0
+                    && g.n > 0
+                {
+                    let b = g.buf[g.r];
+                    g.r = (g.r + 1) % TX_CAP;
+                    g.n -= 1;
+                    core::ptr::write_volatile(reg(R_RBR), b);
+                }
+            }
             false
         } else {
             true
@@ -62,17 +76,6 @@ pub fn putchar(c: u8) {
         unsafe {
             while core::ptr::read_volatile(reg(R_LSR)) & LSR_TX_EMPTY == 0 {}
             core::ptr::write_volatile(reg(R_RBR), c);
-        }
-        return;
-    }
-    unsafe {
-        // arm THRE interrupt, then kick the chain if THR is already empty
-        let ier = core::ptr::read_volatile(reg(R_IER));
-        core::ptr::write_volatile(reg(R_IER), ier | IER_TX);
-        if core::ptr::read_volatile(reg(R_LSR)) & LSR_TX_EMPTY != 0 {
-            if let Some(b) = tx_pop() {
-                core::ptr::write_volatile(reg(R_RBR), b);
-            }
         }
     }
 }
@@ -94,8 +97,9 @@ static TX: SpinMutex<TxRing> = SpinMutex::new(TxRing {
     n: 0,
 });
 
-static mut TX_ON: bool = false;
-static mut TX_MARKED: bool = false;
+static TX_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+// v1.0: atomic -- two harts can enter tx_drain concurrently on first use
+static TX_MARKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn tx_pop() -> Option<u8> {
     let mut g = TX.lock();
@@ -114,10 +118,7 @@ fn tx_pop() -> Option<u8> {
 fn tx_drain() {
     // first THRE entry proves TX-empty IRQ delivery (the kick path may have
     // already moved the bytes, so don't gate the marker on moved > 0)
-    if !unsafe { TX_MARKED } {
-        unsafe {
-            TX_MARKED = true;
-        }
+    if !TX_MARKED.swap(true, core::sync::atomic::Ordering::SeqCst) {
         crate::println!("[TEST] uart-tx-irq PASS");
     }
     loop {

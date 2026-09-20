@@ -41,8 +41,35 @@ static mut AVAIL_IDX: u16 = 0;
 static mut LAST_USED: u16 = 0;
 static mut READY: bool = false;
 static mut NCAP: u64 = 0;
-// v0.6: completion-interrupt stats
-static mut IRQ_COUNT: u64 = 0;
+// v0.6: completion-interrupt stats (v1.0: atomic, ISR races syscalls
+// across harts; saturating to avoid any failure path)
+static IRQ_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// v1.0: single-flight driver lock. The queue + HDR/DATA/STB buffers are
+// shared by all harts; concurrent submit() calls would mix up requests
+// and corrupt DATA (observed: "exec sh failed" under -smp 4).
+// Pure spin (never block_current here): the holder always makes progress
+// independently on its own hart, so a spinner holds nothing and cannot
+// deadlock. Blocking while spinning would be worse than useless -- the
+// task is still current[] on its hart, so a wake would queue it twice
+// (see wake_locked) and two harts would run one task.
+static DRV_BUSY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+fn drv_lock() {
+    use core::sync::atomic::Ordering::SeqCst;
+    while DRV_BUSY
+        .compare_exchange(false, true, SeqCst, SeqCst)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+fn drv_unlock() {
+    use core::sync::atomic::Ordering::SeqCst;
+    DRV_BUSY.store(false, SeqCst);
+}
 
 // single-flight request buffers (identity-mapped .bss, whole RAM mapped)
 static mut HDR: [u8; 16] = [0; 16];
@@ -209,58 +236,33 @@ unsafe fn submit(write: bool, lba: u32) -> bool {
     w16(a + 2, AVAIL_IDX);
     fence();
     w32(R_QNOTIFY, 0);
-    // ---- completion wait (v0.6 hybrid) ----
     let u = used_pa();
-    // fast path: brief poll (covers boot + already-done device)
-    let mut spins = 0u32;
-    while r16(u + 2) == LAST_USED && spins < 5000 {
+    // ---- completion wait: pure poll (v1.0) ----
+    // NOTE: this runs inside a syscall (trap) or at boot -- kernel context
+    // with SIE=0, so this hart takes no interrupts and can never deschedule
+    // here. block_current() in this loop would only mark the task Blocked
+    // while it is still current[] and executing; a wake from another hart
+    // would then queue it a second time and two harts would run one task.
+    // So: poll the used ring (the device advances it on its own) with a
+    // deadline from the global tick (other harts advance it) plus a local
+    // iteration bound in case all harts are spinning and ticks freeze.
+    let deadline = crate::timer::ticks().wrapping_add(500);
+    let mut local = 0u32;
+    loop {
         fence();
-        spins += 1;
+        if r16(u + 2) != LAST_USED {
+            break;
+        }
+        if crate::timer::ticks() >= deadline {
+            break;
+        }
+        local = local.wrapping_add(1);
+        if local > 100_000_000 {
+            break;
+        }
     }
     if r16(u + 2) == LAST_USED {
-        if crate::task::scheduler_active() {
-            // running system: block until the completion ISR (or the
-            // timer-tick watchdog, see trap.rs) wakes us. The deadline is
-            // re-checked on every wake -- a sleeper cannot check time
-            // itself -- then we fall back to bounded poll (no hang even
-            // if the IRQ is lost entirely).
-            let deadline = crate::timer::ticks().wrapping_add(500);
-            loop {
-                fence();
-                if r16(u + 2) != LAST_USED {
-                    break;
-                }
-                if crate::timer::ticks() >= deadline {
-                    break;
-                }
-                crate::task::block_current(crate::task::BLOCK_VIRTIO, 0);
-                crate::task::yield_now();
-            }
-            let mut s2 = 0u32;
-            loop {
-                fence();
-                if r16(u + 2) != LAST_USED {
-                    break;
-                }
-                s2 += 1;
-                if s2 > 20_000_000 {
-                    return false;
-                }
-            }
-        } else {
-            // boot (kernel context, SIE=0 so no ISR can fire): pure poll
-            let mut s2 = 0u32;
-            loop {
-                fence();
-                if r16(u + 2) != LAST_USED {
-                    break;
-                }
-                s2 += 1;
-                if s2 > 20_000_000 {
-                    return false;
-                }
-            }
-        }
+        return false;
     }
     fence();
     let slot = (LAST_USED as usize) % QDEPTH;
@@ -281,7 +283,12 @@ pub fn on_irq() {
     unsafe {
         let st = r32(R_INTSTAT);
         if st & 1 != 0 {
-            IRQ_COUNT = IRQ_COUNT.wrapping_add(1);
+            // saturating: cap at u64::MAX instead of wrapping
+            let _ = IRQ_COUNT.fetch_update(
+                core::sync::atomic::Ordering::SeqCst,
+                core::sync::atomic::Ordering::SeqCst,
+                |v| v.checked_add(1),
+            );
             w32(R_INTACK, st);
             fence();
         }
@@ -290,33 +297,41 @@ pub fn on_irq() {
 }
 
 pub fn irq_count() -> u64 {
-    unsafe { IRQ_COUNT }
+    IRQ_COUNT.load(core::sync::atomic::Ordering::SeqCst)
 }
 
-/// Read one 512B sector.
+/// Read one 512B sector. Single-flight: the queue + DATA buffer are
+/// shared, so the whole submit+copy runs under the driver lock.
 pub fn read_block(lba: u32, out: &mut [u8; 512]) -> bool {
-    unsafe {
+    drv_lock();
+    let ok = unsafe {
         if !READY {
-            return false;
+            false
+        } else if !submit(false, lba) {
+            false
+        } else {
+            out.copy_from_slice(&DATA);
+            true
         }
-        if !submit(false, lba) {
-            return false;
-        }
-        out.copy_from_slice(&DATA);
-        true
-    }
+    };
+    drv_unlock();
+    ok
 }
 
-/// Write one 512B sector.
+/// Write one 512B sector (single-flight, see read_block).
 pub fn write_block(lba: u32, data: &[u8; 512]) -> bool {
-    unsafe {
+    drv_lock();
+    let ok = unsafe {
         if !READY {
-            return false;
+            false
+        } else {
+            DATA.copy_from_slice(data);
+            fence();
+            submit(true, lba)
         }
-        DATA.copy_from_slice(data);
-        fence();
-        submit(true, lba)
-    }
+    };
+    drv_unlock();
+    ok
 }
 
 unsafe fn selftest() {

@@ -25,6 +25,8 @@ mod real {
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/persist");
     pub const PRINTENV_ELF: &[u8] =
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/printenv");
+    pub const SMPTEST_ELF: &[u8] =
+        include_bytes!("../../target/riscv64gc-unknown-none-elf/release/smp_test");
 }
 #[cfg(not(test))]
 pub use real::*;
@@ -43,6 +45,7 @@ pub fn get_by_name(name: &str) -> Option<Vec<u8>> {
         "usertests" => USERTESTS_ELF,
         "persist" => PERSIST_ELF,
         "printenv" => PRINTENV_ELF,
+        "smp_test" => SMPTEST_ELF,
         _ => return None,
     };
     Some(Vec::from(b))
@@ -75,3 +78,5 @@ pub const USERTESTS_ELF: &[u8] = b"test";
 pub const PERSIST_ELF: &[u8] = b"test";
 #[cfg(test)]
 pub const PRINTENV_ELF: &[u8] = b"test";
+#[cfg(test)]
+pub const SMPTEST_ELF: &[u8] = b"test";

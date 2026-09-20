@@ -52,6 +52,11 @@ pub fn execve(path: *const u8, argv: usize, envp: usize) -> isize {
     ecall(34, path as usize, argv, envp)
 }
 
+/// v1.0: current hart id (0..MAX_HART).
+pub fn gethart() -> isize {
+    ecall(35, 0, 0, 0)
+}
+
 /// v0.11: inherited environment, filled by _start from the kernel stack
 /// layout (argc/argv/envc/envp). Read-only for the process.
 /// no_mangle: referenced by name from _start asm; used: invisible to

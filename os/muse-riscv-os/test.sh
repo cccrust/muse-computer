@@ -8,7 +8,7 @@ echo "=== 1. host unit tests ==="
 cargo test -p kernel -p host-tests -p mkfs || PASS=0
 
 echo "=== 2. build user ELFs ==="
-cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv || PASS=0
+cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test || PASS=0
 
 echo "=== 3. mkfs ==="
 cargo run --release -p mkfs -- fs.img || PASS=0
@@ -28,21 +28,25 @@ fi
 $OBJCOPY -O binary "$KELF" "$KBIN" || PASS=0
 test -s "$KBIN" || { echo "FAIL: kernel.bin empty"; PASS=0; }
 
-echo "=== 5. QEMU boot test (25s) ==="
+echo "=== 5. QEMU boot test (120s; v1.0: -smp 4 MTTCG is slower) ==="
 rm -f qemu.log
 if command -v timeout >/dev/null 2>&1; then
   TO="timeout 25"
+  TO1="timeout 120"
 elif command -v gtimeout >/dev/null 2>&1; then
   TO="gtimeout 25"
+  TO1="gtimeout 120"
 else
   TO=""
+  TO1=""
 fi
 START=$(date +%s)
 # NOTE: stdin must come from /dev/null. With `-nographic`, if stdin is the
 # user's controlling terminal while stdout is a pipe (tee), QEMU stays silent
 # (no output at all, guest never boots). run.sh keeps interactive stdin.
-$TO qemu-system-riscv64 \
-  -machine virt \
+# v1.0: run1 uses TO1 (120s) -- the full autorun no longer fits in 25s on -smp 4.
+$TO1 qemu-system-riscv64 \
+  -machine virt -smp 4 \
   -nographic \
   -bios default \
   -kernel "$KBIN" \
@@ -73,6 +77,11 @@ check "spawn init"
 check "fork PASS"
 check "pipe PASS"
 check "usertests PASS"
+check "smp PASS"
+check "hart0 up"
+check "hart1 up"
+check "hart2 up"
+check "hart3 up"
 check "mmap PASS"
 check "VIRTIO"
 check "virtio-irq PASS"
@@ -110,7 +119,7 @@ fi
 echo "=== 7. persistence: second boot on SAME fs.img (no rebuild) ==="
 rm -f qemu2.log
 $TO qemu-system-riscv64 \
-  -machine virt \
+  -machine virt -smp 4 \
   -nographic \
   -bios default \
   -kernel "$KBIN" \
@@ -140,7 +149,7 @@ rm -f qemu3.log
 # NOTE: stdin is a pipe here (not a tty), so no QEMU silence issue.
 # Ctrl-C at ~15s hits sh blocked at prompt; respawned sh then reads halt.
 (sleep 15; printf '\003'; sleep 7; printf 'halt\n') | $TO qemu-system-riscv64 \
-  -machine virt \
+  -machine virt -smp 4 \
   -nographic \
   -bios default \
   -kernel "$KBIN" \
@@ -197,7 +206,7 @@ rm -f qemu4.log
 # v0.12: prompt is up by ~18s (autorun grew); early input buffers in the
 # UART ring, so an 18s halt is safe even if the prompt is not ready yet.
 (sleep 18; printf 'halt\n') | $TO qemu-system-riscv64 \
-  -machine virt \
+  -machine virt -smp 4 \
   -nographic \
   -bios default \
   -kernel "$KBIN" \
@@ -225,7 +234,7 @@ fi
 echo "=== 10. reboot after clean halt: mount must NOT need fsck ==="
 rm -f qemu5.log
 $TO qemu-system-riscv64 \
-  -machine virt \
+  -machine virt -smp 4 \
   -nographic \
   -bios default \
   -kernel "$KBIN" \

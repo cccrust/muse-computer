@@ -25,30 +25,23 @@ static CACHE: SpinMutex<[Slot; NSLOT]> = SpinMutex::new([EMPTY; NSLOT]);
 static HAND: SpinMutex<usize> = SpinMutex::new(0);
 
 // stats (saturating; informational only)
-static mut HITS: u64 = 0;
-static mut MISS: u64 = 0;
-static mut DEV_RD: u64 = 0;
-static mut DEV_WR: u64 = 0;
+// v1.0: atomics -- shared by all harts (plain static mut is a data race).
+static HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static MISS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DEV_RD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static DEV_WR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn bump_hit() {
-    unsafe {
-        HITS = HITS.saturating_add(1);
-    }
+    HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 fn bump_miss() {
-    unsafe {
-        MISS = MISS.saturating_add(1);
-    }
+    MISS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 fn bump_rd() {
-    unsafe {
-        DEV_RD = DEV_RD.saturating_add(1);
-    }
+    DEV_RD.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 fn bump_wr() {
-    unsafe {
-        DEV_WR = DEV_WR.saturating_add(1);
-    }
+    DEV_WR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 fn lookup(c: &[Slot; NSLOT], lba: u32) -> Option<usize> {
@@ -84,7 +77,7 @@ fn fetch(lba: u32, slot_data: &mut [u8; 512]) -> bool {
 }
 
 pub fn read(lba: u32, out: &mut [u8; 512]) {
-    // fast path: hit
+    // fast path: hit under lock (short critical section, never blocks)
     {
         let mut c = CACHE.lock();
         if let Some(i) = lookup(&c, lba) {
@@ -95,26 +88,29 @@ pub fn read(lba: u32, out: &mut [u8; 512]) {
         }
     }
     bump_miss();
-    // miss: fetch + install (victim), plus 1-block readahead
-    let mut c = CACHE.lock();
-    // re-check under lock (single hart: no race, but keeps logic uniform)
-    if let Some(i) = lookup(&c, lba) {
-        c[i].referenced = true;
-        out.copy_from_slice(&c[i].data);
-        bump_hit();
+    // miss: fetch WITHOUT holding the cache lock. fetch() runs virtio I/O,
+    // which may block the task (deschedule); holding a spinlock across that
+    // would wedge any other hart spinning on it (v1.0).
+    let mut tmp = [0u8; 512];
+    if !fetch(lba, &mut tmp) {
         return;
     }
-    let i = victim(&mut c);
-    if fetch(lba, &mut c[i].data) {
+    out.copy_from_slice(&tmp);
+    // install under lock, re-checking (another hart may have installed it
+    // while we fetched; last writer wins, both copies identical).
+    {
+        let mut c = CACHE.lock();
+        if let Some(i) = lookup(&c, lba) {
+            c[i].referenced = true;
+            out.copy_from_slice(&c[i].data);
+            return;
+        }
+        let i = victim(&mut c);
+        c[i].data.copy_from_slice(&tmp);
         c[i].lba = lba;
         c[i].valid = true;
         c[i].referenced = true;
-        out.copy_from_slice(&c[i].data);
-    } else {
-        c[i].valid = false;
-        return;
     }
-    drop(c);
     // readahead n+1 (best effort; needs NCAP bound -- ask virtio)
     readahead(lba + 1);
 }
@@ -123,22 +119,34 @@ fn readahead(lba: u32) {
     if lba as u64 >= crate::fs::virtio::capacity_sectors() {
         return;
     }
+    // v1.0: never fetch under the cache lock (fetch may spin on the
+    // device; a sleeper holding CACHE would wedge other harts). Check,
+    // fetch, then install with re-check -- same pattern as read().
+    {
+        let c = CACHE.lock();
+        if lookup(&c, lba).is_some() {
+            return;
+        }
+    }
+    let mut tmp = [0u8; 512];
+    if !fetch(lba, &mut tmp) {
+        return;
+    }
     let mut c = CACHE.lock();
     if lookup(&c, lba).is_some() {
         return;
     }
     let i = victim(&mut c);
-    if fetch(lba, &mut c[i].data) {
-        c[i].lba = lba;
-        c[i].valid = true;
-        c[i].referenced = false; // prefetched, not yet used
-    } else {
-        c[i].valid = false;
-    }
+    c[i].data.copy_from_slice(&tmp);
+    c[i].lba = lba;
+    c[i].valid = true;
+    c[i].referenced = false; // prefetched, not yet used
 }
 
 pub fn write(lba: u32, data: &[u8; 512]) {
-    // write-through: device first, then cache
+    // write-through: device first WITHOUT holding the cache lock (virtio
+    // I/O may block the task; v1.0 never holds a spinlock across that),
+    // then a short locked cache update.
     bump_wr();
     crate::fs::virtio::write_block(lba, data);
     let mut c = CACHE.lock();
@@ -158,13 +166,11 @@ pub fn write(lba: u32, data: &[u8; 512]) {
 /// (nothing dirty) except printing stats; kept as the hook where a
 /// future write-back would drain.
 pub fn sync() {
-    unsafe {
-        crate::println!(
-            "[FS] cache stats hits={} miss={} dev_rd={} dev_wr={}",
-            HITS,
-            MISS,
-            DEV_RD,
-            DEV_WR
-        );
-    }
+    crate::println!(
+        "[FS] cache stats hits={} miss={} dev_rd={} dev_wr={}",
+        HITS.load(core::sync::atomic::Ordering::Relaxed),
+        MISS.load(core::sync::atomic::Ordering::Relaxed),
+        DEV_RD.load(core::sync::atomic::Ordering::Relaxed),
+        DEV_WR.load(core::sync::atomic::Ordering::Relaxed),
+    );
 }

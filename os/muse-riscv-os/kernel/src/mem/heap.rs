@@ -1,3 +1,4 @@
+use crate::sync::SpinMutex;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 
@@ -11,6 +12,10 @@ struct Node {
 
 static mut FREE_HEAD: *mut Node = null_mut();
 static mut HEAP_INITED: bool = false;
+
+// v1.0: the heap is shared by all harts; the free list is only ever
+// touched for short non-blocking list ops, so a spinlock suffices.
+static HEAP_LOCK: SpinMutex<()> = SpinMutex::new(());
 
 pub fn init() {
     unsafe {
@@ -31,6 +36,7 @@ pub fn init() {
 struct HeapAlloc;
 unsafe impl GlobalAlloc for HeapAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _g = HEAP_LOCK.lock();
         let size = (layout.size() + 15) & !15;
         let need = size + 16;
         let mut prev: *mut Node = null_mut();
@@ -66,6 +72,7 @@ unsafe impl GlobalAlloc for HeapAlloc {
         if ptr.is_null() {
             return;
         }
+        let _g = HEAP_LOCK.lock();
         let node = (ptr as usize - 16) as *mut Node;
         (*node).next = FREE_HEAD;
         FREE_HEAD = node;

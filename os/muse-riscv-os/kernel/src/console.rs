@@ -23,6 +23,17 @@ pub fn _print(args: fmt::Arguments) {
     let _ = c.write_fmt(args);
 }
 
+/// v1.0: whole-buffer console write under the print lock. sys_write's
+/// stdout path must use this (not raw putchar): otherwise a userspace
+/// write on one hart interleaves byte-wise with a kernel println! on
+/// another and test markers (e.g. "[TEST] waitpid PASS") get torn.
+pub fn write_bytes(s: &[u8]) {
+    let _g = LOCK.lock();
+    for &b in s {
+        crate::uart::putchar(b);
+    }
+}
+
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {

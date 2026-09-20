@@ -35,13 +35,61 @@ impl TrapFrame {
     }
 }
 
-static mut TRAP_STACK: [u8; 16384] = [0; 16384];
+/// v1.0: per-hart trap stacks. Each slice is 16 KiB-aligned so the hart
+/// id can be recomputed from the stack pointer on every trap entry
+/// (see `reaffirm_hartid`): user execution is free to use tp, and tasks
+/// migrate between harts, so a TP-carried hartid would go stale and every
+/// hart would operate on current[wrong].
+#[repr(align(16384))]
+struct TrapStacks([[u8; 16384]; crate::MAX_HART]);
+
+static mut TRAP_STACK: TrapStacks = TrapStacks([[0; 16384]; crate::MAX_HART]);
+
+fn trap_stack_base() -> usize {
+    unsafe { TRAP_STACK.0.as_ptr() as usize }
+}
 
 pub fn trap_stack_top() -> usize {
-    unsafe { TRAP_STACK.as_ptr() as usize + TRAP_STACK.len() }
+    trap_stack_top_hart(crate::task::hartid() % crate::MAX_HART)
+}
+
+/// v1.0: per-hart trap stack top (trap.S loads sp from TF.kernel_sp,
+/// which the scheduler sets to this hart's top on every pick).
+pub fn trap_stack_top_hart(hart: usize) -> usize {
+    let h = hart % crate::MAX_HART;
+    trap_stack_base() + (h + 1) * 16384
+}
+
+/// v1.0: re-establish tp=hartid from the current (kernel trap) stack
+/// pointer. Must run before any hartid() use in the trap handler:
+/// trap.S preserves the USER tp across traps, so tp on kernel entry is
+/// whatever the interrupted user context had -- stale after migration.
+/// Each slice is [base+h*16K, base+(h+1)*16K) and sp is somewhere inside
+/// this hart's slice (top minus the trap frame/call overhead), so
+/// hart = (sp - base) >> 14.
+#[inline(always)]
+fn reaffirm_hartid() {
+    let sp: usize;
+    unsafe {
+        asm!("mv {0}, sp", out(reg) sp);
+    }
+    let h = (sp.wrapping_sub(trap_stack_base()) >> 14) % crate::MAX_HART;
+    unsafe {
+        asm!("mv tp, {0}", in(reg) h);
+    }
 }
 
 pub fn init() {
+    init_on(0);
+    crate::plic::init();
+    crate::uart::irq_enable();
+    crate::uart::tx_enable();
+}
+
+/// v1.0: per-hart trap setup for APs (stvec/sie are per-hart CSRs;
+/// UART IER is chip-global, enabled once by the boot hart).
+pub fn init_on(hart: usize) {
+    let h = hart % crate::MAX_HART;
     unsafe {
         asm!("csrw stvec, {0}", in(reg) __trap_entry as usize);
         // enable supervisor timer (5) + external (9) interrupts;
@@ -51,13 +99,12 @@ pub fn init() {
         sie |= (1 << 5) | (1 << 9);
         asm!("csrw sie, {0}", in(reg) sie);
     }
-    crate::plic::init();
-    crate::uart::irq_enable();
-    crate::uart::tx_enable();
+    crate::plic::enable_ctx(h);
 }
 
 #[no_mangle]
 pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
+    reaffirm_hartid();
     unsafe {
         let scause: usize;
         let stval: usize;
@@ -101,12 +148,11 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
                             // submitter usually already consumed+acked via the
                             // fast path or tick watchdog, so gate on claim,
                             // not on INTSTAT.)
-                            static mut VIRTIO_IRQ_SEEN: bool = false;
-                            unsafe {
-                                if !VIRTIO_IRQ_SEEN {
-                                    VIRTIO_IRQ_SEEN = true;
-                                    crate::println!("[TEST] virtio-irq PASS");
-                                }
+                            // v1.0: atomic -- set from any hart's ISR
+                            static VIRTIO_IRQ_SEEN: core::sync::atomic::AtomicBool =
+                                core::sync::atomic::AtomicBool::new(false);
+                            if !VIRTIO_IRQ_SEEN.swap(true, core::sync::atomic::Ordering::SeqCst) {
+                                crate::println!("[TEST] virtio-irq PASS");
                             }
                             crate::fs::virtio::on_irq();
                         }

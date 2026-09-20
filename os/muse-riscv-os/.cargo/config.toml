@@ -3,3 +3,10 @@
 [build]
 # do NOT set default target here: host-tests must build for host,
 # kernel/user are built with --target riscv64gc-unknown-none-elf in run.sh
+
+# v1.0: QEMU virt (rv64imafdch) has M+A; the stock riscv64gc target leaves
+# them off for asm. entry.S needs amoswap (boot election). Scoped to the
+# RISC-V target only so host builds are unaffected. (LLVM wants the explicit
+# Zaamo/Zmmul names, not just +m/+a.)
+[target.riscv64gc-unknown-none-elf]
+rustflags = ["-C", "target-feature=+m,+a,+zaamo,+zmmul"]

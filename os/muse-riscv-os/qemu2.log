@@ -11,7 +11,7 @@ OpenSBI v1.7
 
 Platform Name               : riscv-virtio,qemu
 Platform Features           : medeleg
-Platform HART Count         : 1
+Platform HART Count         : 4
 Platform IPI Device         : aclint-mswi
 Platform Timer Device       : aclint-mtimer @ 10000000Hz
 Platform Console Device     : uart8250
@@ -22,11 +22,11 @@ Platform Shutdown Device    : syscon-poweroff
 Platform Suspend Device     : ---
 Platform CPPC Device        : ---
 Firmware Base               : 0x80000000
-Firmware Size               : 317 KB
+Firmware Size               : 353 KB
 Firmware RW Offset          : 0x40000
-Firmware RW Size            : 61 KB
-Firmware Heap Offset        : 0x46000
-Firmware Heap Size          : 37 KB (total), 2 KB (reserved), 11 KB (used), 23 KB (free)
+Firmware RW Size            : 97 KB
+Firmware Heap Offset        : 0x4c000
+Firmware Heap Size          : 49 KB (total), 3 KB (reserved), 12 KB (used), 33 KB (free)
 Firmware Scratch Size       : 4096 B (total), 1400 B (used), 2696 B (free)
 Runtime SBI Version         : 3.0
 Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,dbtr,sse
@@ -34,11 +34,11 @@ Experimental SBI Extensions : none
 
 Domain0 Name                : root
 Domain0 Boot HART           : 0
-Domain0 HARTs               : 0*
+Domain0 HARTs               : 0*,1*,2*,3*
 Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
 Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
 Domain0 Region02            : 0x0000000002000000-0x000000000200ffff M: (I,R,W) S/U: ()
-Domain0 Region03            : 0x0000000080040000-0x000000008004ffff M: (R,W) S/U: ()
+Domain0 Region03            : 0x0000000080040000-0x000000008005ffff M: (R,W) S/U: ()
 Domain0 Region04            : 0x0000000080000000-0x000000008003ffff M: (R,X) S/U: ()
 Domain0 Region05            : 0x000000000c400000-0x000000000c5fffff M: (I,R,W) S/U: (R,W)
 Domain0 Region06            : 0x000000000c000000-0x000000000c3fffff M: (I,R,W) S/U: (R,W)
@@ -65,7 +65,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [BOOT] hart booted in S-mode, kernel @ 0x80200000
 [MM] heap init ok
 [MM] frame allocator ok
-[MM] root=0x80ac1000
+[MM] root=0x80a99000
 [MM] text mapped
 [MM] rodata mapped
 [MM] data mapped
@@ -74,6 +74,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [MM] mmio mapped, activating...
 [MM] activated
 [MMU] SV39 enabled (satp MODE=8, 3-level)
+[PLIC] hart0 ctx irq10+1 enabled
 [PLIC] uart irq10 + virtio irq1 enabled
 [TRAP] stvec set
 [TIMER] enabled (10ms tick)
@@ -83,8 +84,19 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [FS] disk mount ok (MUSEFS01, 8192 blocks)
 [PROC] init pid=1
 [PROC] spawn init
+[SMP] boot hart0
+[SMP] hart0 up
+[SMP] hart1 starting
+[SMP] hart2 starting
+[SMP] hart3 starting
 [TEST] boot markers ready
 [TEST] virtio-irq PASS
+[PLIC] hart3 ctx irq10+1 enabled
+[PLIC] hart2 ctx irq10+1 enabled
+[PLIC] hart1 ctx irq10+1 enabled
+[SMP] hart3 up
+[SMP] hart2 up
+[SMP] hart1 up
 [USER] init: starting sh
 [PROC] fork pid=1 -> child=2
 [PROC] exec pid=2 -> /bin/sh (argc=0)
@@ -127,6 +139,7 @@ pipe_test ok
 usertests ok
 persist ok
 printenv ok
+smp_test ok
 [TEST] fstat PASS
 [TEST] ls PASS
 [PROC] pid=8 exited(0)
@@ -145,27 +158,43 @@ echo: hi from unix-v6
 [TEST] usertests PASS
 [PROC] pid=3 exited(0)
 [PROC] fork pid=2 -> child=11
-[PROC] exec pid=11 -> /bin/persist (argc=0)
-[TEST] persist READ PASS
+[PROC] exec pid=11 -> /bin/smp_test (argc=0)
+[PROC] fork pid=11 -> child=12
+[PROC] fork pid=11 -> child=13
+[smp] child on hart 0[PROC] fork pid=11 -> child=14
+->0
+[PROC] pid=12 exited(40)
+[PROC] fork pid=11 -> child=15
+[smp] child on hart 0->1
+[PROC] pid=13 exited(41)
+[smp] child on hart [smp] child on hart 01->->01
+[PROC] pid=15 exited(43)
+
+[PROC] pid=14 exited(42)
+[TEST] smp PASS
 [PROC] pid=11 exited(0)
-[PROC] fork pid=2 -> child=12
-[PROC] exec pid=12 -> /bin/cat (argc=2)
+[PROC] fork pid=2 -> child=16
+[PROC] exec pid=16 -> /bin/persist (argc=0)
+[TEST] persist READ PASS
+[PROC] pid=16 exited(0)
+[PROC] fork pid=2 -> child=17
+[PROC] exec pid=17 -> /bin/cat (argc=2)
 PERSIST-v0.2-0123456789abcdef[TEST] cat ARG PASS
-[PROC] pid=12 exited(0)
-[PROC] fork pid=2 -> child=13
-[PROC] exec pid=13 -> /bin/echo (argc=2)
+[PROC] pid=17 exited(0)
+[PROC] fork pid=2 -> child=18
+[PROC] exec pid=18 -> /bin/echo (argc=2)
 hello-arg
 [TEST] echo PASS
-[PROC] pid=13 exited(0)
-[PROC] fork pid=2 -> child=14
+[PROC] pid=18 exited(0)
+[PROC] fork pid=2 -> child=19
+[PROC] exec pid=19 -> /bin/pipe_test (argc=0)
 [bg] pipe_test &
-[PROC] fork pid=2 -> child=15
-[PROC] exec pid=14 -> /bin/pipe_test (argc=0)
-[PROC] fork pid=14 -> child=16
-[PROC] exec pid=15 -> /bin/ls (argc=1)
-[PROC] pid=16 exited(0)
+[PROC] fork pid=2 -> child=20
+[PROC] exec pid=20 -> /bin/ls (argc=1)
+[PROC] fork pid=19 -> child=21
+[PROC] pid=21 exited(0)
 [TEST] pipe PASS
-[PROC] pid=14 exited(0)
+[PROC] pid=19 exited(0)
 /:
 bin/
 README ok
@@ -183,81 +212,82 @@ pipe_test ok
 usertests ok
 persist ok
 printenv ok
+smp_test ok
 [TEST] fstat PASS
 [TEST] ls PASS
-[PROC] pid=15 exited(0)
+[PROC] pid=20 exited(0)
 [bg] done
 [TEST] bg PASS
 [TEST] sleep PASS
-[PROC] fork pid=2 -> child=17
-[PROC] pid=17 killed
-[PROC] pid=17 exited(-9)
+[PROC] fork pid=2 -> child=22
+[PROC] pid=22 killed
+[PROC] pid=22 exited(-9)
 [TEST] kill PASS
 [TEST] chdir PASS
 [TEST] append PASS
 [TEST] dup2 PASS
 [TEST] lseek PASS
-[PROC] fork pid=2 -> child=18
-[PROC] pid=18 exited(42)
+[PROC] fork pid=2 -> child=23
+[PROC] pid=23 exited(42)
 [TEST] waitpid PASS
 [TEST] df PASS
-[PROC] fork pid=2 -> child=19
-[PROC] fork pid=19 -> child=20
-[PROC] execve pid=20 -> /bin/echo (argc=2 envc=0)
-[PROC] pid=20 exited(0)
-[PROC] pid=19 exited(0)
+[PROC] fork pid=2 -> child=24
+[PROC] fork pid=24 -> child=25
+[PROC] execve pid=25 -> /bin/echo (argc=2 envc=0)
+[PROC] pid=25 exited(0)
+[PROC] pid=24 exited(0)
 [TEST] quote PASS
-[PROC] fork pid=2 -> child=21
-[PROC] fork pid=21 -> child=22
-[PROC] execve pid=22 -> /bin/echo (argc=2 envc=1)
-[PROC] pid=22 exited(0)
-[PROC] pid=21 exited(0)
+[PROC] fork pid=2 -> child=26
+[PROC] fork pid=26 -> child=27
+[PROC] execve pid=27 -> /bin/echo (argc=2 envc=1)
+[PROC] pid=27 exited(0)
+[PROC] pid=26 exited(0)
 [TEST] env PASS
-[PROC] fork pid=2 -> child=23
+[PROC] fork pid=2 -> child=28
+[PROC] execve pid=28 -> /bin/echo (argc=2 envc=1)
 [bg] started
-[PROC] execve pid=23 -> /bin/echo (argc=2 envc=1)
 hi
 [TEST] echo PASS
-[PROC] pid=23 exited(0)
+[PROC] pid=28 exited(0)
 [bg] done
 [TEST] fg PASS
 [TEST] history PASS
-[PROC] fork pid=2 -> child=24
-[PROC] fork pid=24 -> child=25
-[PROC] execve pid=25 -> /bin/ps (argc=1 envc=1)
-[PROC] execve pid=25 -> /ps (argc=1 envc=1)
-[PROC] pid=25 exited(0)
-[PROC] pid=24 exited(0)
+[PROC] fork pid=2 -> child=29
+[PROC] fork pid=29 -> child=30
+[PROC] execve pid=30 -> /bin/ps (argc=1 envc=1)
+[PROC] execve pid=30 -> /ps (argc=1 envc=1)
+[PROC] pid=30 exited(0)
+[PROC] pid=29 exited(0)
 [TEST] ps PASS
 [STRACE] pid=2 id=12 a0=0 ret=2
 [STRACE] pid=2 id=33 a0=2 ret=0
 [TEST] strace DONE
-[PROC] fork pid=2 -> child=26
-[PROC] fork pid=26 -> child=27
-[PROC] execve pid=27 -> /bin/echo (argc=3 envc=1)
-[PROC] pid=27 exited(0)
-[PROC] pid=26 exited(0)
-[PROC] fork pid=2 -> child=28
-[PROC] fork pid=28 -> child=29
-[PROC] execve pid=29 -> /bin/echo (argc=2 envc=1)
-[PROC] pid=29 exited(0)
-[PROC] pid=28 exited(0)
-[TEST] glob PASS
-[PROC] fork pid=2 -> child=30
-[PROC] fork pid=30 -> child=31
-[PROC] execve pid=31 -> /bin/printenv (argc=2 envc=2)
-[PROC] pid=31 exited(0)
-[PROC] pid=30 exited(0)
-[TEST] envp PASS
-[PROC] fork pid=2 -> child=32
-[PROC] fork pid=32 -> child=33
-[PROC] execve pid=33 -> /bin/echo (argc=2 envc=3)
-[PROC] pid=33 exited(0)
+[PROC] fork pid=2 -> child=31
+[PROC] fork pid=31 -> child=32
+[PROC] execve pid=32 -> /bin/echo (argc=3 envc=1)
 [PROC] pid=32 exited(0)
-[PROC] fork pid=2 -> child=34
-[PROC] fork pid=34 -> child=35
-[PROC] execve pid=35 -> /bin/cat (argc=2 envc=3)
-[PROC] pid=35 exited(0)
+[PROC] pid=31 exited(0)
+[PROC] fork pid=2 -> child=33
+[PROC] fork pid=33 -> child=34
+[PROC] execve pid=34 -> /bin/echo (argc=2 envc=1)
 [PROC] pid=34 exited(0)
+[PROC] pid=33 exited(0)
+[TEST] glob PASS
+[PROC] fork pid=2 -> child=35
+[PROC] fork pid=35 -> child=36
+[PROC] execve pid=36 -> /bin/printenv (argc=2 envc=2)
+[PROC] pid=36 exited(0)
+[PROC] pid=35 exited(0)
+[TEST] envp PASS
+[PROC] fork pid=2 -> child=37
+[PROC] fork pid=37 -> child=38
+[PROC] execve pid=38 -> /bin/echo (argc=2 envc=3)
+[PROC] pid=38 exited(0)
+[PROC] pid=37 exited(0)
+[PROC] fork pid=2 -> child=39
+[PROC] fork pid=39 -> child=40
+[PROC] execve pid=40 -> /bin/cat (argc=2 envc=3)
+[PROC] pid=40 exited(0)
+[PROC] pid=39 exited(0)
 [TEST] redirenv PASS
-sh$ qemu-system-riscv64: terminating on signal 15 from pid 81912 (<unknown process>)
+sh$ qemu-system-riscv64: terminating on signal 15

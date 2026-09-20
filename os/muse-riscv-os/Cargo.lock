@@ -85,6 +85,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "smp_test"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
 name = "user-lib"
 version = "0.1.0"
 

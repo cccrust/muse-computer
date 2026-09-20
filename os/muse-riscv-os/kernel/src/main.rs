@@ -6,6 +6,15 @@
 extern crate alloc;
 
 #[cfg(not(test))]
+pub const MAX_HART: usize = 4;
+
+#[cfg(not(test))]
+extern "C" {
+    fn _start_secondary();
+    static mut BOOT_DONE: u32;
+}
+
+#[cfg(not(test))]
 use core::arch::{asm, global_asm};
 
 #[cfg(not(test))]
@@ -73,8 +82,50 @@ pub extern "C" fn rust_main() -> ! {
     fs::init();
     task::init();
     println!("[PROC] spawn init");
+    // v1.0: shared init done -- release parked APs, then HSM-start any
+    // hart OpenSBI parked (already-running ones report ALREADY_AVAILABLE).
+    unsafe {
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!(BOOT_DONE),
+            1,
+        );
+    }
+    let me = task::hartid() % MAX_HART;
+    println!("[SMP] boot hart{}", me);
+    // v1.0: the boot hart counts as up too (test.sh asserts hartN up for
+    // all harts; with first-hart-wins the boot hart is whichever won,
+    // observed hart3 under QEMU -smp 4).
+    println!("[SMP] hart{} up", me);
+    // v1.0: wake APs via SBI HSM *after* all shared init (mount, allocator,
+    // task table) is done; APs only enter the scheduler (never re-init).
+    let me = task::hartid() % MAX_HART;
+    for h in 0..MAX_HART {
+        if h == me {
+            continue;
+        }
+        let rc = sbi::hart_start(h, _start_secondary as usize, 0);
+        if rc == 0 {
+            println!("[SMP] hart{} starting", h);
+        } else {
+            println!("[SMP] hart{} start FAILED (rc={}), continuing degraded", h, rc);
+        }
+    }
     println!("[TEST] boot markers ready");
     task::run();
+    unreachable!();
+}
+
+/// v1.0: AP entry (from _start_secondary, tp/a0 = hartid). MM, FS, tasks
+/// are already up (boot hart did them); set up this hart's trap/timer
+/// and join the scheduler.
+#[cfg(not(test))]
+#[no_mangle]
+pub extern "C" fn rust_secondary_main(hart: usize) -> ! {
+    let h = hart % MAX_HART;
+    trap::init_on(h);
+    timer::init_on();
+    println!("[SMP] hart{} up", h);
+    task::run_on(h);
     unreachable!();
 }
 
