@@ -8,7 +8,7 @@ echo "=== 1. host unit tests ==="
 cargo test -p kernel -p host-tests -p mkfs || PASS=0
 
 echo "=== 2. build user ELFs ==="
-cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist || PASS=0
+cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv || PASS=0
 
 echo "=== 3. mkfs ==="
 cargo run --release -p mkfs -- fs.img || PASS=0
@@ -98,6 +98,9 @@ check "fg PASS"
 check "history PASS"
 check "ps PASS"
 check "STRACE"
+check "glob PASS"
+check "envp PASS"
+check "redirenv PASS"
 if grep -q "PANIC" qemu.log; then
   echo "FAIL: PANIC found"; PASS=0
 else
@@ -186,6 +189,72 @@ else
     echo "FAIL: PANIC in third boot"; PASS=0
   else
     echo "OK: no PANIC (third boot)"
+  fi
+fi
+
+echo "=== 9. clean-halt reboot: halt again on the same image ==="
+rm -f qemu4.log
+# v0.12: prompt is up by ~18s (autorun grew); early input buffers in the
+# UART ring, so an 18s halt is safe even if the prompt is not ready yet.
+(sleep 18; printf 'halt\n') | $TO qemu-system-riscv64 \
+  -machine virt \
+  -nographic \
+  -bios default \
+  -kernel "$KBIN" \
+  -drive file=fs.img,if=none,format=raw,id=x0 \
+  -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  2>&1 | tee qemu4.log || true
+
+if [ ! -s qemu4.log ]; then
+  echo "FAIL: qemu4.log empty"
+  PASS=0
+else
+  if grep -q "halting" qemu4.log; then
+    echo "OK: halted cleanly (run4)"
+  else
+    echo "FAIL: missing [halting] in qemu4.log";
+    PASS=0
+  fi
+  if grep -q "PANIC" qemu4.log; then
+    echo "FAIL: PANIC in fourth boot"; PASS=0
+  else
+    echo "OK: no PANIC (fourth boot)"
+  fi
+fi
+
+echo "=== 10. reboot after clean halt: mount must NOT need fsck ==="
+rm -f qemu5.log
+$TO qemu-system-riscv64 \
+  -machine virt \
+  -nographic \
+  -bios default \
+  -kernel "$KBIN" \
+  -drive file=fs.img,if=none,format=raw,id=x0 \
+  -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  < /dev/null 2>&1 | tee qemu5.log || true
+
+if [ ! -s qemu5.log ]; then
+  echo "FAIL: qemu5.log empty"
+  PASS=0
+else
+  if grep -q "disk mount ok" qemu5.log; then
+    echo "OK: disk mount ok (run5)"
+  else
+    echo "FAIL: missing [disk mount ok] in qemu5.log";
+    PASS=0
+  fi
+  # absence assertion (v0.12): clean shutdown cleared the dirty flag,
+  # so mount must NOT rebuild the bitmap
+  if grep -q "fsck: bitmap rebuilt" qemu5.log; then
+    echo "FAIL: unexpected [fsck: bitmap rebuilt] in qemu5.log (dirty flag not cleared)";
+    PASS=0
+  else
+    echo "OK: clean mount, no fsck rebuild (run5)"
+  fi
+  if grep -q "PANIC" qemu5.log; then
+    echo "FAIL: PANIC in fifth boot"; PASS=0
+  else
+    echo "OK: no PANIC (fifth boot)"
   fi
 fi
 

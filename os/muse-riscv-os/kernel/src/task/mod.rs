@@ -147,8 +147,8 @@ fn finish_spawn(
         USER_STACK_PAGES * 4096,
         pt::PTE_R | pt::PTE_W,
     );
-    // init TF (via PA, identity); empty argv on stack
-    let sp = push_args(root, &[]);
+    // init TF (via PA, identity); empty argv+env on stack
+    let sp = push_args(root, &[], &[]);
     unsafe {
         let tf = tf_pa as *mut TrapFrame;
         *tf = TrapFrame::empty();
@@ -269,6 +269,11 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8], parent: usize) -> usize {
                 write_byte_to(root, va, 0);
             }
         }
+        // v0.11: enforce this segment's permissions over its whole range.
+        // BSS tails (or zero-filesz segments) can share pages with RX
+        // text/rodata; first-mapper-wins would leave them non-writable and
+        // any .bss store (e.g. user _start) faults with cause=15.
+        pt::protect(root, p.vaddr, p.memsz, flags);
         let end = (p.vaddr + p.memsz + 0xfff) & !0xfff;
         if end > brk {
             brk = end;
@@ -298,12 +303,19 @@ fn write_u64_to(root: usize, va: usize, v: u64) {
     }
 }
 
-/// Lay out argc/argv on the user stack (inactive root, via page walk).
-/// [sp]=argc u64, [sp+8..]=argv ptr array (NULL-terminated), strings above.
+/// Lay out argc/argv + envc/envp on the user stack (inactive root).
+/// [sp]=argc u64, [sp+8..]=argv ptr array (NULL-terminated),
+/// then envc u64, envp ptr array (NULL-terminated), strings above.
+/// Entry (all user _start): a0=[sp], a1=sp+8, a2=a1+8*(a0+1)+8.
 /// Returns new sp (16B aligned). Stack pages must already be mapped.
-fn push_args(root: usize, args: &[Vec<u8>]) -> usize {
+/// NOTE (v0.11): this layout is a locked pair with user _start's env
+/// capture -- never revert one without the other (a v0.11 _start on the
+/// old layout reads envc from unmapped 0x70000000 and faults at entry).
+fn push_args(root: usize, args: &[Vec<u8>], env: &[Vec<u8>]) -> usize {
     let argc = args.len().min(8);
+    let envc = env.len().min(16);
     let mut addrs = [0usize; 8];
+    let mut envs = [0usize; 16];
     let mut p = USER_STACK_TOP;
     for i in 0..argc {
         let n = args[i].len().min(127);
@@ -314,20 +326,35 @@ fn push_args(root: usize, args: &[Vec<u8>]) -> usize {
         write_byte_to(root, p + n, 0);
         addrs[i] = p;
     }
-    p &= !7usize;
-    // Reserve argv array + argc slot so the final sp is 16B aligned.
-    // (Old code masked sp with !15 AFTER layout, which could slide sp up
-    // to 8B below the argc slot whenever the string bytes totalled 0..7
-    // mod 16 -- entry then read argc from the wrong address. v0.7 #1.)
-    if p.wrapping_sub(8 * (argc + 1) + 8) & 15 != 0 {
-        p -= 8; // pad between strings and argv (inside mapped stack pages)
+    for i in 0..envc {
+        let n = env[i].len().min(127);
+        p -= n + 1;
+        for (k, &ch) in env[i].iter().take(n).enumerate() {
+            write_byte_to(root, p + k, ch);
+        }
+        write_byte_to(root, p + n, 0);
+        envs[i] = p;
     }
-    let argv_base = p - 8 * (argc + 1);
+    p &= !7usize;
+    // Tables below the strings, low->high: [argc@sp][argv+NULL][envc]
+    // [envp+NULL]. The entry contract requires argv immediately after argc
+    // (a1=sp+8) and envp at a1+8*(argc+1)+8, so align sp BEFORE writing
+    // (v0.7 #1: never mask an address after placing data at it; v0.11: an
+    // earlier revision put envp between argc and argv, breaking argv).
+    let need = 8 + 8 * (argc + 1) + 8 + 8 * (envc + 1);
+    let sp = p.wrapping_sub(need) & !15usize;
+    let argv_base = sp + 8;
     for i in 0..argc {
         write_u64_to(root, argv_base + i * 8, addrs[i] as u64);
     }
     write_u64_to(root, argv_base + argc * 8, 0);
-    let sp = argv_base - 8;
+    let envc_slot = argv_base + 8 * (argc + 1);
+    write_u64_to(root, envc_slot, envc as u64);
+    let envp_base = envc_slot + 8;
+    for i in 0..envc {
+        write_u64_to(root, envp_base + i * 8, envs[i] as u64);
+    }
+    write_u64_to(root, envp_base + envc * 8, 0);
     write_u64_to(root, sp, argc as u64);
     debug_assert!(sp & 15 == 0);
     sp
@@ -395,9 +422,9 @@ pub fn fork(parent_pid: usize) -> usize {
     child
 }
 
-/// Exec path in current process with argv. Args must already be copied out
-/// of user memory (address space is replaced here).
-pub fn exec(pid: usize, path: &str, args: &[Vec<u8>]) -> bool {
+/// Exec path in current process with argv+env. Both must already be copied
+/// out of user memory (address space is replaced here).
+pub fn exec(pid: usize, path: &str, args: &[Vec<u8>], env: &[Vec<u8>]) -> bool {
     let data = match crate::fs::read_file(path) {
         Some(d) => d,
         None => return false,
@@ -427,6 +454,8 @@ pub fn exec(pid: usize, path: &str, args: &[Vec<u8>]) -> bool {
                 write_byte_to(new_root, zb + k, 0);
             }
         }
+        // v0.11: enforce segment permissions (see spawn path above).
+        pt::protect(new_root, p.vaddr, p.memsz, flags);
         let end = (p.vaddr + p.memsz + 0xfff) & !0xfff;
         if end > brk {
             brk = end;
@@ -438,8 +467,8 @@ pub fn exec(pid: usize, path: &str, args: &[Vec<u8>]) -> bool {
         USER_STACK_PAGES * 4096,
         pt::PTE_R | pt::PTE_W,
     );
-    // reset TF with argv on stack
-    let sp = push_args(new_root, args);
+    // reset TF with argv+env on stack
+    let sp = push_args(new_root, args, env);
     unsafe {
         let tf = tf_pa as *mut TrapFrame;
         *tf = TrapFrame::empty();

@@ -142,15 +142,21 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
                 }
                 2 | 12 | 13 | 15 => {
                     crate::println!(
-                        "[TRAP] page fault cause={} sepc={:#x} stval={:#x} -> kill",
-                        code, tfm.sepc, stval
+                        "[TRAP] page fault cause={} pid={} sepc={:#x} stval={:#x} -> kill",
+                        code,
+                        crate::task::current_pid(),
+                        tfm.sepc,
+                        stval
                     );
                     crate::syscall::do_exit(-2);
                 }
                 _ => {
                     crate::println!(
-                        "[TRAP] unknown exception {} sepc={:#x} stval={:#x}",
-                        code, tfm.sepc, stval
+                        "[TRAP] unknown exception {} pid={} sepc={:#x} stval={:#x}",
+                        code,
+                        crate::task::current_pid(),
+                        tfm.sepc,
+                        stval
                     );
                     crate::syscall::do_exit(-1);
                 }

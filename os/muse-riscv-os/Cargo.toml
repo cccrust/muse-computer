@@ -12,6 +12,7 @@ members = [
   "user/pipe_test",
   "user/usertests",
   "user/persist",
+  "user/printenv",
   "tools/mkfs",
   "host-tests",
 ]

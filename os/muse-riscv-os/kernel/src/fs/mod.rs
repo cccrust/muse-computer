@@ -33,6 +33,7 @@ pub fn init() {
     ramfs::write_file("/bin/pipe_test", crate::embed::PIPE_ELF);
     ramfs::write_file("/bin/usertests", crate::embed::USERTESTS_ELF);
     ramfs::write_file("/bin/persist", crate::embed::PERSIST_ELF);
+    ramfs::write_file("/bin/printenv", crate::embed::PRINTENV_ELF);
     ramfs::write_file("/README", b"muse-riscv-os Unix-v6 like\ntry: ls cat echo grep fork_test pipe_test usertests\n");
 }
 

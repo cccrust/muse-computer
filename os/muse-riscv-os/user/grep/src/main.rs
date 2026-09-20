@@ -6,6 +6,14 @@ global_asm!(r#".section .text.entry
 _start:
     ld a0, 0(sp)
     addi a1, sp, 8
+    slli t0, a0, 3
+    addi t0, t0, 16
+    add t1, a1, t0
+    la t2, ENVIRON_P
+    sd t1, 0(t2)
+    ld t0, -8(t1)
+    la t2, ENVIRON_C
+    sd t0, 0(t2)
     call main
     li a0, 0
     li a7, 2

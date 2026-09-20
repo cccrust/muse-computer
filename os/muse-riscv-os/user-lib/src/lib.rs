@@ -45,6 +45,48 @@ pub fn close(fd: isize) -> isize {
 pub fn exec(path: *const u8, argv: usize) -> isize {
     ecall(9, path as usize, argv, 0)
 }
+
+/// v0.11: execve(path, argv, envp). envp = ptr to array of "K=V" NUL-string
+/// pointers, NULL-terminated.
+pub fn execve(path: *const u8, argv: usize, envp: usize) -> isize {
+    ecall(34, path as usize, argv, envp)
+}
+
+/// v0.11: inherited environment, filled by _start from the kernel stack
+/// layout (argc/argv/envc/envp). Read-only for the process.
+/// no_mangle: referenced by name from _start asm; used: invisible to
+/// --gc-sections otherwise.
+#[no_mangle]
+#[used]
+pub static mut ENVIRON_P: usize = 0;
+#[no_mangle]
+#[used]
+pub static mut ENVIRON_C: usize = 0;
+
+pub fn env_count() -> usize {
+    unsafe { ENVIRON_C }
+}
+
+/// i-th "K=V" entry (NUL-terminated, cap 128). Bounds/NULL safe.
+pub unsafe fn env_str(i: usize) -> Option<&'static [u8]> {
+    let n = ENVIRON_C;
+    if i >= n || n > 16 {
+        return None;
+    }
+    let arr = ENVIRON_P as *const *const u8;
+    if arr.is_null() {
+        return None;
+    }
+    let p = *arr.add(i);
+    if p.is_null() {
+        return None;
+    }
+    let mut len = 0;
+    while len < 128 && *p.add(len) != 0 {
+        len += 1;
+    }
+    Some(core::slice::from_raw_parts(p, len))
+}
 pub fn open(path: *const u8, flags: i32) -> isize {
     ecall(10, path as usize, flags as usize, 0)
 }

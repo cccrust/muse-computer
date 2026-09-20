@@ -162,8 +162,7 @@ fn ensure_next(root: usize, idx: usize) -> usize {
 
 /// Unmap one user page. Only clears U leaves (never kernel mappings).
 /// Returns the freed PA (caller decides whether to dealloc). sfence included.
-pub fn unmap_page(root_pa: usize, va: usize) -> Option<usize> {
-    let mut cur = root_pa;
+pub fn unmap_page(root_pa: usize, va: usize) -> Option<usize> {    let mut cur = root_pa;
     for level in [2, 1].iter().cloned() {
         let idx = vpn(va, level);
         unsafe {
@@ -191,6 +190,52 @@ pub fn unmap_page(root_pa: usize, va: usize) -> Option<usize> {
         *t.add(idx) = 0;
         core::arch::asm!("sfence.vma");
         Some(pte_pa(e))
+    }
+}
+
+/// OR permission flags into every mapped U leaf in [va, va+len).
+/// Used for BSS tails that share pages with RX text/rodata: the first
+/// mapper's flags win in map_one/alloc_map_user, so a zero-filesz RW
+/// segment (or .bss tail) can end up on a non-writable page (v0.11 #1:
+/// entry storing to .bss faulted with cause=15). Skips unmapped and
+/// non-U entries. sfence included.
+pub fn protect(root_pa: usize, va: usize, len: usize, flags: u64) {
+    let start = va & !0xfff;
+    let end = (va + len + 0xfff) & !0xfff;
+    let mut cur = start;
+    while cur < end {
+        // walk to leaf
+        let mut tab = root_pa;
+        let mut ok = true;
+        for level in [2, 1].iter().cloned() {
+            let idx = vpn(cur, level);
+            unsafe {
+                let t = table_at(tab);
+                let e = *t.add(idx);
+                if e & PTE_V == 0 || e & (PTE_R | PTE_W | PTE_X) != 0 {
+                    ok = false;
+                    break;
+                }
+                tab = pte_pa(e);
+            }
+        }
+        if ok {
+            let idx = vpn(cur, 0);
+            unsafe {
+                let t = table_at(tab);
+                let e = *t.add(idx);
+                if e & PTE_V != 0
+                    && e & PTE_U != 0
+                    && e & (PTE_R | PTE_W | PTE_X) != 0
+                {
+                    *t.add(idx) = e | (flags & (PTE_R | PTE_W | PTE_X | PTE_U));
+                }
+            }
+        }
+        cur += 4096;
+    }
+    unsafe {
+        core::arch::asm!("sfence.vma");
     }
 }
 

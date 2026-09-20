@@ -37,6 +37,8 @@ pub const SYS_MUNMAP: usize = 31;
 // v0.9
 pub const SYS_PS: usize = 32;
 pub const SYS_TRACE: usize = 33;
+// v0.11
+pub const SYS_EXECVE: usize = 34;
 
 pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) -> isize {
     match id {
@@ -81,6 +83,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_MUNMAP => sys_munmap(a0, a1) as isize,
         SYS_PS => sys_ps(a0, a1) as isize,
         SYS_TRACE => sys_trace(a0, a1) as isize,
+        SYS_EXECVE => sys_execve(a0, a1, a2) as isize,
         SYS_SHUTDOWN => {
             crate::println!("[SYS] shutdown");
             if crate::fs::use_disk() {
@@ -388,12 +391,63 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize) -> isize {
         // resolve against caller cwd before address space is replaced
         let path = crate::task::resolve_for(pid, &raw);
         crate::println!("[PROC] exec pid={} -> {} (argc={})", pid, path, args.len());
-        if crate::task::exec(pid, &path, &args) {
+        if crate::task::exec(pid, &path, &args, &[]) {
             0
         } else {
             -1
         }
     }
+}
+
+/// v0.11: execve(path, argv, envp). envp = user array of "K=V" NUL-string
+/// pointers, NULL-terminated, max 16 entries x 127 bytes.
+fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
+    unsafe {
+        let raw = match crate::fs::user_str(path_ptr) {
+            Some(s) => s,
+            None => return -1,
+        };
+        let args = copy_strvec(argv_ptr, 8);
+        let env = copy_strvec(envp_ptr, 16);
+        let pid = crate::task::current_pid();
+        let path = crate::task::resolve_for(pid, &raw);
+        crate::println!(
+            "[PROC] execve pid={} -> {} (argc={} envc={})",
+            pid,
+            path,
+            args.len(),
+            env.len()
+        );
+        if crate::task::exec(pid, &path, &args, &env) {
+            0
+        } else {
+            -1
+        }
+    }
+}
+
+/// Copy a NULL-terminated user array of NUL-terminated strings (cap count).
+unsafe fn copy_strvec(arr_ptr: usize, max: usize) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    if arr_ptr == 0 {
+        return out;
+    }
+    for i in 0..max {
+        let p = *(arr_ptr as *const usize).add(i);
+        if p == 0 {
+            break;
+        }
+        let mut v = Vec::new();
+        for k in 0..128 {
+            let b = *((p as *const u8).add(k));
+            if b == 0 {
+                break;
+            }
+            v.push(b);
+        }
+        out.push(v);
+    }
+    out
 }
 
 fn sys_sleep(ticks: usize) -> isize {

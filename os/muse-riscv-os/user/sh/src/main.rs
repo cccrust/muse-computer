@@ -7,6 +7,14 @@ global_asm!(r#"
 _start:
     ld a0, 0(sp)
     addi a1, sp, 8
+    slli t0, a0, 3
+    addi t0, t0, 16
+    add t1, a1, t0
+    la t2, ENVIRON_P
+    sd t1, 0(t2)
+    ld t0, -8(t1)
+    la t2, ENVIRON_C
+    sd t0, 0(t2)
     call main
     li a0, 0
     li a7, 2
@@ -35,8 +43,8 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8], env: &Env) {
     }
     // redirection: prog > file / prog >> file (append) / prog < file
     //   prog 2> file / prog 2>> file (stderr). single file, no pipe combo.
-    // v0.7: operator scan is quote-aware; quoted filenames with spaces
-    // are NOT supported (name runs to next space as before).
+    // v0.7: operator scan is quote-aware. v0.11: quoted filenames may
+    // contain spaces; $VAR expands in filenames.
     let mut redir_out: Option<&[u8]> = None;
     let mut redir_in: Option<&[u8]> = None;
     let mut append_out = false;
@@ -59,14 +67,24 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8], env: &Env) {
             j += 1;
         }
         let f = trim(&cmd[j..end]);
-        // filename = up to next space
-        let mut fl = f.len();
-        for k in 0..f.len() {
-            if f[k] == b' ' {
-                fl = k;
-                break;
+        // v0.11: quoted filename runs to matching quote, else next space
+        let fl = if !f.is_empty() && (f[0] == b'\'' || f[0] == b'"') {
+            let q = f[0];
+            let mut k = 1;
+            while k < f.len() && f[k] != q {
+                k += 1;
             }
-        }
+            if k < f.len() { k + 1 } else { f.len() }
+        } else {
+            let mut k = f.len();
+            for x in 0..f.len() {
+                if f[x] == b' ' {
+                    k = x;
+                    break;
+                }
+            }
+            k
+        };
         redir_out = Some(&f[..fl]);
         // trailing "2>" means stderr
         if i > 0 && cmd[i - 1] == b'2' && (i == 1 || cmd[i - 2] == b' ') {
@@ -78,41 +96,56 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8], env: &Env) {
     } else if lt.is_some() {
         let i = lt.unwrap();
         let f = trim(&cmd[i + 1..end]);
-        // filename = up to next space
-        let mut fl = f.len();
-        for k in 0..f.len() {
-            if f[k] == b' ' {
-                fl = k;
-                break;
+        // v0.11: quoted filename runs to matching quote, else next space
+        let fl = if !f.is_empty() && (f[0] == b'\'' || f[0] == b'"') {
+            let q = f[0];
+            let mut k = 1;
+            while k < f.len() && f[k] != q {
+                k += 1;
             }
-        }
+            if k < f.len() { k + 1 } else { f.len() }
+        } else {
+            let mut k = f.len();
+            for x in 0..f.len() {
+                if f[x] == b' ' {
+                    k = x;
+                    break;
+                }
+            }
+            k
+        };
         redir_in = Some(&f[..fl]);
         core_end = i;
     }
     let core = trim(&cmd[..core_end]);
-    // tokenize core into argv
+    // tokenize core into argv (+quote mask), then glob-expand
     let mut toks = [[0u8; 64]; 8];
-    let ntok = tokenize_env(core, &mut toks, env);
+    let mut lit = [[false; 64]; 8];
+    let ntok = tokenize_env(core, &mut toks, &mut lit, env);
     if ntok == 0 {
         return;
     }
+    let mut xtoks = [[0u8; 64]; 8];
+    let ntok = expand_globs(&toks, ntok, &lit, &mut xtoks);
+    if ntok == 0 {
+        return;
+    }
+    let toks = xtoks;
     let mut path = [0u8; 64];
     resolve(&toks[0], &mut path);
     let mut av: [*const u8; 9] = [core::ptr::null(); 9];
     mkargv(&toks, ntok, &mut av);
     let pid = user_lib::fork();
     if pid == 0 {
-        // redirections via dup2 (v0.5)
+        // flatten sh env for execve (v0.11); buffers live in parent frame,
+        // inherited across fork
+        let mut kv = [[0u8; 96]; 16];
+        let mut ev: [*const u8; 17] = [core::ptr::null(); 17];
+        mkenvp(env, &mut kv, &mut ev);
+        // redirections via dup2 (v0.5; v0.11 quoted/$VAR filenames)
         if let Some(f) = redir_out {
             let mut fp = [0u8; 64];
-            let mut L = 0;
-            for &b in f {
-                if L < 62 {
-                    fp[L] = b;
-                    L += 1;
-                }
-            }
-            fp[L] = 0;
+            redir_name(f, env, &mut fp);
             let oflags = if append_out {
                 user_lib::O_CREATE | user_lib::O_APPEND | 1
             } else {
@@ -126,23 +159,16 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8], env: &Env) {
         }
         if let Some(f) = redir_in {
             let mut fp = [0u8; 64];
-            let mut L = 0;
-            for &b in f {
-                if L < 62 {
-                    fp[L] = b;
-                    L += 1;
-                }
-            }
-            fp[L] = 0;
+            redir_name(f, env, &mut fp);
             let fd = user_lib::open(fp.as_ptr(), 0);
             if fd >= 0 {
                 user_lib::dup2(fd as isize, 0);
                 user_lib::close(fd as isize);
             }
         }
-        let _ = user_lib::exec(path.as_ptr(), av.as_ptr() as usize);
+        let _ = user_lib::execve(path.as_ptr(), av.as_ptr() as usize, ev.as_ptr() as usize);
         // try token itself as path (e.g. absolute path typed)
-        let _ = user_lib::exec(toks[0].as_ptr(), av.as_ptr() as usize);
+        let _ = user_lib::execve(toks[0].as_ptr(), av.as_ptr() as usize, ev.as_ptr() as usize);
         // v0.9: output-only builtin fallback so run_capture("ps") works
         // (stateful builtins like cd/export stay prompt-only)
         if ntok == 1 && toks[0][0] == b'p' && toks[0][1] == b's' && toks[0][2] == 0 {
@@ -311,7 +337,7 @@ fn find_unquoted(s: &[u8], target: u8) -> Option<usize> {
 // split s into up to 8 NUL-terminated tokens with quote/$VAR/backslash
 // handling (v0.7). Returns count. Redirection filenames with quoted spaces
 // are NOT supported (only argv quoting); see _doc/v0.7.md.
-fn tokenize_env(s: &[u8], toks: &mut [[u8; 64]], env: &Env) -> usize {
+fn tokenize_env(s: &[u8], toks: &mut [[u8; 64]], lit: &mut [[bool; 64]], env: &Env) -> usize {
     let mut n = 0;
     let mut i = 0;
     while i < s.len() && n < 8 {
@@ -330,6 +356,7 @@ fn tokenize_env(s: &[u8], toks: &mut [[u8; 64]], env: &Env) -> usize {
                     q = 0;
                 } else {
                     toks[n][l] = b;
+                    lit[n][l] = true;
                     l += 1;
                 }
                 i += 1;
@@ -340,12 +367,14 @@ fn tokenize_env(s: &[u8], toks: &mut [[u8; 64]], env: &Env) -> usize {
                 } else if b == b'\\' && i + 1 < s.len() {
                     i += 1;
                     toks[n][l] = s[i];
+                    lit[n][l] = true;
                     l += 1;
                     i += 1;
                 } else if b == b'$' {
-                    i = expand_var(s, i, toks, n, &mut l, env);
+                    i = expand_var(s, i, toks, n, &mut l, lit, env, true);
                 } else {
                     toks[n][l] = b;
+                    lit[n][l] = true;
                     l += 1;
                     i += 1;
                 }
@@ -360,12 +389,14 @@ fn tokenize_env(s: &[u8], toks: &mut [[u8; 64]], env: &Env) -> usize {
             } else if b == b'\\' && i + 1 < s.len() {
                 i += 1;
                 toks[n][l] = s[i];
+                lit[n][l] = true;
                 l += 1;
                 i += 1;
             } else if b == b'$' {
-                i = expand_var(s, i, toks, n, &mut l, env);
+                i = expand_var(s, i, toks, n, &mut l, lit, env, false);
             } else {
                 toks[n][l] = b;
+                lit[n][l] = false;
                 l += 1;
                 i += 1;
             }
@@ -405,15 +436,16 @@ fn tokenize_env(s: &[u8], toks: &mut [[u8; 64]], env: &Env) -> usize {
 
 // expand $NAME at s[i]=='$'; appends value to toks[n] (cap 62 via l).
 // Returns new i (past the name, or past '$' if no name follows).
-fn expand_var(s: &[u8], i: usize, toks: &mut [[u8; 64]], n: usize, l: &mut usize, env: &Env) -> usize {
+fn expand_var(s: &[u8], i: usize, toks: &mut [[u8; 64]], n: usize, l: &mut usize, lit: &mut [[bool; 64]], env: &Env, litval: bool) -> usize {
     let mut j = i + 1;
     while j < s.len() && is_name_byte(s[j]) {
         j += 1;
     }
     if j == i + 1 {
-        // lone '$': literal
+        // lone '$': literal (never globs)
         if *l < 62 {
             toks[n][*l] = b'$';
+            lit[n][*l] = true;
             *l += 1;
         }
         return i + 1;
@@ -424,6 +456,7 @@ fn expand_var(s: &[u8], i: usize, toks: &mut [[u8; 64]], n: usize, l: &mut usize
                 break;
             }
             toks[n][*l] = b;
+            lit[n][*l] = litval;
             *l += 1;
         }
     }
@@ -454,19 +487,250 @@ fn resolve(prog: &[u8], path: &mut [u8; 64]) {
     path[l] = 0;
 }
 
+// ---- v0.11 helpers ----
+
+// flatten sh Env into "NAME=VAL\0" buffers + NULL-terminated ptr array.
+fn mkenvp(env: &Env, kv: &mut [[u8; 96]; 16], ptrs: &mut [*const u8; 17]) -> usize {
+    let mut n = 0;
+    for i in 0..env.n {
+        let nl = env.nlen[i].min(31);
+        let vl = env.vlen[i].min(63);
+        if nl + 1 + vl + 1 > 96 {
+            continue;
+        }
+        kv[n][..nl].copy_from_slice(&env.names[i][..nl]);
+        kv[n][nl] = b'=';
+        kv[n][nl + 1..nl + 1 + vl].copy_from_slice(&env.vals[i][..vl]);
+        kv[n][nl + 1 + vl] = 0;
+        ptrs[n] = kv[n].as_ptr();
+        n += 1;
+    }
+    ptrs[n] = core::ptr::null();
+    n
+}
+
+// $VAR expansion (no quotes, no glob) into NUL-terminated out (cap 64).
+fn expand_str(s: &[u8], env: &Env, out: &mut [u8; 64]) -> usize {
+    let mut l = 0;
+    let mut i = 0;
+    while i < s.len() && l < 62 {
+        if s[i] == b'$' {
+            let mut j = i + 1;
+            while j < s.len() && is_name_byte(s[j]) {
+                j += 1;
+            }
+            if j == i + 1 {
+                out[l] = b'$';
+                l += 1;
+                i += 1;
+            } else {
+                if let Some(v) = env.get(&s[i + 1..j]) {
+                    for &b in v {
+                        if l >= 62 {
+                            break;
+                        }
+                        out[l] = b;
+                        l += 1;
+                    }
+                }
+                i = j;
+            }
+        } else {
+            out[l] = s[i];
+            l += 1;
+            i += 1;
+        }
+    }
+    out[l] = 0;
+    l
+}
+
+// redirection filename: strip one quote layer, then $VAR-expand.
+fn redir_name(f: &[u8], env: &Env, out: &mut [u8; 64]) {
+    let inner: &[u8];
+    if f.len() >= 2 && (f[0] == b'\'' || f[0] == b'"') {
+        let q = f[0];
+        let mut k = 1;
+        while k < f.len() && f[k] != q {
+            k += 1;
+        }
+        inner = &f[1..k];
+    } else {
+        inner = f;
+    }
+    expand_str(inner, env, out);
+}
+
+// true if the NUL-terminated token has * or ? outside quotes/escapes.
+fn token_globs(tok: &[u8; 64], lit: &[bool; 64]) -> bool {
+    let mut k = 0;
+    while k < 64 && tok[k] != 0 {
+        if !lit[k] && (tok[k] == b'*' || tok[k] == b'?') {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
+
+fn tok_len(tok: &[u8; 64]) -> usize {
+    let mut k = 0;
+    while k < 64 && tok[k] != 0 {
+        k += 1;
+    }
+    k
+}
+
+// fnmatch with * (any run) and ? (single byte). No char classes.
+fn fnmatch(pat: &[u8], name: &[u8]) -> bool {
+    let (mut px, mut nx) = (0usize, 0usize);
+    let (mut star, mut ss) = (None, 0usize);
+    while nx < name.len() {
+        if px < pat.len() && (pat[px] == b'?' || pat[px] == name[nx]) {
+            px += 1;
+            nx += 1;
+        } else if px < pat.len() && pat[px] == b'*' {
+            star = Some(px);
+            px += 1;
+            ss = nx;
+        } else if let Some(sp) = star {
+            px = sp + 1;
+            ss += 1;
+            nx = ss;
+        } else {
+            return false;
+        }
+    }
+    while px < pat.len() && pat[px] == b'*' {
+        px += 1;
+    }
+    px == pat.len()
+}
+
+// expand unquoted globs via getdents. out[] capped at 8 argv entries;
+// overflow tokens are dropped; zero-match keeps the literal token.
+// Returns new argc.
+fn expand_globs(
+    toks: &[[u8; 64]; 8],
+    ntok: usize,
+    lit: &[[bool; 64]; 8],
+    out: &mut [[u8; 64]; 8],
+) -> usize {
+    let mut n = 0;
+    for t in 0..ntok {
+        let tl = tok_len(&toks[t]);
+        if n >= 8 {
+            break;
+        }
+        if !token_globs(&toks[t], &lit[t]) {
+            out[n] = toks[t];
+            n += 1;
+            continue;
+        }
+        // split dir prefix at last '/'
+        let tok = &toks[t][..tl];
+        let mut slash: Option<usize> = None;
+        for k in 0..tl {
+            if tok[k] == b'/' {
+                slash = Some(k);
+            }
+        }
+        // dir part ('.' for bare patterns) and pattern part
+        let dir: &[u8] = match slash {
+            Some(k) => &tok[..k + 1],
+            None => b".",
+        };
+        let pat: &[u8] = match slash {
+            Some(k) => &tok[k + 1..],
+            None => tok,
+        };
+        let mut dp = [0u8; 128];
+        let dl = dir.len().min(126);
+        dp[..dl].copy_from_slice(&dir[..dl]);
+        dp[dl] = 0;
+        let mut nb = [0u8; 512];
+        let r = user_lib::getdents(dp.as_ptr(), nb.as_mut_ptr(), 512);
+        if r <= 0 {
+            out[n] = toks[t]; // keep literal (nullglob off)
+            n += 1;
+            continue;
+        }
+        // walk exactly r NUL-terminated names (never scan past them:
+        // the rest of nb[] is uninitialized stack)
+        let mut off = 0;
+        let mut seen = 0;
+        let mut matched = 0;
+        while seen < r as usize && off < 511 && n < 8 {
+            let mut e = off;
+            while e < 512 && nb[e] != 0 {
+                e += 1;
+            }
+            if e >= 512 {
+                break;
+            }
+            seen += 1;
+            let name = &nb[off..e];
+            off = e + 1;
+            if name.is_empty() {
+                continue;
+            }
+            // hidden files only on explicit dot patterns (bash-like)
+            if name[0] != b'.' || (!pat.is_empty() && pat[0] == b'.') {
+                if fnmatch(pat, name) {
+                    let mut o = 0usize;
+                    if slash.is_some() {
+                        for &b in dir {
+                            if o >= 62 {
+                                break;
+                            }
+                            out[n][o] = b;
+                            o += 1;
+                        }
+                    }
+                    for &b in name {
+                        if o >= 62 {
+                            break;
+                        }
+                        out[n][o] = b;
+                        o += 1;
+                    }
+                    out[n][o] = 0;
+                    n += 1;
+                    matched += 1;
+                }
+            }
+        }
+        if matched == 0 && n < 8 {
+            out[n] = toks[t]; // keep literal (nullglob off)
+            n += 1;
+        }
+    }
+    n
+}
+
 fn exec_simple(cmd: &[u8], env: &Env) {
     let cmd = trim(cmd);
     let mut toks = [[0u8; 64]; 8];
-    let ntok = tokenize_env(cmd, &mut toks, env);
+    let mut lit = [[false; 64]; 8];
+    let ntok = tokenize_env(cmd, &mut toks, &mut lit, env);
     if ntok == 0 {
         user_lib::exit(-1);
     }
+    let mut xtoks = [[0u8; 64]; 8];
+    let ntok = expand_globs(&toks, ntok, &lit, &mut xtoks);
+    if ntok == 0 {
+        user_lib::exit(-1);
+    }
+    let toks = xtoks;
     let mut path = [0u8; 64];
     resolve(&toks[0], &mut path);
     let mut av: [*const u8; 9] = [core::ptr::null(); 9];
     mkargv(&toks, ntok, &mut av);
-    let _ = user_lib::exec(path.as_ptr(), av.as_ptr() as usize);
-    let _ = user_lib::exec(toks[0].as_ptr(), av.as_ptr() as usize);
+    let mut kv = [[0u8; 96]; 16];
+    let mut ev: [*const u8; 17] = [core::ptr::null(); 17];
+    mkenvp(env, &mut kv, &mut ev);
+    let _ = user_lib::execve(path.as_ptr(), av.as_ptr() as usize, ev.as_ptr() as usize);
+    let _ = user_lib::execve(toks[0].as_ptr(), av.as_ptr() as usize, ev.as_ptr() as usize);
     user_lib::print("sh: pipe exec failed\n");
     user_lib::exit(-1);
 }
@@ -1139,6 +1403,73 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
             user_lib::trace(me, 0);
             user_lib::print("[TEST] strace DONE\n");
         }
+        // ---- v0.11 coverage: glob, exec envp, quoted/$ redir names ----
+        {
+            // glob: /WD/* expands (some entry like /WD/F appears)
+            let mut gb = [0u8; 128];
+            let gn = run_capture(b"echo /WD/*\n", &mut jobs, &env, &mut gb);
+            let mut gok = false;
+            if gn >= 2 {
+                // absolute expansion always contains "/<name>";
+                // the bare pattern has no "/F" in it
+                for k in 0..gn - 1 {
+                    if gb[k] == b'/' && gb[k + 1] == b'F' {
+                        gok = true;
+                        break;
+                    }
+                }
+            }
+            // quoted star stays literal: output starts with "/WD/*\n"
+            // (echo appends its own PASS line after)
+            let mut qb = [0u8; 64];
+            let qn = run_capture(b"echo \"/WD/*\"\n", &mut jobs, &env, &mut qb);
+            let qok = qn >= 6
+                && qb[0] == b'/'
+                && qb[1] == b'W'
+                && qb[2] == b'D'
+                && qb[3] == b'/'
+                && qb[4] == b'*'
+                && qb[5] == b'\n';
+            if gok && qok {
+                user_lib::print("[TEST] glob PASS\n");
+            } else {
+                user_lib::print("[TEST] glob FAIL\n");
+            }
+        }
+        {
+            // exec envp: printenv inherits sh env ("FPE=hello-envp\n" = 15B)
+            env.set(b"FPE", b"hello-envp");
+            let mut pb = [0u8; 256];
+            let n = run_capture(b"printenv FPE\n", &mut jobs, &env, &mut pb);
+            let mut ok = false;
+            if n >= 15 {
+                for k in 0..n - 14 {
+                    if pb[k..k + 15] == *b"FPE=hello-envp\n" {
+                        ok = true;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                user_lib::print("[TEST] envp PASS\n");
+            } else {
+                user_lib::print("[TEST] envp FAIL\n");
+            }
+        }
+        {
+            // quoted + $VAR redirection filenames. Note: echo appends its
+            // own PASS line to the file, so assert on the "data\n" prefix.
+            env.set(b"RF", b"/WD/RF");
+            let mut z = [0u8; 16];
+            let _ = run_capture(b"echo data > $RF\n", &mut jobs, &env, &mut z);
+            let mut cb = [0u8; 64];
+            let n = run_capture(b"cat \"$RF\"\n", &mut jobs, &env, &mut cb);
+            if n >= 5 && cb[..5] == *b"data\n" {
+                user_lib::print("[TEST] redirenv PASS\n");
+            } else {
+                user_lib::print("[TEST] redirenv FAIL\n");
+            }
+        }
     }
     // prompt runs as foreground for Ctrl-C
     user_lib::setfg(user_lib::getpid());
@@ -1370,18 +1701,28 @@ fn exec_bg(line: &[u8], n: usize, jobs: &mut [isize; 8], env: &Env) -> isize {
     // reuse exec_cmd machinery via fork here is complex; support simple prog+args
     let core = trim(&line[..n]);
     let mut toks = [[0u8; 64]; 8];
-    let ntok = tokenize_env(core, &mut toks, env);
+    let mut lit = [[false; 64]; 8];
+    let ntok = tokenize_env(core, &mut toks, &mut lit, env);
     if ntok == 0 {
         return -1;
     }
+    let mut xtoks = [[0u8; 64]; 8];
+    let ntok = expand_globs(&toks, ntok, &lit, &mut xtoks);
+    if ntok == 0 {
+        return -1;
+    }
+    let toks = xtoks;
     let mut path = [0u8; 64];
     resolve(&toks[0], &mut path);
     let mut av: [*const u8; 9] = [core::ptr::null(); 9];
     mkargv(&toks, ntok, &mut av);
+    let mut kv = [[0u8; 96]; 16];
+    let mut ev: [*const u8; 17] = [core::ptr::null(); 17];
+    mkenvp(env, &mut kv, &mut ev);
     let pid = user_lib::fork();
     if pid == 0 {
-        let _ = user_lib::exec(path.as_ptr(), av.as_ptr() as usize);
-        let _ = user_lib::exec(toks[0].as_ptr(), av.as_ptr() as usize);
+        let _ = user_lib::execve(path.as_ptr(), av.as_ptr() as usize, ev.as_ptr() as usize);
+        let _ = user_lib::execve(toks[0].as_ptr(), av.as_ptr() as usize, ev.as_ptr() as usize);
         user_lib::exit(-1);
     } else if pid > 0 {
         if jobs_add(jobs, pid) {

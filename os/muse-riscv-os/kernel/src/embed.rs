@@ -23,6 +23,8 @@ mod real {
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/usertests");
     pub const PERSIST_ELF: &[u8] =
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/persist");
+    pub const PRINTENV_ELF: &[u8] =
+        include_bytes!("../../target/riscv64gc-unknown-none-elf/release/printenv");
 }
 #[cfg(not(test))]
 pub use real::*;
@@ -40,6 +42,7 @@ pub fn get_by_name(name: &str) -> Option<Vec<u8>> {
         "pipe_test" => PIPE_ELF,
         "usertests" => USERTESTS_ELF,
         "persist" => PERSIST_ELF,
+        "printenv" => PRINTENV_ELF,
         _ => return None,
     };
     Some(Vec::from(b))
@@ -70,3 +73,5 @@ pub const PIPE_ELF: &[u8] = b"test";
 pub const USERTESTS_ELF: &[u8] = b"test";
 #[cfg(test)]
 pub const PERSIST_ELF: &[u8] = b"test";
+#[cfg(test)]
+pub const PRINTENV_ELF: &[u8] = b"test";

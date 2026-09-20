@@ -71,6 +71,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "printenv"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
 name = "sh"
 version = "0.1.0"
 dependencies = [
