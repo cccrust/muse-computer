@@ -160,12 +160,8 @@ hello-arg
 [PROC] fork pid=2 -> child=14
 [bg] pipe_test &
 [PROC] fork pid=2 -> child=15
-[PROC] exec pid=14 -> /bin/pipe_test (argc=0)
-[PROC] fork pid=14 -> child=16
 [PROC] exec pid=15 -> /bin/ls (argc=1)
-[PROC] pid=16 exited(0)
-[TEST] pipe PASS
-[PROC] pid=14 exited(0)
+[PROC] exec pid=14 -> /bin/pipe_test (argc=0)
 /:
 bin/
 README ok
@@ -174,8 +170,12 @@ WD/
 /bin:
 init ok
 sh ok
-ls ok
-cat ok
+ls[PROC] fork pid=14 -> child=16
+ ok
+cat[PROC] pid=16 exited(0)
+[TEST] pipe PASS
+[PROC] pid=14 exited(0)
+ ok
 echo ok
 grep ok
 fork_test ok
@@ -260,4 +260,4 @@ hi
 [PROC] pid=35 exited(0)
 [PROC] pid=34 exited(0)
 [TEST] redirenv PASS
-sh$ qemu-system-riscv64: terminating on signal 15 from pid 81912 (<unknown process>)
+sh$ qemu-system-riscv64: terminating on signal 15 from pid 0 (<unknown process>)

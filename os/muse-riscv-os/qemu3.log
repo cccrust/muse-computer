@@ -65,7 +65,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [BOOT] hart booted in S-mode, kernel @ 0x80200000
 [MM] heap init ok
 [MM] frame allocator ok
-[MM] root=0x80ac2000
+[MM] root=0x80ac1000
 [MM] text mapped
 [MM] rodata mapped
 [MM] data mapped
