@@ -65,7 +65,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [BOOT] hart booted in S-mode, kernel @ 0x80200000
 [MM] heap init ok
 [MM] frame allocator ok
-[MM] root=0x80a99000
+[MM] root=0x80ae5000
 [MM] text mapped
 [MM] rodata mapped
 [MM] data mapped
@@ -74,7 +74,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [MM] mmio mapped, activating...
 [MM] activated
 [MMU] SV39 enabled (satp MODE=8, 3-level)
-[PLIC] hart0 ctx irq10+1 enabled
+[PLIC] hart2 ctx irq10+1 enabled
 [PLIC] uart irq10 + virtio irq1 enabled
 [TRAP] stvec set
 [TIMER] enabled (10ms tick)
@@ -89,16 +89,18 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [SMP] hart0 starting
 [SMP] hart1 starting
 [SMP] hart3 starting
-[TEST] boot markers ready
-[USER] init: starting sh
 [PLIC] hart1 ctx irq10+1 enabled
 [PLIC] hart3 ctx irq10+1 enabled
+[PLIC] hart0 ctx irq10+1 enabled
 [SMP] hart3 up
 [SMP] hart1 up
-[PLIC] hart0 ctx irq10+1 enabled
-[PROC] fork pid=1 -> child=2
 [SMP] hart0 up
+[DBG] soft hart=1 n=0 sip=0x202->0x200
+[TEST] ipi PASS
+[TEST] boot markers ready
 [TEST] virtio-irq PASS
+[USER] init: starting sh
+[PROC] fork pid=1 -> child=2
 [PROC] exec pid=2 -> /bin/sh (argc=0)
 [USER] sh: Unix-v6 like shell. try: ls, cat /README, echo hi | grep hi, usertests
 [USER] sh: builtins: cd pwd df jobs fg kill halt export unset env; quotes + $VAR + history
@@ -163,13 +165,13 @@ echo: hi from unix-v6
 [PROC] fork pid=11 -> child=13
 [PROC] fork pid=11 -> child=14
 [PROC] fork pid=11 -> child=15
-[smp] child on hart 3->3
+[smp] child on hart 2->2
 [PROC] pid=12 exited(40)
-[smp] child on hart 3->0
-[smp] child on hart [PROC] pid=13 exited(41)
-3->3
+[smp] child on hart 2->2
+[PROC] pid=13 exited(41)
+[smp] child on hart 2->2
 [PROC] pid=14 exited(42)
-[smp] child on hart 0->0
+[smp] child on hart 2->2
 [PROC] pid=15 exited(43)
 [TEST] smp PASS
 [PROC] pid=11 exited(0)
@@ -187,11 +189,11 @@ hello-arg
 [TEST] echo PASS
 [PROC] pid=18 exited(0)
 [PROC] fork pid=2 -> child=19
-[PROC] exec pid=19 -> /bin/pipe_test (argc=0)
 [bg] pipe_test &
 [PROC] fork pid=2 -> child=20
-[PROC] exec pid=20 -> /bin/ls (argc=1)
+[PROC] exec pid=19 -> /bin/pipe_test (argc=0)
 [PROC] fork pid=19 -> child=21
+[PROC] exec pid=20 -> /bin/ls (argc=1)
 [PROC] pid=21 exited(0)
 [TEST] pipe PASS
 [PROC] pid=19 exited(0)
@@ -218,6 +220,7 @@ smp_test ok
 [PROC] pid=20 exited(0)
 [bg] done
 [TEST] bg PASS
+[DBG] soft hart=0 n=0 sip=0x2->0x0
 [TEST] sleep PASS
 [PROC] fork pid=2 -> child=22
 [PROC] pid=22 killed
@@ -244,8 +247,8 @@ smp_test ok
 [PROC] pid=26 exited(0)
 [TEST] env PASS
 [PROC] fork pid=2 -> child=28
-[PROC] execve pid=28 -> /bin/echo (argc=2 envc=1)
 [bg] started
+[PROC] execve pid=28 -> /bin/echo (argc=2 envc=1)
 hi
 [TEST] echo PASS
 [PROC] pid=28 exited(0)
@@ -293,6 +296,7 @@ hi
 sh$ [TEST] uart-tx-irq PASS
 [TTY] Ctrl-C -> kill fg
 [PROC] pid=2 killed
+[DBG] soft hart=2 n=0 sip=0x22->0x20
 [PROC] pid=2 exited(130)
 [USER] init: sh exited, respawn
 [PROC] fork pid=1 -> child=41
@@ -358,15 +362,15 @@ echo: hi from unix-v6
 [PROC] exec pid=50 -> /bin/smp_test (argc=0)
 [PROC] fork pid=50 -> child=51
 [PROC] fork pid=50 -> child=52
-[smp] child on hart 2->2
-[PROC] pid=51 exited(40)
 [PROC] fork pid=50 -> child=53
 [PROC] fork pid=50 -> child=54
 [smp] child on hart 2->2
+[PROC] pid=51 exited(40)
+[smp] child on hart 2->2
 [PROC] pid=52 exited(41)
-[smp] child on hart 2->2
-[PROC] pid=53 exited(42)
-[smp] child on hart 2->2
+[smp] child on hart [smp] child on hart 2->22
+->[PROC] pid=53 exited(42)
+3
 [PROC] pid=54 exited(43)
 [TEST] smp PASS
 [PROC] pid=50 exited(0)
@@ -415,6 +419,7 @@ smp_test ok
 [PROC] pid=59 exited(0)
 [bg] done
 [TEST] bg PASS
+[DBG] soft hart=1 n=1 sip=0x2->0x0
 [TEST] sleep PASS
 [PROC] fork pid=41 -> child=61
 [PROC] pid=61 killed
@@ -441,8 +446,8 @@ smp_test ok
 [PROC] pid=65 exited(0)
 [TEST] env PASS
 [PROC] fork pid=41 -> child=67
-[PROC] execve pid=67 -> /bin/echo (argc=2 envc=1)
 [bg] started
+[PROC] execve pid=67 -> /bin/echo (argc=2 envc=1)
 hi
 [TEST] echo PASS
 [PROC] pid=67 exited(0)
@@ -493,3 +498,4 @@ sh: halting
 [SYS] shutdown
 [FS] cache stats hits=9789 miss=1720 dev_rd=3383 dev_wr=40
 [FS] marked clean
+[SMP] steals=20

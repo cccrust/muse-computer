@@ -99,6 +99,9 @@ pub extern "C" fn rust_main() -> ! {
     // v1.0: wake APs via SBI HSM *after* all shared init (mount, allocator,
     // task table) is done; APs only enter the scheduler (never re-init).
     let me = task::hartid() % MAX_HART;
+    // v1.1: remember which harts actually started (under -smp 1 there are
+    // no APs; the IPI test must only wait for started harts).
+    let mut started_mask = 0usize;
     for h in 0..MAX_HART {
         if h == me {
             continue;
@@ -106,9 +109,69 @@ pub extern "C" fn rust_main() -> ! {
         let rc = sbi::hart_start(h, _start_secondary as usize, 0);
         if rc == 0 {
             println!("[SMP] hart{} starting", h);
+            started_mask |= 1 << h;
         } else {
             println!("[SMP] hart{} start FAILED (rc={}), continuing degraded", h, rc);
         }
+    }
+    // v1.1: IPI delivery self-test. APs ack in the soft-irq handler
+    // (trap.rs); an AP still spinning in run_on (SIE=0) holds the IPI
+    // pending until its first SIE=1 context. Wait on mtime (advances
+    // without ISRs, so the bound holds even with SIE=0), wfi-ing between
+    // checks to yield the vCPU to the APs under MTTCG. Timeout reports
+    // FAIL but boots on (degraded: no prompt wakeups).
+    // HSM start is asynchronous: an AP may still be STOPPED when its IPI
+    // is first sent (OpenSBI answers -3 INVALID_PARAM until STARTED), so
+    // retry each hart until the send succeeds (bounded; the ids are valid
+    // -- these harts just started above).
+    let send_deadline = crate::timer::now().wrapping_add(crate::timer::freq() * 5);
+    let mut send_mask = started_mask;
+    while send_mask != 0 && crate::timer::now() < send_deadline {
+        for h in 0..MAX_HART {
+            if send_mask & (1 << h) != 0 {
+                if sbi::send_ipi(1 << h) == 0 {
+                    send_mask &= !(1 << h);
+                }
+            }
+        }
+        core::hint::spin_loop();
+    }
+    for h in 0..MAX_HART {
+        if started_mask & (1 << h) != 0 && send_mask & (1 << h) != 0 {
+            println!("[DBG] ipi send hart{} failed, continuing", h);
+        }
+    }
+    let deadline = crate::timer::now().wrapping_add(crate::timer::freq() * 15);
+    loop {
+        let mut done = true;
+        for h in 0..MAX_HART {
+            if started_mask & (1 << h) != 0 && !trap::soft_acked(h) {
+                done = false;
+                break;
+            }
+        }
+        if done {
+            break;
+        }
+        if crate::timer::now() >= deadline {
+            break;
+        }
+        // wfi with SIE=0: no trap is taken, but the vCPU sleeps until an
+        // interrupt pends (own timer is armed) -- APs get CPU time.
+        unsafe {
+            core::arch::asm!("wfi");
+        }
+    }
+    let mut missing = false;
+    for h in 0..MAX_HART {
+        if started_mask & (1 << h) != 0 && !trap::soft_acked(h) {
+            missing = true;
+        }
+    }
+    if missing {
+        println!("[TEST] ipi FAIL (ack timeout)");
+    } else {
+        println!("[TEST] ipi PASS");
     }
     println!("[TEST] boot markers ready");
     task::run();

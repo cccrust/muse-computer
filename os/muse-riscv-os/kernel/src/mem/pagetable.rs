@@ -247,6 +247,29 @@ pub fn activate(root_pa: usize) {
     }
 }
 
+/// v1.1: flush this hart (local sfence) plus every other hart (SBI RFENCE,
+/// full address space) after changing a LIVE user address space's
+/// mappings. Required because ASIDs are all 0: a stale TLB entry on
+/// another hart silently aliases the new mapping at the same VA.
+/// Callers (only live roots need it; fresh roots/frames are uncached):
+/// - mem::unmap_free_user (munmap / sbrk shrink: frames are recycled);
+/// - task::exec root switch (old root's VAs collide with the new root's).
+/// protect() callers: spawn uses a fresh root (skip); exec is covered here.
+/// Call context is always trap/kernel with valid tp (hartid).
+pub fn remote_flush_all() {
+    unsafe {
+        core::arch::asm!("sfence.vma");
+    }
+    let me = crate::task::hartid() % crate::MAX_HART;
+    let mut mask = 0usize;
+    for h in 0..crate::MAX_HART {
+        if h != me {
+            mask |= 1 << h;
+        }
+    }
+    crate::sbi::remote_sfence_vma(mask, 0, 0);
+}
+
 pub fn current_satp() -> usize {
     let s: usize;
     unsafe {

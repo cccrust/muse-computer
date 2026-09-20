@@ -65,7 +65,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [BOOT] hart booted in S-mode, kernel @ 0x80200000
 [MM] heap init ok
 [MM] frame allocator ok
-[MM] root=0x80a99000
+[MM] root=0x80ae5000
 [MM] text mapped
 [MM] rodata mapped
 [MM] data mapped
@@ -90,14 +90,16 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [SMP] hart1 starting
 [SMP] hart2 starting
 [SMP] hart3 starting
-[TEST] boot markers ready
-[PLIC] hart3 ctx irq10+1 enabled
-[PLIC] hart2 ctx irq10+1 enabled
 [PLIC] hart1 ctx irq10+1 enabled
-[TEST] virtio-irq PASS
-[SMP] hart3 up
-[SMP] hart2 up
+[PLIC] hart2 ctx irq10+1 enabled
 [SMP] hart1 up
+[SMP] hart2 up
+[PLIC] hart3 ctx irq10+1 enabled
+[SMP] hart3 up
+[DBG] soft hart=1 n=0 sip=0x222->0x220
+[TEST] ipi PASS
+[TEST] boot markers ready
+[TEST] virtio-irq PASS
 [USER] init: starting sh
 [PROC] fork pid=1 -> child=2
 [PROC] exec pid=2 -> /bin/sh (argc=0)
@@ -160,16 +162,16 @@ echo: hi from unix-v6
 [PROC] exec pid=11 -> /bin/smp_test (argc=0)
 [PROC] fork pid=11 -> child=12
 [PROC] fork pid=11 -> child=13
-[smp] child on hart [PROC] fork pid=11 -> child=14
-3->3
-[PROC] pid=12 exited(40)
+[PROC] fork pid=11 -> child=14
 [PROC] fork pid=11 -> child=15
-[smp] child on hart 3->[smp] child on hart 33->
-1[PROC] pid=13 exited(41)
-
+[smp] child on hart 3->3
+[smp] child on hart 3->3
+[PROC] pid=13 exited(41)
+[smp] child on hart 3->3
 [PROC] pid=14 exited(42)
-[smp] child on hart 1->1
+[smp] child on hart 3->3
 [PROC] pid=15 exited(43)
+[PROC] pid=12 exited(40)
 [TEST] smp PASS
 [PROC] pid=11 exited(0)
 [PROC] fork pid=2 -> child=16
@@ -187,11 +189,11 @@ hello-arg
 [TEST] echo PASS
 [PROC] pid=18 exited(0)
 [PROC] fork pid=2 -> child=19
-[PROC] exec pid=19 -> /bin/pipe_test (argc=0)
 [bg] pipe_test &
 [PROC] fork pid=2 -> child=20
-[PROC] exec pid=20 -> /bin/ls (argc=1)
+[PROC] exec pid=19 -> /bin/pipe_test (argc=0)
 [PROC] fork pid=19 -> child=21
+[PROC] exec pid=20 -> /bin/ls (argc=1)
 [PROC] pid=21 exited(0)
 [TEST] pipe PASS
 [PROC] pid=19 exited(0)
@@ -289,4 +291,4 @@ hi
 [PROC] pid=40 exited(0)
 [PROC] pid=39 exited(0)
 [TEST] redirenv PASS
-sh$ qemu-system-riscv64: terminating on signal 15 from pid 6906 (<unknown process>)
+sh$ qemu-system-riscv64: terminating on signal 15 from pid 0 (<unknown process>)

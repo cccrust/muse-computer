@@ -59,11 +59,27 @@ pub struct Proc {
 
 struct Sched {
     procs: Vec<Option<Proc>>,
-    queue: VecDeque<usize>,
-    // v1.0: per-hart state for SMP (global procs/queue under one big lock)
+    // v1.1: per-hart runqueues (placement + stealing). Big lock retained
+    // (lock split is v1.2); all queue ops are short critical sections.
+    queues: [VecDeque<usize>; crate::MAX_HART],
+    // v1.0: per-hart state for SMP (global procs under one big lock)
     current: [usize; crate::MAX_HART],
     next_pid: usize,
     yield_flag: [bool; crate::MAX_HART],
+    // v1.1: true while the hart sleeps in the idle loop (wfi, SIE=1) --
+    // an IPI then wakes it promptly (see kick_idle).
+    idle: [bool; crate::MAX_HART],
+}
+
+// v1.1: successful cross-hart steals (informational; printed at halt).
+static STEALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// v1.1: scheduler balance stats line (called on the halt path).
+pub fn print_stats() {
+    crate::println!(
+        "[SMP] steals={}",
+        STEALS.load(core::sync::atomic::Ordering::SeqCst)
+    );
 }
 
 static mut SCHED: Option<crate::sync::SpinMutex<Sched>> = None;
@@ -125,6 +141,97 @@ pub fn current_pid() -> usize {
     sched().lock().current[hartid() % crate::MAX_HART]
 }
 
+/// v1.1: enqueue pid on hart hq's runqueue. Caller holds the sched lock.
+/// Exactly-once (v1.0 rule, per-hart): if pid is still current[] on any
+/// hart, that hart owns it and its trap epilogue will enqueue it -- do
+/// not push a second copy (two harts would run one task).
+/// Returns true if the pid was queued (caller may kick_idle after unlock).
+fn enqueue_locked(s: &mut Sched, pid: usize, hq: usize) -> bool {
+    let hq = hq % crate::MAX_HART;
+    for hh in 0..crate::MAX_HART {
+        if s.current[hh] == pid {
+            return false;
+        }
+    }
+    s.queues[hq].push_back(pid);
+    dbg_push(pid, 4);
+    true
+}
+
+/// v1.1: scan queues[v] (bounded), drop stale entries (reaped / zombie /
+/// blocked / owned by another hart), return the first takeable pid for
+/// hart h. Caller validates state was Runnable-or-orphan-Running.
+fn pop_valid_locked(s: &mut Sched, h: usize, v: usize) -> Option<usize> {
+    let v = v % crate::MAX_HART;
+    let n = s.queues[v].len();
+    for _ in 0..n {
+        let pid = match s.queues[v].pop_front() {
+            Some(p) => p,
+            None => break,
+        };
+        let mut owned = false;
+        for hh in 0..crate::MAX_HART {
+            if hh != h && s.current[hh] == pid {
+                owned = true;
+                break;
+            }
+        }
+        let live = match s.procs.get(pid) {
+            Some(Some(p))
+                if p.state == State::Runnable || p.state == State::Running =>
+            {
+                !owned
+            }
+            _ => false,
+        };
+        if live {
+            return Some(pid);
+        }
+        // else: drop stale entry
+    }
+    None
+}
+
+/// v1.1: pick next task for hart h: local queue first, then steal one
+/// task per pass from other harts (round-robin). A successful steal bumps
+/// STEALS. Caller marks Running + current[h] + idle[h]=false.
+fn pick_locked(s: &mut Sched, h: usize) -> Option<usize> {
+    let h = h % crate::MAX_HART;
+    if let Some(pid) = pop_valid_locked(s, h, h) {
+        return Some(pid);
+    }
+    for off in 1..crate::MAX_HART {
+        let v = (h + off) % crate::MAX_HART;
+        if let Some(pid) = pop_valid_locked(s, h, v) {
+            STEALS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// v1.1: IPI-kick every hart that is idle with a non-empty queue.
+/// Computed under lock, sent after unlock (ecall from trap/ISR context
+/// is legal). Spurious kicks are harmless (soft irq only sets the local
+/// yield flag). Without this, an idle hart in wfi waits up to one timer
+/// tick (~10ms) to notice newly queued work.
+fn kick_idle() {
+    let mut mask = 0usize;
+    {
+        let s = sched().lock();
+        for h in 0..crate::MAX_HART {
+            if s.idle[h] && !s.queues[h].is_empty() {
+                mask |= 1 << h;
+            }
+        }
+    }
+    for h in 0..crate::MAX_HART {
+        if mask & (1 << h) != 0 {
+            crate::sbi::send_ipi(1 << h);
+        }
+    }
+}
+
 fn alloc_tf() -> usize {
     crate::mem::frame::alloc_frame().expect("oom tf")
 }
@@ -142,10 +249,11 @@ pub fn init() {
     unsafe {
         SCHED = Some(crate::sync::SpinMutex::new(Sched {
             procs: Vec::new(),
-            queue: VecDeque::new(),
+            queues: core::array::from_fn(|_| VecDeque::new()),
             current: [0; crate::MAX_HART],
             next_pid: 1,
             yield_flag: [false; crate::MAX_HART],
+            idle: [false; crate::MAX_HART],
         }));
     }
     // create init from embedded ELF
@@ -287,8 +395,11 @@ fn finish_spawn(
             pp.children.push(pid);
         }
     }
-    s.queue.push_back(pid);
-    dbg_push(pid, 1);
+    // v1.1: spawn onto the current (spawning) hart's queue; idle harts
+    // steal from there. Boot: init lands on the boot hart.
+    enqueue_locked(&mut s, pid, hartid() % crate::MAX_HART);
+    drop(s);
+    kick_idle();
 }
 
 pub fn spawn_from_elf(name: &str, elf_bytes: &[u8], parent: usize) -> usize {
@@ -463,8 +574,11 @@ pub fn fork(parent_pid: usize) -> usize {
     if let Some(Some(pp)) = s.procs.get_mut(parent_pid) {
         pp.children.push(child);
     }
-    s.queue.push_back(child);
-    dbg_push(child, 2);
+    // v1.1: child inherits the parent hart's queue (locality); other
+    // harts steal if they idle. Kick after unlock (non-reentrant lock).
+    enqueue_locked(&mut s, child, hartid() % crate::MAX_HART);
+    drop(s);
+    kick_idle();
     // set parent return = child pid (caller does)
     child
 }
@@ -550,6 +664,10 @@ pub fn exec(pid: usize, path: &str, args: &[Vec<u8>], env: &[Vec<u8>]) -> bool {
     if s.current[h] == pid {
         pt::activate(new_root);
     }
+    drop(s);
+    // v1.1: the old root's VAs may sit in other harts' TLBs, and ASIDs are
+    // all 0 -- flush remotes so stale entries cannot alias the new root.
+    pt::remote_flush_all();
     true
 }
 
@@ -569,16 +687,37 @@ pub fn exit(pid: usize, code: i32) {
 }
 
 fn find_next(s: &mut Sched, exclude: usize) -> Option<usize> {
-    // RR: pop front until runnable (queue = waiting only, current separate)
-    let n = s.queue.len();
-    for _ in 0..n {
-        if let Some(pid) = s.queue.pop_front() {
+    // v1.1: exiting hart takes local work first, then steals (one task).
+    // RR within a queue is preserved (pop front, stale dropped). The
+    // exiting pid is dropped wherever met (it just went Zombie).
+    let h = hartid() % crate::MAX_HART;
+    for off in 0..crate::MAX_HART {
+        let v = (h + off) % crate::MAX_HART;
+        let n = s.queues[v].len();
+        for _ in 0..n {
+            let pid = match s.queues[v].pop_front() {
+                Some(p) => p,
+                None => break,
+            };
             if pid == exclude {
                 continue;
+            }
+            let mut owned = false;
+            for hh in 0..crate::MAX_HART {
+                if hh != h && s.current[hh] == pid {
+                    owned = true;
+                    break;
+                }
+            }
+            if owned {
+                continue; // owned elsewhere: drop this copy, keep scanning
             }
             if let Some(Some(p)) = s.procs.get(pid) {
                 if p.state == State::Runnable || p.state == State::Running {
                     // do NOT push back: becomes current
+                    if off > 0 {
+                        STEALS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                    }
                     return Some(pid);
                 }
                 // zombie skipped
@@ -600,36 +739,37 @@ pub fn kill(pid: usize) -> bool {
 }
 
 fn kill_with(pid: usize, code: i32) -> bool {
-    let mut s = sched().lock();
-    match s.procs.get_mut(pid) {
-        Some(Some(p)) => {
-            if p.state == State::Zombie {
-                return false;
-            }
-            p.killed = true;
-            p.kill_code = code;
-            if p.state == State::Blocked {
-                p.state = State::Runnable;
-                p.blocked_on = 0;
-                // v1.0: same exactly-once rule as wake_locked -- a task
-                // still current[] on some hart is owned by that hart's
-                // trap epilogue; do not push a second copy.
-                let mut owned = false;
-                for hh in 0..crate::MAX_HART {
-                    if s.current[hh] == pid {
-                        owned = true;
-                        break;
-                    }
+    let h = hartid() % crate::MAX_HART;
+    let queued = {
+        let mut s = sched().lock();
+        let blocked = match s.procs.get_mut(pid) {
+            Some(Some(p)) => {
+                if p.state == State::Zombie {
+                    return false;
                 }
-                if !owned {
-                    s.queue.push_back(pid);
-                    dbg_push(pid, 4);
+                p.killed = true;
+                p.kill_code = code;
+                if p.state == State::Blocked {
+                    p.state = State::Runnable;
+                    p.blocked_on = 0;
+                    true
+                } else {
+                    false
                 }
             }
-            true
+            _ => return false,
+        };
+        // borrow of p ended; fresh &mut s for the enqueue
+        if blocked {
+            enqueue_locked(&mut s, pid, h)
+        } else {
+            false
         }
-        _ => false,
+    };
+    if queued {
+        kick_idle();
     }
+    true
 }
 
 pub fn is_killed(pid: usize) -> bool {
@@ -676,65 +816,74 @@ pub fn block_current(reason: u8, wake_at: u64) {
     }
 }
 
-fn wake_locked(s: &mut Sched, pid: usize) {
-    if let Some(Some(p)) = s.procs.get_mut(pid) {
-        if p.state == State::Blocked {
+/// v1.1: wake one task (caller holds the sched lock). Transitions
+/// Blocked->Runnable and enqueues onto the WAKING hart's queue (locality;
+/// stealers rebalance). Returns true if queued (caller kicks idle harts
+/// after unlock).
+fn wake_locked(s: &mut Sched, pid: usize, hq: usize) -> bool {
+    let blocked = match s.procs.get_mut(pid) {
+        Some(Some(p)) if p.state == State::Blocked => {
             p.state = State::Runnable;
             p.blocked_on = 0;
-            // v1.0: exactly-once queueing. If the task is still current[]
-            // on some hart, that hart owns it: it blocked and has not yet
-            // reached its trap epilogue, which will push it exactly once.
-            // Pushing here as well would queue it twice and two harts
-            // would run one task. (All under the sched lock, so the
-            // epilogue-first / wake-first interleavings are both safe:
-            // vacated-then-wake pushes here; wake-then-epilogue pushes
-            // there.)
-            let mut owned = false;
-            for hh in 0..crate::MAX_HART {
-                if s.current[hh] == pid {
-                    owned = true;
-                    break;
-                }
-            }
-            if !owned {
-                s.queue.push_back(pid);
-                dbg_push(pid, 4);
-            }
+            true
         }
+        _ => false,
+    };
+    // borrow of p ended; fresh &mut s for the enqueue
+    if blocked {
+        enqueue_locked(s, pid, hq)
+    } else {
+        false
     }
 }
 
 /// Wake stdin sleepers (UART ISR).
 pub fn wake_stdin() {
-    let mut s = sched().lock();
-    let ids: Vec<usize> = s
-        .procs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, o)| match o {
-            Some(p) if p.state == State::Blocked && p.blocked_on == BLOCK_STDIN => Some(i),
-            _ => None,
-        })
-        .collect();
-    for pid in ids {
-        wake_locked(&mut s, pid);
+    let h = hartid() % crate::MAX_HART;
+    let queued = {
+        let mut s = sched().lock();
+        let ids: Vec<usize> = s
+            .procs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| match o {
+                Some(p) if p.state == State::Blocked && p.blocked_on == BLOCK_STDIN => Some(i),
+                _ => None,
+            })
+            .collect();
+        let mut q = false;
+        for pid in ids {
+            q |= wake_locked(&mut s, pid, h);
+        }
+        q
+    };
+    if queued {
+        kick_idle();
     }
 }
 
 /// Wake virtio-block sleepers (virtio completion ISR).
 pub fn wake_virtio() {
-    let mut s = sched().lock();
-    let ids: Vec<usize> = s
-        .procs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, o)| match o {
-            Some(p) if p.state == State::Blocked && p.blocked_on == BLOCK_VIRTIO => Some(i),
-            _ => None,
-        })
-        .collect();
-    for pid in ids {
-        wake_locked(&mut s, pid);
+    let h = hartid() % crate::MAX_HART;
+    let queued = {
+        let mut s = sched().lock();
+        let ids: Vec<usize> = s
+            .procs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| match o {
+                Some(p) if p.state == State::Blocked && p.blocked_on == BLOCK_VIRTIO => Some(i),
+                _ => None,
+            })
+            .collect();
+        let mut q = false;
+        for pid in ids {
+            q |= wake_locked(&mut s, pid, h);
+        }
+        q
+    };
+    if queued {
+        kick_idle();
     }
 }
 
@@ -750,35 +899,43 @@ static SCHED_ACTIVE: core::sync::atomic::AtomicBool =
 
 /// Wake expired sleepers (timer tick).
 pub fn wake_sleepers(now: u64) {
-    let mut s = sched().lock();
-    let ids: Vec<usize> = s
-        .procs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, o)| match o {
-            Some(p)
-                if p.state == State::Blocked
-                    && p.blocked_on == BLOCK_SLEEP
-                    && now >= p.wake_at =>
-            {
-                Some(i)
-            }
-            _ => None,
-        })
-        .collect();
-    for pid in ids {
-        wake_locked(&mut s, pid);
+    let h = hartid() % crate::MAX_HART;
+    let queued = {
+        let mut s = sched().lock();
+        let ids: Vec<usize> = s
+            .procs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| match o {
+                Some(p)
+                    if p.state == State::Blocked
+                        && p.blocked_on == BLOCK_SLEEP
+                        && now >= p.wake_at =>
+                {
+                    Some(i)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut q = false;
+        for pid in ids {
+            q |= wake_locked(&mut s, pid, h);
+        }
+        q
+    };
+    if queued {
+        kick_idle();
     }
 }
 
 /// Called at end of trap handler with old TF ptr (VA).
 /// Switches satp to next task. TF_VA stays same.
-/// Invariant (v1.0, per hart): a task is EITHER current[h] (Running) OR
-/// queued (Runnable) OR neither (Blocked/Zombie) -- never both. current[h]
-/// is vacated the moment its task stops running, so no stale claims.
+/// Invariant (v1.1, per hart): a task is EITHER current[h] (Running) OR
+/// queued in some queues[q] (Runnable) OR neither (Blocked/Zombie) --
+/// never both. current[h] is vacated the moment its task stops running,
+/// so no stale claims.
 pub fn schedule_point(_old_tf: *mut TrapFrame) {
-    // v1.0: operate on this hart's current slot only; the global queue
-    // stays shared (big-lock RR).
+    // v1.1: local runqueue first, steal on empty (big lock retained).
     let h = hartid() % crate::MAX_HART;
     let next = {
         let mut s = sched().lock();
@@ -792,36 +949,33 @@ pub fn schedule_point(_old_tf: *mut TrapFrame) {
             DEBUG_SCHED_IN = false;
         }
         let cur = s.current[h];
-        // requeue current if still runnable, else vacate the slot: a
-        // Blocked/Zombie task must not appear to run here anymore
+        // Requeue current if it is still ours. Two cases push:
+        // - Running -> Runnable (timeslice / explicit yield);
+        // - Runnable (woken between block_current and this epilogue: the
+        //   waker set Runnable but left the push to us -- exactly-once).
+        // Blocked/Zombie vacates the slot. The push is DIRECT, not via
+        // enqueue_locked: we own current[h], and enqueue_locked's
+        // ownership check would (correctly for wakers, wrongly for us)
+        // skip a self-owned pid and strand the task.
+        let mut repush = false;
         if let Some(Some(p)) = s.procs.get_mut(cur) {
             if p.state == State::Running {
                 p.state = State::Runnable;
-                s.queue.push_back(cur);
-                dbg_push(cur, 3);
+                repush = true;
+            } else if p.state == State::Runnable {
+                repush = true;
             } else {
                 s.current[h] = 0;
             }
         } else {
             s.current[h] = 0;
         }
-        // pop next runnable
-        let n = s.queue.len();
-        let mut pick: Option<usize> = None;
-        for _ in 0..n {
-            if let Some(pid) = s.queue.pop_front() {
-                let ok = match s.procs.get(pid) {
-                    Some(Some(p)) => p.state == State::Runnable || p.state == State::Running,
-                    _ => false,
-                };
-                if ok {
-                    pick = Some(pid);
-                    break;
-                }
-                // else drop zombie / dead
-            }
+        if repush {
+            s.queues[h].push_back(cur);
+            dbg_push(cur, 3);
         }
-        match pick {
+        // pop next runnable (local-first, then steal)
+        match pick_locked(&mut s, h) {
             Some(pid) => {
                 if let Some(Some(p)) = s.procs.get_mut(pid) {
                     p.state = State::Running;
@@ -843,14 +997,8 @@ pub fn schedule_point(_old_tf: *mut TrapFrame) {
                             "[DBG] current=[{},{},{},{}]",
                             s.current[0], s.current[1], s.current[2], s.current[3]
                         );
-                        crate::println!("[DBG] queue dump:");
-                        let mut k = 0;
-                        for q in s.queue.iter() {
-                            crate::println!("[DBG]   q[{}]={}", k, *q);
-                            k += 1;
-                            if k >= 32 {
-                                break;
-                            }
+                        for (qh, q) in s.queues.iter().enumerate() {
+                            crate::println!("[DBG] queue[{}] len={}", qh, q.len());
                         }
                         crate::println!("[DBG] freezing hart{}", h);
                         loop {
@@ -859,6 +1007,7 @@ pub fn schedule_point(_old_tf: *mut TrapFrame) {
                     }
                 }
                 s.current[h] = pid;
+                s.idle[h] = false;
                 // v1.0: a task may migrate harts; its trap stack must be
                 // this hart's (trap.S loads sp from TF on trap entry)
                 let tfpa = s.procs[pid].as_ref().unwrap().tf_pa;
@@ -870,7 +1019,9 @@ pub fn schedule_point(_old_tf: *mut TrapFrame) {
             }
             None => {
                 // nothing runnable for this hart (current already vacated
-                // above); idle-sleep below instead of sret into a dead TF
+                // above); mark idle and sleep below instead of sret into
+                // a dead TF. kick_idle() will IPI us when work lands.
+                s.idle[h] = true;
                 None
             }
         }
@@ -990,6 +1141,7 @@ fn switch_to(next: Option<usize>) {    match next {
                     idle_on_hart(h);
                 }
                 s.current[h] = pid;
+                s.idle[h] = false;
                 if let Some(Some(p)) = s.procs.get_mut(pid) {
                     p.state = State::Running;
                     unsafe {
@@ -1012,7 +1164,9 @@ fn switch_to(next: Option<usize>) {    match next {
             // later IRQ/tick will wake. Idling (wfi, SIE=1) lets a later
             // trap redrive schedule_point. Global power-off is only via
             // the explicit SYS_SHUTDOWN (halt) path.
+            // v1.1: mark idle under lock so kick_idle() can target us.
             let h = hartid() % crate::MAX_HART;
+            sched().lock().idle[h] = true;
             idle_on_hart(h);
         }
     }
@@ -1021,73 +1175,45 @@ fn switch_to(next: Option<usize>) {    match next {
 /// v1.0: first entry to userspace on a hart. APs call this from
 /// rust_secondary_main after task::init (done by the boot hart).
 /// Spins (no wfi: SIE is off in kernel context) until a task appears;
-/// init's forks feed the queue, shutdown powers the machine off.
+/// init's forks feed the queues, shutdown powers the machine off.
+/// v1.1: local runqueue first, then steal (same take rules as
+/// schedule_point); never panics on stale entries.
 pub fn run_on(hart: usize) -> ! {
     let h = hart % crate::MAX_HART;
     loop {
         let mut s = sched().lock();
-            // TEMP DBG: exclusion check
-            unsafe {
-                if DEBUG_IN_CRIT {
-                    crate::println!("[DBG] LOCK BROKEN run_on hart{}", h);
-                }
-                DEBUG_IN_CRIT = true;
-                core::arch::asm!("nop; nop; nop; nop; nop; nop; nop; nop");
-                DEBUG_IN_CRIT = false;
+        // TEMP DBG: exclusion check
+        unsafe {
+            if DEBUG_IN_CRIT {
+                crate::println!("[DBG] LOCK BROKEN run_on hart{}", h);
             }
-            // v1.0: filter loop (same rules as schedule_point's pick).
-            // The queue can hold stale entries (a pid reaped by waitpid
-            // before a duplicate entry was consumed, or a pid already
-            // running on another hart): popping blindly and unwrapping
-            // panics or double-runs. Drop stale entries, skip dups.
-            let n = s.queue.len();
-            let mut pick: Option<usize> = None;
-            for _ in 0..n {
-                let pid = match s.queue.pop_front() {
-                    Some(p) => p,
-                    None => break,
-                };
-                let mut owned = false;
-                for hh in 0..crate::MAX_HART {
-                    if hh != h && s.current[hh] == pid {
-                        owned = true;
-                        break;
-                    }
+            DEBUG_IN_CRIT = true;
+            core::arch::asm!("nop; nop; nop; nop; nop; nop; nop; nop");
+            DEBUG_IN_CRIT = false;
+        }
+        if let Some(pid) = pick_locked(&mut s, h) {
+            s.current[h] = pid;
+            s.idle[h] = false;
+            if let Some(Some(p)) = s.procs.get_mut(pid) {
+                p.state = State::Running;
+                unsafe {
+                    (*(p.tf_pa as *mut TrapFrame)).kernel_sp =
+                        crate::trap::trap_stack_top_hart(h);
                 }
-                let live = match s.procs.get(pid) {
-                    // runnable/orphan-running: take unless owned elsewhere
-                    Some(Some(p))
-                        if p.state == State::Runnable || p.state == State::Running =>
-                    {
-                        !owned
-                    }
-                    // reaped/zombie/blocked: drop entry
-                    _ => false,
-                };
-                if !live {
-                    continue;
-                }
-                pick = Some(pid);
-                break;
+                // capture root under the same lock: no reap window
+                let root = p.root;
+                drop(s);
+                pt::activate(root);
+                enter_user(pid);
+                unreachable!();
             }
-            if let Some(pid) = pick {
-                s.current[h] = pid;
-                if let Some(Some(p)) = s.procs.get_mut(pid) {
-                    p.state = State::Running;
-                    unsafe {
-                        (*(p.tf_pa as *mut TrapFrame)).kernel_sp =
-                            crate::trap::trap_stack_top_hart(h);
-                    }
-                    // capture root under the same lock: no reap window
-                    let root = p.root;
-                    drop(s);
-                    pt::activate(root);
-                    enter_user(pid);
-                    unreachable!();
-                }
-                // vanished under us (impossible: we own it as Running);
-                // loop and pick again rather than panic
-            }
+            // vanished under us (impossible: we own it as Running);
+            // loop and pick again rather than panic
+        }
+        // v1.1: SIE=0 here so a pending IPI never traps; poll-ack it so
+        // the boot self-test observes delivery even if this hart never
+        // reaches userspace (boot hart may do all early work itself).
+        crate::trap::poll_soft_ack();
         core::hint::spin_loop();
     }
 }
@@ -1275,10 +1401,11 @@ pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
         }
         if let Some((c, code)) = found {
             s.procs[c] = None;
-            // v1.0: purge stale queue entries for the reaped pid; a
-            // leftover copy would panic run_on's old blind pop (now
-            // filtered, but keep the queue clean anyway).
-            s.queue.retain(|&x| x != c);
+            // v1.1: purge stale entries from ALL runqueues (pick paths
+            // filter strays, but keep the queues clean anyway).
+            for q in s.queues.iter_mut() {
+                q.retain(|&x| x != c);
+            }
             if let Some(Some(pp)) = s.procs.get_mut(pid) {
                 pp.children.retain(|&x| x != c);
             }

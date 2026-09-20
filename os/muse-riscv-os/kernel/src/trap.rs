@@ -80,7 +80,9 @@ fn reaffirm_hartid() {
 }
 
 pub fn init() {
-    init_on(0);
+    // v1.1: enable the CALLING hart's context (v1.0 hardcoded 0, so a
+    // non-zero boot hart never got its PLIC context; APs masked it).
+    init_on(crate::task::hartid() % crate::MAX_HART);
     crate::plic::init();
     crate::uart::irq_enable();
     crate::uart::tx_enable();
@@ -88,18 +90,54 @@ pub fn init() {
 
 /// v1.0: per-hart trap setup for APs (stvec/sie are per-hart CSRs;
 /// UART IER is chip-global, enabled once by the boot hart).
+/// v1.1: also enables supervisor software interrupts (SSIP, bit 1) for
+/// SBI IPI wakeups.
 pub fn init_on(hart: usize) {
     let h = hart % crate::MAX_HART;
     unsafe {
         asm!("csrw stvec, {0}", in(reg) __trap_entry as usize);
-        // enable supervisor timer (5) + external (9) interrupts;
+        // enable supervisor software (1, IPI) + timer (5) + external (9);
         // SIE bit itself stays 0 in kernel, set on sret to user.
         let mut sie: usize;
         asm!("csrr {0}, sie", out(reg) sie);
-        sie |= (1 << 5) | (1 << 9);
+        sie |= (1 << 1) | (1 << 5) | (1 << 9);
         asm!("csrw sie, {0}", in(reg) sie);
     }
     crate::plic::enable_ctx(h);
+}
+
+// v1.1: per-hart IPI receipt flags (set in the soft-irq handler, read by
+// the boot hart's IPI self-test). Atomics: handler and waiter run on
+// different harts.
+static SOFT_ACK: [core::sync::atomic::AtomicBool; crate::MAX_HART] = {
+    const F: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [F, F, F, F]
+};
+
+/// v1.1: has this hart taken a software (IPI) interrupt since boot?
+/// (Boot self-test polls the APs' flags.)
+pub fn soft_acked(hart: usize) -> bool {
+    SOFT_ACK[hart % crate::MAX_HART].load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// v1.1: poll-ack a pending soft irq, for contexts that cannot take traps
+/// (run_on's SIE=0 spin). The boot IPI self-test only needs SBI->hart
+/// delivery proven; the trap path is exercised separately by kick_idle
+/// IPIs once the hart reaches SIE=1 contexts. Returns true if one pended.
+pub fn poll_soft_ack() -> bool {
+    let sip: usize;
+    unsafe {
+        asm!("csrr {0}, sip", out(reg) sip);
+    }
+    if sip & 2 == 0 {
+        return false;
+    }
+    unsafe {
+        asm!("csrc sip, 2");
+    }
+    let h = crate::task::hartid() % crate::MAX_HART;
+    SOFT_ACK[h].store(true, core::sync::atomic::Ordering::SeqCst);
+    true
 }
 
 #[no_mangle]
@@ -122,6 +160,39 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
         let code = scause & 0xfff;
         if is_int {
             match code {
+                1 => {
+                    // v1.1: supervisor software interrupt (SBI IPI).
+                    // Clear pending first (level-ish on some impls), ack,
+                    // then yield so the epilogue reschedules: this is how
+                    // a woken task on an idle hart gets picked up promptly.
+                    // TEMP DBG v1.1: verify delivery + clear works.
+                    let sip_before: usize;
+                    unsafe {
+                        asm!("csrr {0}, sip", out(reg) sip_before);
+                    }
+                    let h = crate::task::hartid() % crate::MAX_HART;
+                    static SEEN: [core::sync::atomic::AtomicU64; 4] = {
+                        const Z: core::sync::atomic::AtomicU64 =
+                            core::sync::atomic::AtomicU64::new(0);
+                        [Z, Z, Z, Z]
+                    };
+                    let n = SEEN[h].fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                    unsafe {
+                        asm!("csrc sip, 2");
+                    }
+                    let sip_after: usize;
+                    unsafe {
+                        asm!("csrr {0}, sip", out(reg) sip_after);
+                    }
+                    if n < 3 {
+                        crate::println!(
+                            "[DBG] soft hart={} n={} sip={:#x}->{:#x}",
+                            h, n, sip_before, sip_after
+                        );
+                    }
+                    SOFT_ACK[h].store(true, core::sync::atomic::Ordering::SeqCst);
+                    crate::task::set_yield_flag();
+                }
                 5 => {
                     crate::timer::tick();
                     crate::timer::set_next();

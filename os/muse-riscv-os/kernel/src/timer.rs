@@ -14,6 +14,16 @@ fn r_time() -> u64 {
     t
 }
 
+/// v1.1: raw mtime (advances without ISRs; for bounded boot waits while
+/// SIE=0). ~10MHz on QEMU virt.
+pub fn now() -> u64 {
+    r_time()
+}
+
+pub fn freq() -> u64 {
+    FREQ
+}
+
 pub fn init() {
     unsafe {
         // enable supervisor timer interrupt (per-hart CSR; call on each hart)

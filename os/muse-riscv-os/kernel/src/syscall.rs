@@ -94,6 +94,8 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
                 crate::fs::disk::set_dirty(false);
                 crate::println!("[FS] marked clean");
             }
+            // v1.1: scheduler balance stats (steals across harts).
+            crate::task::print_stats();
             crate::sbi::shutdown();
         }
         _ => {

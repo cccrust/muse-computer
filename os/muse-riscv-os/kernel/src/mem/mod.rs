@@ -208,6 +208,9 @@ pub fn alloc_map_user(root: usize, va: usize, len: usize, flags: u64) {
 
 /// v0.8: unmap user pages in [va, va+len) and recycle their frames.
 /// Skips unmapped / non-U pages (partial ranges are safe).
+/// v1.1: remote-flushes all harts afterwards (freed frames are reused for
+/// other address spaces; with ASID 0 a stale remote TLB entry would alias
+/// the next mapping at the same VA).
 pub fn unmap_free_user(root: usize, va: usize, len: usize) {
     let start = va & !0xfff;
     let end = (va + len + 0xfff) & !0xfff;
@@ -218,4 +221,5 @@ pub fn unmap_free_user(root: usize, va: usize, len: usize) {
         }
         cur += 4096;
     }
+    pt::remote_flush_all();
 }
