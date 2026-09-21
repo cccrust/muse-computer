@@ -2,6 +2,10 @@
 // Scope: one NIC, static config (guest 10.0.2.15/24, gw 10.0.2.2 -- QEMU
 // user-net/SLIRP defaults), ARP + UDP only. No TCP, DHCP, DNS.
 //
+// v1.5: TCP submodule (passive open, enough for the static web server).
+
+mod tcp;
+//
 // Concurrency contract (SMP): ONE lock (NET) guards queue indices, the RX
 // staging ring, ARP state and sockets. The TX completion wait is a pure
 // MMIO poll (like blk's submit) -- never block_current while holding it.
@@ -43,20 +47,26 @@ static mut TXP: [u8; 2048] = [0; 2048];
 
 struct Sock {
     used: bool,
+    kind: u8, // 0 = UDP, 1 = TCP
+    closing: bool, // v1.5: fd detached, TCB draining (FIN_WAIT/LAST_ACK)
     lport: u16,
     peer_ip: u32,   // BE, set by connect
     peer_port: u16, // BE order value (as passed)
-    rx: VecDeque<(u32, u16, Vec<u8>)>, // (src ip BE, src port, payload)
+    rx: VecDeque<(u32, u16, Vec<u8>)>, // UDP: (src ip BE, src port, payload)
+    tcp: tcp::Tcb,
 }
 
 impl Sock {
     const fn new() -> Self {
         Self {
             used: false,
+            kind: 0,
+            closing: false,
             lport: 0,
             peer_ip: 0,
             peer_port: 0,
             rx: VecDeque::new(),
+            tcp: tcp::Tcb::new(),
         }
     }
 }
@@ -564,11 +574,22 @@ fn parse_frame(n: &mut NetState, f: &[u8]) {
     if ihl < 20 || f.len() < 14 + ihl + 8 {
         return;
     }
-    if f[23] != 17 {
-        return; // not UDP
+    if f[23] != 17 && f[23] != tcp::TCP_PROTO {
+        return; // neither UDP nor TCP
     }
     if be32(&f[30..34]) != GUEST_IP {
         return; // not for us
+    }
+    if f[23] == tcp::TCP_PROTO {
+        // v1.5: TCP segment length comes from the IP total-length field,
+        // NOT the frame length (Ethernet pads short frames; checksumming
+        // the padding breaks validation -- observed off-by-2 vs host).
+        let ip_len = be16(&f[16..18]) as usize;
+        if ip_len < ihl || f.len() < 14 + ip_len {
+            return;
+        }
+        tcp::tcp_rx(n, be32(&f[26..30]), &f[14 + ihl..14 + ip_len]);
+        return;
     }
     let src_ip = be32(&f[26..30]);
     let uo = 14 + ihl;
@@ -634,7 +655,8 @@ fn alloc_port(n: &mut NetState) -> u16 {
     0
 }
 
-pub fn sock_open() -> Option<usize> {
+/// v1.5: open with kind (0 = UDP, 1 = TCP).
+pub fn sock_open_kind(kind: u8) -> Option<usize> {
     let mut n = NET.lock();
     let mut free = None;
     for (i, s) in n.socks.iter().enumerate() {
@@ -649,18 +671,80 @@ pub fn sock_open() -> Option<usize> {
         return None;
     }
     n.socks[i].used = true;
+    n.socks[i].kind = kind;
+    n.socks[i].closing = false;
     n.socks[i].lport = port;
     n.socks[i].peer_ip = 0;
     n.socks[i].peer_port = 0;
     n.socks[i].rx.clear();
+    n.socks[i].tcp.reset();
     Some(i)
 }
 
 pub fn sock_close(idx: usize) {
     let mut n = NET.lock();
-    if idx < NSOCK {
-        n.socks[idx].used = false;
-        n.socks[idx].rx.clear();
+    if idx >= NSOCK || !n.socks[idx].used {
+        return;
+    }
+    if n.socks[idx].kind == 1 {
+        // v1.5: TCP close runs FIN + lingering close-state (slot retained
+        // until ACK/timeout; fd is detached immediately by the caller).
+        tcp::tcp_close(&mut n, idx);
+        return;
+    }
+    n.socks[idx].used = false;
+    n.socks[idx].rx.clear();
+}
+
+/// v1.5: bind a fixed local port (UDP sticky port / TCP listen prerequisite).
+/// Port must be free across UDP + TCP (incl. lingering close holders).
+pub fn sock_bind(idx: usize, port: u16) -> bool {
+    let mut n = NET.lock();
+    if idx >= NSOCK || !n.socks[idx].used || port == 0 {
+        return false;
+    }
+    if n.socks[idx].kind == 1 {
+        return tcp::tcp_bind(&mut n, idx, port);
+    }
+    for (j, s) in n.socks.iter().enumerate() {
+        if j != idx && s.used && s.lport == port {
+            return false;
+        }
+    }
+    n.socks[idx].lport = port;
+    true
+}
+
+/// v1.5: TCP listen.
+pub fn sock_listen(idx: usize) -> bool {
+    let mut n = NET.lock();
+    tcp::tcp_listen(&mut n, idx)
+}
+
+/// v1.5: TCP accept. Returns the child sock idx (caller allocates an fd).
+pub fn sock_accept(idx: usize) -> Option<usize> {
+    let mut n = NET.lock();
+    tcp::tcp_accept(&mut n, idx)
+}
+
+/// v1.5: commit a peeked accept (after fd allocation; see tcp_accept).
+pub fn sock_accept_commit(idx: usize) {
+    let mut n = NET.lock();
+    tcp::tcp_accept_commit(&mut n, idx);
+}
+
+/// v1.5: per-tick TCP retransmit/timeout scan (timer ISR, 10ms). Wakes net
+/// sleepers after unlock if anything completed.
+pub fn tick() {
+    if !ready() {
+        return;
+    }
+    let wake = {
+        let mut n = NET.lock();
+        tcp::tcp_tick(&mut n, crate::timer::ticks() as u64)
+    };
+    if wake {
+        crate::task::wake_net();
     }
 }
 
@@ -675,12 +759,21 @@ pub fn sock_connect(idx: usize, ip_be: u32, port: u16) -> bool {
 }
 
 pub fn sock_send(idx: usize, data: &[u8]) -> isize {
-    // -2 WouldBlock (no ARP yet; userspace retries), -1 error, else len.
+    // -2 WouldBlock (UDP: no ARP yet; TCP: backpressure. Userspace
+    // retries), -1 error, else len.
+    let mut n = NET.lock();
+    if idx >= NSOCK || !n.socks[idx].used {
+        return -1;
+    }
+    if n.socks[idx].kind == 1 {
+        return tcp::tcp_send(&mut n, idx, data);
+    }
+    drop(n);
     if data.len() > MAXUDP {
         return -1;
     }
     let mut n = NET.lock();
-    if idx >= NSOCK || !n.socks[idx].used {
+    if idx >= NSOCK || !n.socks[idx].used || n.socks[idx].kind != 0 {
         return -1;
     }
     if !n.arp_ok {
@@ -706,10 +799,14 @@ pub fn sock_send(idx: usize, data: &[u8]) -> isize {
 }
 
 pub fn sock_recv(idx: usize, out: &mut [u8]) -> isize {
-    // payload length, or -2 WouldBlock (empty). Userspace retries.
+    // payload length, -2 WouldBlock (empty), 0 EOF (TCP peer FIN + drained),
+    // -1 error. Userspace retries.
     let mut n = NET.lock();
     if idx >= NSOCK || !n.socks[idx].used {
         return -1;
+    }
+    if n.socks[idx].kind == 1 {
+        return tcp::tcp_recv(&mut n, idx, out);
     }
     match n.socks[idx].rx.pop_front() {
         Some((_ip, _port, pkt)) => {

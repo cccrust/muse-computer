@@ -200,6 +200,9 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
                     // v0.6 watchdog: re-check virtio-blocked tasks every tick
                     // so a lost completion IRQ delays I/O by ~10ms, not forever
                     crate::task::wake_virtio();
+                    // v1.5: TCP retransmit/timeout scan (cheap no-op scan
+                    // without TCP sockets; under NET lock, ISR-safe)
+                    crate::net::tick();
                     if crate::timer::should_preempt() {
                         crate::task::set_yield_flag();
                     }

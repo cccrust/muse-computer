@@ -1115,9 +1115,13 @@ fn run_capture(line: &[u8], jobs: &mut [isize; 8], env: &Env, out: &mut [u8]) ->
 
 // single non-blocking reap attempt (for `jobs` builtin)
 fn reap_poll(jobs: &mut [isize; 8]) {
+    // v1.4/v1.5: MUST be WNOHANG. A blocking wait() sleeps until ANY child
+    // exits -- with an immortal background child (webserver) that is never,
+    // and the prompt loop stalls before read_edit (halt bytes rot unread).
+    // w==0 (nothing yet) and w<0 (no children) both mean "nothing reaped".
     let mut code: i32 = 0;
-    let w = user_lib::wait(&mut code as *mut i32);
-    if w >= 0 {
+    let w = user_lib::waitpid(-1, &mut code as *mut i32, 1);
+    if w > 0 {
         bg_done(jobs, w);
     }
 }
@@ -1145,6 +1149,9 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     run_one(b"/bin/smp_test\0", &mut jobs);
     run_one(b"/bin/reclaim_test\0", &mut jobs);
     run_one(b"/bin/stress\0", &mut jobs);
+    // v1.5: webserver backgrounds (never exits by design); the test
+    // client connects from the host.
+    let _ws = spawn_one(b"/bin/webserver\0");
     run_one(b"/bin/udpping\0", &mut jobs);
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);

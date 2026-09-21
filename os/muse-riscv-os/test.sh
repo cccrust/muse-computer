@@ -8,7 +8,7 @@ echo "=== 1. host unit tests ==="
 cargo test -p kernel -p host-tests -p mkfs || PASS=0
 
 echo "=== 2. build user ELFs ==="
-cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping || PASS=0
+cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver || PASS=0
 
 echo "=== 3. mkfs ==="
 cargo run --release -p mkfs -- fs.img || PASS=0
@@ -57,7 +57,11 @@ START=$(date +%s)
 python3 tools/udp_echo.py > /tmp/muse-echo.log 2>&1 &
 ECHO_PID=$!
 sleep 1
-$TO1 qemu-system-riscv64 \
+# v1.5: run1 keeps QEMU alive in background so the host web client can
+# fetch from the guest webserver mid-run (a timeout-killed QEMU can't be
+# fetched from afterwards). Sequence: boot bg -> web_fetch (30s) -> wait
+# for autorun end (redirenv, ~150s budget) -> kill QEMU -> assertions.
+qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
   -bios default \
@@ -65,8 +69,38 @@ $TO1 qemu-system-riscv64 \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0 \
-  < /dev/null 2>&1 | tee qemu.log || true
+  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
+  < /dev/null > qemu.log 2>&1 &
+QEMU_PID=$!
+echo "QEMU bg pid $QEMU_PID (log qemu.log)"
+# v1.5: wait for the guest webserver (backgrounded in autorun) before
+# fetching -- boot+autorun take ~60-90s even unloaded.
+for i in $(seq 1 150); do
+  if grep -q "webserver listening" qemu.log 2>/dev/null; then
+    echo "webserver up"
+    break
+  fi
+  if ! kill -0 $QEMU_PID 2>/dev/null; then
+    echo "QEMU exited early"
+    break
+  fi
+  sleep 1
+done
+python3 tools/web_fetch.py || PASS=0
+# wait for autorun to finish (or budget out)
+for i in $(seq 1 150); do
+  if grep -q "redirenv PASS" qemu.log 2>/dev/null; then
+    echo "autorun finished"
+    break
+  fi
+  if ! kill -0 $QEMU_PID 2>/dev/null; then
+    echo "QEMU exited early"
+    break
+  fi
+  sleep 1
+done
+kill $QEMU_PID 2>/dev/null || true
+wait $QEMU_PID 2>/dev/null || true
 END=$(date +%s)
 echo "QEMU ran for $((END-START))s, qemu.log bytes: $(wc -c < qemu.log)"
 
@@ -96,6 +130,7 @@ check "reclaim PASS"
 check "stress DONE"
 check "net PASS"
 check "net-dev PASS"
+check "web PASS"
 check "ipi PASS"
 check "hart0 up"
 check "hart1 up"
@@ -149,7 +184,7 @@ $TO2 qemu-system-riscv64 \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0 \
+  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
   < /dev/null 2>&1 | tee qemu2.log || true
 
 if [ ! -s qemu2.log ]; then
@@ -181,7 +216,7 @@ rm -f qemu3.log
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0 \
+  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
   2>&1 | tee qemu3.log || true
 
 if [ ! -s qemu3.log ]; then
@@ -254,7 +289,7 @@ rm -f qemu4.log
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0 \
+  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
   2>&1 | tee qemu4.log || true
 
 if [ ! -s qemu4.log ]; then
@@ -284,7 +319,7 @@ $TO qemu-system-riscv64 \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0 \
+  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
   < /dev/null 2>&1 | tee qemu5.log || true
 
 if [ ! -s qemu5.log ]; then

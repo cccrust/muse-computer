@@ -181,8 +181,9 @@ pub fn memstat() -> isize {
 /// IPv4 u32 + port; send/recv are datagrams on the connected peer.
 /// send/recv return -2 (WouldBlock) when ARP is unresolved / no packet;
 /// callers retry with their own deadline.
-pub fn socket() -> isize {
-    ecall(37, 0, 0, 0)
+/// v1.5: socket takes kind (0 = UDP, 1 = TCP); bind/listen/accept for TCP.
+pub fn socket(kind: usize) -> isize {
+    ecall(37, kind, 0, 0)
 }
 pub fn connect(fd: isize, ip_be: u32, port: u16) -> isize {
     ecall(38, fd as usize, ip_be as usize, port as usize)
@@ -192,6 +193,15 @@ pub fn send(fd: isize, buf: *const u8, len: usize) -> isize {
 }
 pub fn recv(fd: isize, buf: *mut u8, len: usize) -> isize {
     ecall(40, fd as usize, buf as usize, len)
+}
+pub fn bind(fd: isize, port: u16) -> isize {
+    ecall(41, fd as usize, port as usize, 0)
+}
+pub fn listen(fd: isize) -> isize {
+    ecall(42, fd as usize, 0, 0)
+}
+pub fn accept(fd: isize) -> isize {
+    ecall(43, fd as usize, 0, 0)
 }
 
 /// v0.9: ps(buf, len) fills "pid ppid state brk cwd\n" lines; trace(pid, on).

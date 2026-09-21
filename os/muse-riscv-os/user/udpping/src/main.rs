@@ -35,7 +35,7 @@ const ECHO_PORT: u16 = 7777;
 
 #[no_mangle]
 pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
-    let fd = user_lib::socket();
+    let fd = user_lib::socket(0);
     if fd < 0 {
         user_lib::print("[TEST] net FAIL (socket)\n");
         user_lib::exit(1);

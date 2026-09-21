@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 TARGET=riscv64gc-unknown-none-elf
 
 echo "=== build user apps (independent ELF) ==="
-cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping
+cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver
 
 echo "=== mkfs fs.img ==="
 cargo run --release -p mkfs -- fs.img
@@ -36,4 +36,4 @@ exec qemu-system-riscv64 \
   -drive file=fs.img,if=none,format=raw,id=x0,file.locking=off \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0
+  -netdev user,id=n0,hostfwd=tcp::8080-:80

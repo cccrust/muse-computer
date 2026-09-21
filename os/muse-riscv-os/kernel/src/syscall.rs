@@ -49,6 +49,10 @@ pub const SYS_SOCKET: usize = 37;
 pub const SYS_CONNECT: usize = 38;
 pub const SYS_SEND: usize = 39;
 pub const SYS_RECV: usize = 40;
+// v1.5: TCP listen-side + bind.
+pub const SYS_BIND: usize = 41;
+pub const SYS_LISTEN: usize = 42;
+pub const SYS_ACCEPT: usize = 43;
 
 pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) -> isize {
     match id {
@@ -96,10 +100,13 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_EXECVE => sys_execve(a0, a1, a2) as isize,
         SYS_GETHART => (crate::task::hartid() % crate::MAX_HART) as isize,
         SYS_MEMSTAT => crate::mem::frame::free_frames() as isize,
-        SYS_SOCKET => sys_socket() as isize,
+        SYS_SOCKET => sys_socket(a0) as isize,
         SYS_CONNECT => sys_connect(a0 as i32, a1 as u32, a2 as u16) as isize,
         SYS_SEND => sys_send(a0 as i32, a1, a2) as isize,
         SYS_RECV => sys_recv(a0 as i32, a1, a2) as isize,
+        SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
+        SYS_LISTEN => sys_listen(a0 as i32) as isize,
+        SYS_ACCEPT => sys_accept(a0 as i32) as isize,
         SYS_SHUTDOWN => {
             crate::println!("[SYS] shutdown");
             if crate::fs::use_disk() {
@@ -360,8 +367,12 @@ fn sys_close(fd: i32) -> isize {
     0
 }
 
-fn sys_socket() -> isize {
-    let idx = match crate::net::sock_open() {
+fn sys_socket(kind: usize) -> isize {
+    // v1.5: kind 0 = UDP, 1 = TCP.
+    if kind > 1 {
+        return -1;
+    }
+    let idx = match crate::net::sock_open_kind(kind as u8) {
         Some(i) => i,
         None => return -1,
     };
@@ -393,6 +404,62 @@ fn sock_idx_of(fd: i32) -> Option<usize> {
             Some(p.fds[fd as usize] as usize)
         }
     })
+}
+
+/// v1.5: bind/listen/accept (fd_kind 7 sockets; TCP listen-side).
+fn sys_bind(fd: i32, port: u16) -> isize {
+    match sock_idx_of(fd) {
+        Some(s) => {
+            if crate::net::sock_bind(s, port) {
+                0
+            } else {
+                -1
+            }
+        }
+        None => -1,
+    }
+}
+
+fn sys_listen(fd: i32) -> isize {
+    match sock_idx_of(fd) {
+        Some(s) => {
+            if crate::net::sock_listen(s) {
+                0
+            } else {
+                -1
+            }
+        }
+        None => -1,
+    }
+}
+
+fn sys_accept(fd: i32) -> isize {
+    let child = match sock_idx_of(fd) {
+        Some(s) => match crate::net::sock_accept(s) {
+            Some(c) => c,
+            None => return -2, // WouldBlock: no completed handshake yet
+        },
+        None => return -1,
+    };
+    // allocate an fd for the child socket (fd_kind 7, like sys_socket)
+    let mut ret: isize = -1;
+    crate::task::with_current_mut(|p| {
+        for i in 3..16 {
+            if p.fd_kind[i] == 0 {
+                p.fd_kind[i] = 7;
+                p.fds[i] = child as i32;
+                p.fd_off[i] = 0;
+                p.fd_path[i] = 0;
+                p.fd_cloexec[i] = false;
+                ret = i as isize;
+                break;
+            }
+        }
+    });
+    if ret >= 0 {
+        crate::net::sock_accept_commit(child);
+    }
+    ret
 }
 
 fn sys_connect(fd: i32, ip_be: u32, port: u16) -> isize {
