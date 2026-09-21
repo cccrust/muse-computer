@@ -177,6 +177,23 @@ pub fn memstat() -> isize {
     ecall(36, 0, 0, 0)
 }
 
+/// v1.3: UDP sockets (SYS_SOCKET=37 .. SYS_RECV=40). connect takes BE
+/// IPv4 u32 + port; send/recv are datagrams on the connected peer.
+/// send/recv return -2 (WouldBlock) when ARP is unresolved / no packet;
+/// callers retry with their own deadline.
+pub fn socket() -> isize {
+    ecall(37, 0, 0, 0)
+}
+pub fn connect(fd: isize, ip_be: u32, port: u16) -> isize {
+    ecall(38, fd as usize, ip_be as usize, port as usize)
+}
+pub fn send(fd: isize, buf: *const u8, len: usize) -> isize {
+    ecall(39, fd as usize, buf as usize, len)
+}
+pub fn recv(fd: isize, buf: *mut u8, len: usize) -> isize {
+    ecall(40, fd as usize, buf as usize, len)
+}
+
 /// v0.9: ps(buf, len) fills "pid ppid state brk cwd\n" lines; trace(pid, on).
 pub fn ps(buf: *mut u8, len: usize) -> isize {
     ecall(32, buf as usize, len, 0)

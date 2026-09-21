@@ -226,6 +226,12 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
                                 crate::println!("[TEST] virtio-irq PASS");
                             }
                             crate::fs::virtio::on_irq();
+                        } else if (2..=8).contains(&irq) {
+                            // v1.3: other virtio-mmio slots (net lives on
+                            // the second one). Dispatch by device INTSTAT
+                            // inside, so the exact IRQ mapping doesn't
+                            // matter; unknown slots are no-ops.
+                            crate::net::on_irq();
                         }
                         crate::plic::complete(irq);
                     }

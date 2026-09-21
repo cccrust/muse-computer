@@ -36,23 +36,30 @@ fn enable(irq: u32) {
 }
 
 /// v1.0: enable UART+VIRTIO on an AP's S context.
+/// v1.3: enables ALL virtio-mmio IRQs (1..=8, QEMU virt assigns one per
+/// transport in slot order). The blk device is IRQ 1; net (if present)
+/// takes the next slot. Dispatch is by device INTSTAT, not IRQ number,
+// so over-enabling is harmless.
 pub fn enable_ctx(hart: usize) {
     enable_irq_ctx(UART_IRQ, hart);
-    enable_irq_ctx(VIRTIO_IRQ, hart);
+    for irq in 1..=8u32 {
+        enable_irq_ctx(irq, hart);
+    }
     crate::println!(
-        "[PLIC] hart{} ctx irq{}+{} enabled",
+        "[PLIC] hart{} ctx irq{}+virtio1-8 enabled",
         hart,
         UART_IRQ,
-        VIRTIO_IRQ
     );
 }
 
 pub fn init() {
     enable(UART_IRQ);
-    enable(VIRTIO_IRQ);
+    for irq in 1..=8u32 {
+        enable_irq_ctx(irq, 0);
+    }
     crate::println!(
-        "[PLIC] uart irq{} + virtio irq{} enabled",
-        UART_IRQ, VIRTIO_IRQ
+        "[PLIC] uart irq{} + virtio irq1-8 enabled",
+        UART_IRQ,
     );
 }
 

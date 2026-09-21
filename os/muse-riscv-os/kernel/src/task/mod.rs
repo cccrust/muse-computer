@@ -30,6 +30,10 @@ pub enum State {
 pub const BLOCK_STDIN: u8 = 1;
 pub const BLOCK_SLEEP: u8 = 2;
 pub const BLOCK_VIRTIO: u8 = 3;
+// v1.3: net sleepers (UDP recv / ARP wait). Woken by the net RX ISR via
+// wake_net; the timer tick does NOT auto-wake these (unlike virtio-blk's
+// watchdog) -- callers use bounded userspace retry instead.
+pub const BLOCK_NET: u8 = 4;
 
 pub struct Proc {
     pub pid: usize,
@@ -130,6 +134,13 @@ static SCHED_ACQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64:
 fn sched_lock() -> crate::sync::Guard<'static, Sched> {
     SCHED_ACQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     sched().lock_counted(&SCHED_MISS)
+}
+
+/// v1.3: zero contention counters (called once at boot-markers: boot-time
+/// run_on spinning would otherwise dominate the v1.4 verdict numbers).
+pub fn contention_reset() {
+    SCHED_MISS.store(0, core::sync::atomic::Ordering::SeqCst);
+    SCHED_ACQ.store(0, core::sync::atomic::Ordering::SeqCst);
 }
 
 /// v1.0: current hart id, from tp (set at entry for every hart).
@@ -919,6 +930,32 @@ pub fn wake_virtio() {
             .enumerate()
             .filter_map(|(i, o)| match o {
                 Some(p) if p.state == State::Blocked && p.blocked_on == BLOCK_VIRTIO => Some(i),
+                _ => None,
+            })
+            .collect();
+        let mut q = false;
+        for pid in ids {
+            q |= wake_locked(&mut s, pid, h);
+        }
+        q
+    };
+    if queued {
+        kick_idle();
+    }
+}
+
+/// Wake net sleepers (net RX ISR: UDP packet arrived or ARP resolved).
+/// v1.3: same shape as wake_virtio (enqueue + kick after unlock).
+pub fn wake_net() {
+    let h = hartid() % crate::MAX_HART;
+    let queued = {
+        let mut s = sched_lock();
+        let ids: Vec<usize> = s
+            .procs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, o)| match o {
+                Some(p) if p.state == State::Blocked && p.blocked_on == BLOCK_NET => Some(i),
                 _ => None,
             })
             .collect();

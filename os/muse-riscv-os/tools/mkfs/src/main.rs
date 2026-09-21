@@ -275,7 +275,7 @@ fn main() {
     let out = std::env::args().nth(1).unwrap_or("fs.img".into());
     let names = [
         "init", "sh", "ls", "cat", "echo", "grep", "fork_test", "pipe_test", "usertests",
-        "persist", "printenv", "smp_test", "reclaim_test", "stress",
+        "persist", "printenv", "smp_test", "reclaim_test", "stress", "udpping",
     ];
     let mut img = Image::new(names.len() + 1); // + README
     for n in names {

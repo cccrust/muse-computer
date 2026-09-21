@@ -8,7 +8,7 @@ echo "=== 1. host unit tests ==="
 cargo test -p kernel -p host-tests -p mkfs || PASS=0
 
 echo "=== 2. build user ELFs ==="
-cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress || PASS=0
+cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping || PASS=0
 
 echo "=== 3. mkfs ==="
 cargo run --release -p mkfs -- fs.img || PASS=0
@@ -28,14 +28,14 @@ fi
 $OBJCOPY -O binary "$KELF" "$KBIN" || PASS=0
 test -s "$KBIN" || { echo "FAIL: kernel.bin empty"; PASS=0; }
 
-echo "=== 5. QEMU boot test (120s; v1.0: -smp 4 MTTCG is slower) ==="
+echo "=== 5. QEMU boot test (180s; v1.0: -smp 4 MTTCG is slower) ==="
 rm -f qemu.log
 if command -v timeout >/dev/null 2>&1; then
   TO="timeout 25"
-  TO1="timeout 120"
+  TO1="timeout 180"
 elif command -v gtimeout >/dev/null 2>&1; then
   TO="gtimeout 25"
-  TO1="gtimeout 120"
+  TO1="gtimeout 180"
 else
   TO=""
   TO1=""
@@ -45,6 +45,15 @@ START=$(date +%s)
 # user's controlling terminal while stdout is a pipe (tee), QEMU stays silent
 # (no output at all, guest never boots). run.sh keeps interactive stdin.
 # v1.0: run1 uses TO1 (120s) -- the full autorun no longer fits in 25s on -smp 4.
+# v1.3: TO1 180s -- loaded hosts (load>4) slow MTTCG several-fold. Rule of
+# thumb: wedging at the SAME spot twice under light load = real bug and
+# must be dug, not papered with more timeout.
+# v1.3: net pinned to mmio bus.1 (0x10002000); the kernel probes by DEVID
+# (QEMU auto-attach otherwise fills from the top -- observed bus.7).
+# v1.3: UDP echo server for udpping (background, killed after §6).
+python3 tools/udp_echo.py > /tmp/muse-echo.log 2>&1 &
+ECHO_PID=$!
+sleep 1
 $TO1 qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
@@ -52,6 +61,8 @@ $TO1 qemu-system-riscv64 \
   -kernel "$KBIN" \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
+  -netdev user,id=n0 \
   < /dev/null 2>&1 | tee qemu.log || true
 END=$(date +%s)
 echo "QEMU ran for $((END-START))s, qemu.log bytes: $(wc -c < qemu.log)"
@@ -80,6 +91,8 @@ check "usertests PASS"
 check "smp PASS"
 check "reclaim PASS"
 check "stress DONE"
+check "net PASS"
+check "net-dev PASS"
 check "ipi PASS"
 check "hart0 up"
 check "hart1 up"
@@ -118,6 +131,8 @@ if grep -q "PANIC" qemu.log; then
 else
   echo "OK: no PANIC"
 fi
+# v1.3: stop the UDP echo server (run1 only)
+kill $ECHO_PID 2>/dev/null || true
 
 echo "=== 7. persistence: second boot on SAME fs.img (no rebuild) ==="
 rm -f qemu2.log
@@ -128,6 +143,8 @@ $TO qemu-system-riscv64 \
   -kernel "$KBIN" \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
+  -netdev user,id=n0 \
   < /dev/null 2>&1 | tee qemu2.log || true
 
 if [ ! -s qemu2.log ]; then
@@ -158,6 +175,8 @@ rm -f qemu3.log
   -kernel "$KBIN" \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
+  -netdev user,id=n0 \
   2>&1 | tee qemu3.log || true
 
 if [ ! -s qemu3.log ]; then
@@ -229,6 +248,8 @@ rm -f qemu4.log
   -kernel "$KBIN" \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
+  -netdev user,id=n0 \
   2>&1 | tee qemu4.log || true
 
 if [ ! -s qemu4.log ]; then
@@ -257,6 +278,8 @@ $TO qemu-system-riscv64 \
   -kernel "$KBIN" \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
+  -netdev user,id=n0 \
   < /dev/null 2>&1 | tee qemu5.log || true
 
 if [ ! -s qemu5.log ]; then

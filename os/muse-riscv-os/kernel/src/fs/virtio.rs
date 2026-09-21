@@ -1,36 +1,39 @@
-// virtio-blk legacy-MMIO driver (QEMU virt @ 0x10001000), polling, 1 queue.
-// Only used before any user trap runs (single hart, no concurrency).
+// virtio-blk legacy-MMIO driver. v1.3: the MMIO/register helpers below
+// are shared with the net driver (kernel/src/net.rs); the blk queue state
+// itself stays single-device (BLK_BASE).
+const BLK_BASE: usize = 0x1000_1000;
+pub(crate) const MAGIC: u32 = 0x74726976; // "virt"
 
-const BASE: usize = 0x1000_1000;
-const MAGIC: u32 = 0x74726976; // "virt"
+// legacy MMIO register offsets (shared with net)
+pub(crate) const R_MAGIC: usize = 0x000;
+pub(crate) const R_VER: usize = 0x004;
+pub(crate) const R_DEVID: usize = 0x008;
+pub(crate) const R_DEVFEAT: usize = 0x010;
+pub(crate) const R_DEVFEATSEL: usize = 0x014;
+pub(crate) const R_DRVFEAT: usize = 0x020;
+pub(crate) const R_DRVFEATSEL: usize = 0x024;
+pub(crate) const R_PAGESZ: usize = 0x028; // GuestPageSize (legacy): PFN unit, must set
+pub(crate) const R_QSEL: usize = 0x030;
+pub(crate) const R_QMAX: usize = 0x034;
+pub(crate) const R_QNUM: usize = 0x038;
+pub(crate) const R_QALIGN: usize = 0x03c;
+pub(crate) const R_QPFN: usize = 0x040;
+pub(crate) const R_QNOTIFY: usize = 0x050;
+pub(crate) const R_INTSTAT: usize = 0x060;
+pub(crate) const R_INTACK: usize = 0x064;
+pub(crate) const R_STATUS: usize = 0x070;
+pub(crate) const R_CONFIG: usize = 0x100; // blk: capacity u64 at +0
+pub(crate) const R_CFG_MAC: usize = 0x100; // net: MAC bytes 0..6 at +0
 
-// legacy MMIO register offsets
-const R_MAGIC: usize = 0x000;
-const R_VER: usize = 0x004;
-const R_DEVID: usize = 0x008;
-const R_DEVFEAT: usize = 0x010;
-const R_DEVFEATSEL: usize = 0x014;
-const R_DRVFEAT: usize = 0x020;
-const R_DRVFEATSEL: usize = 0x024;
-const R_PAGESZ: usize = 0x028; // GuestPageSize (legacy): PFN unit, must set
-const R_QSEL: usize = 0x030;const R_QMAX: usize = 0x034;
-const R_QNUM: usize = 0x038;
-const R_QALIGN: usize = 0x03c;
-const R_QPFN: usize = 0x040;
-const R_QNOTIFY: usize = 0x050;const R_INTSTAT: usize = 0x060;
-const R_INTACK: usize = 0x064;
-const R_STATUS: usize = 0x070;
-const R_CONFIG: usize = 0x100; // blk: capacity u64 at +0
+pub(crate) const ST_ACK: u32 = 1;
+pub(crate) const ST_DRIVER: u32 = 2;
+pub(crate) const ST_OK: u32 = 4;
+pub(crate) const ST_FEAT_OK: u32 = 8;
 
-const ST_ACK: u32 = 1;
-const ST_DRIVER: u32 = 2;
-const ST_OK: u32 = 4;
-const ST_FEAT_OK: u32 = 8;
+pub(crate) const QDEPTH: usize = 8;
 
-const QDEPTH: usize = 8;
-
-const D_NEXT: u16 = 1;
-const D_WRITE: u16 = 2; // device writes (device-writable)
+pub(crate) const D_NEXT: u16 = 1;
+pub(crate) const D_WRITE: u16 = 2; // device writes (device-writable)
 
 const T_IN: u32 = 0;
 const T_OUT: u32 = 1;
@@ -76,29 +79,32 @@ static mut HDR: [u8; 16] = [0; 16];
 static mut DATA: [u8; 512] = [0; 512];
 static mut STB: [u8; 1] = [0; 1];
 
-unsafe fn r32(off: usize) -> u32 {
-    core::ptr::read_volatile((BASE + off) as *const u32)
+pub(crate) unsafe fn r32(base: usize, off: usize) -> u32 {
+    core::ptr::read_volatile((base + off) as *const u32)
 }
-unsafe fn w32(off: usize, v: u32) {
-    core::ptr::write_volatile((BASE + off) as *mut u32, v)
+pub(crate) unsafe fn w32(base: usize, off: usize, v: u32) {
+    core::ptr::write_volatile((base + off) as *mut u32, v)
 }
-unsafe fn w16(pa: usize, v: u16) {
+pub(crate) unsafe fn r8(base: usize, off: usize) -> u8 {
+    core::ptr::read_volatile((base + off) as *const u8)
+}
+pub(crate) unsafe fn w16(pa: usize, v: u16) {
     core::ptr::write_volatile(pa as *mut u16, v)
 }
-unsafe fn r16(pa: usize) -> u16 {
+pub(crate) unsafe fn r16(pa: usize) -> u16 {
     core::ptr::read_volatile(pa as *const u16)
 }
-unsafe fn w32pa(pa: usize, v: u32) {
+pub(crate) unsafe fn w32pa(pa: usize, v: u32) {
     core::ptr::write_volatile(pa as *mut u32, v)
 }
-unsafe fn r32pa(pa: usize) -> u32 {
+pub(crate) unsafe fn r32pa(pa: usize) -> u32 {
     core::ptr::read_volatile(pa as *const u32)
 }
-unsafe fn w64pa(pa: usize, v: u64) {
+pub(crate) unsafe fn w64pa(pa: usize, v: u64) {
     core::ptr::write_volatile(pa as *mut u64, v)
 }
 #[inline(always)]
-unsafe fn fence() {
+pub(crate) unsafe fn fence() {
     core::arch::asm!("fence iorw, iorw");
 }
 
@@ -131,9 +137,9 @@ pub fn capacity_sectors() -> u64 {
 /// Probe + queue setup. Keeps old `[TEST] virtio-blk PASS` marker.
 pub fn init() {
     unsafe {
-        let magic = r32(R_MAGIC);
-        let ver = r32(R_VER);
-        let dtype = r32(R_DEVID);
+        let magic = r32(BLK_BASE, R_MAGIC);
+        let ver = r32(BLK_BASE, R_VER);
+        let dtype = r32(BLK_BASE, R_DEVID);
         if magic != MAGIC || (ver != 1 && ver != 2) || dtype != 2 {
             crate::println!(
                 "[VIRTIO] no blk magic (magic={:#x} ver={} type={}), skip blk test",
@@ -143,27 +149,27 @@ pub fn init() {
             return;
         }
         // reset + ack + driver
-        w32(R_STATUS, 0);
-        w32(R_STATUS, ST_ACK | ST_DRIVER);
+        w32(BLK_BASE, R_STATUS, 0);
+        w32(BLK_BASE, R_STATUS, ST_ACK | ST_DRIVER);
         // negotiate no features
-        w32(R_DEVFEATSEL, 0);
-        let _feat = r32(R_DEVFEAT);
-        w32(R_DRVFEATSEL, 0);
-        w32(R_DRVFEAT, 0);
-        w32(R_STATUS, r32(R_STATUS) | ST_FEAT_OK);
-        if r32(R_STATUS) & ST_FEAT_OK == 0 {
+        w32(BLK_BASE, R_DEVFEATSEL, 0);
+        let _feat = r32(BLK_BASE, R_DEVFEAT);
+        w32(BLK_BASE, R_DRVFEATSEL, 0);
+        w32(BLK_BASE, R_DRVFEAT, 0);
+        w32(BLK_BASE, R_STATUS, r32(BLK_BASE, R_STATUS) | ST_FEAT_OK);
+        if r32(BLK_BASE, R_STATUS) & ST_FEAT_OK == 0 {
             crate::println!("[VIRTIO] FEATURES_OK rejected");
             return;
         }
         // queue 0
-        w32(R_QSEL, 0);
-        let max = r32(R_QMAX) as usize;
+        w32(BLK_BASE, R_QSEL, 0);
+        let max = r32(BLK_BASE, R_QMAX) as usize;
         if max == 0 {
             crate::println!("[VIRTIO] queue 0 unavailable");
             return;
         }
         let q = core::cmp::min(max, QDEPTH);
-        w32(R_QNUM, q as u32);
+        w32(BLK_BASE, R_QNUM, q as u32);
         let f0 = match crate::mem::frame::alloc_frame() {
             Some(p) => p,
             None => {
@@ -187,21 +193,21 @@ pub fn init() {
         w16(used_pa(), 0);
         w16(used_pa() + 2, 0);
         fence();
-        w32(R_PAGESZ, 4096);
-        w32(R_QALIGN, 4096);
-        w32(R_QPFN, (f0 >> 12) as u32);
+        w32(BLK_BASE, R_PAGESZ, 4096);
+        w32(BLK_BASE, R_QALIGN, 4096);
+        w32(BLK_BASE, R_QPFN, (f0 >> 12) as u32);
         fence();
-        w32(R_STATUS, r32(R_STATUS) | ST_OK);
+        w32(BLK_BASE, R_STATUS, r32(BLK_BASE, R_STATUS) | ST_OK);
         // capacity (sectors of 512B)
-        let lo = r32(R_CONFIG) as u64;
-        let hi = r32(R_CONFIG + 4) as u64;
+        let lo = r32(BLK_BASE, R_CONFIG) as u64;
+        let hi = r32(BLK_BASE, R_CONFIG + 4) as u64;
         NCAP = lo | (hi << 32);
         AVAIL_IDX = 0;
         LAST_USED = 0;
         READY = true;
         crate::println!(
             "[VIRTIO] blk device found @ {:#x} (ver={}, {} sectors)",
-            BASE, ver, NCAP
+            BLK_BASE, ver, NCAP
         );
         crate::println!("[TEST] virtio-blk PASS");
         // LBA round-trip self-test on last sector (save/restore)
@@ -235,7 +241,7 @@ unsafe fn submit(write: bool, lba: u32) -> bool {
     AVAIL_IDX = AVAIL_IDX.wrapping_add(1);
     w16(a + 2, AVAIL_IDX);
     fence();
-    w32(R_QNOTIFY, 0);
+    w32(BLK_BASE, R_QNOTIFY, 0);
     let u = used_pa();
     // ---- completion wait: pure poll (v1.0) ----
     // NOTE: this runs inside a syscall (trap) or at boot -- kernel context
@@ -269,7 +275,7 @@ unsafe fn submit(write: bool, lba: u32) -> bool {
     let id = r32pa(u + 4 + slot * 8);
     LAST_USED = LAST_USED.wrapping_add(1);
     // ack interrupt
-    w32(R_INTACK, r32(R_INTSTAT));
+    w32(BLK_BASE, R_INTACK, r32(BLK_BASE, R_INTSTAT));
     fence();
     id == 0 && STB[0] == 0
 }
@@ -281,7 +287,7 @@ unsafe fn submit(write: bool, lba: u32) -> bool {
 /// on the claim side (trap.rs).
 pub fn on_irq() {
     unsafe {
-        let st = r32(R_INTSTAT);
+        let st = r32(BLK_BASE, R_INTSTAT);
         if st & 1 != 0 {
             // saturating: cap at u64::MAX instead of wrapping
             let _ = IRQ_COUNT.fetch_update(
@@ -289,7 +295,7 @@ pub fn on_irq() {
                 core::sync::atomic::Ordering::SeqCst,
                 |v| v.checked_add(1),
             );
-            w32(R_INTACK, st);
+            w32(BLK_BASE, R_INTACK, st);
             fence();
         }
     }

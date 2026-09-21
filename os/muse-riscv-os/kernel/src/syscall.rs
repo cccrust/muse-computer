@@ -43,6 +43,12 @@ pub const SYS_EXECVE: usize = 34;
 pub const SYS_GETHART: usize = 35;
 // v1.2
 pub const SYS_MEMSTAT: usize = 36;
+// v1.3: UDP sockets (socket/connect/send/recv). Port args and IPv4
+// addresses are plain usize values (ip BE u32, port u16 in low bits).
+pub const SYS_SOCKET: usize = 37;
+pub const SYS_CONNECT: usize = 38;
+pub const SYS_SEND: usize = 39;
+pub const SYS_RECV: usize = 40;
 
 pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) -> isize {
     match id {
@@ -90,6 +96,10 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_EXECVE => sys_execve(a0, a1, a2) as isize,
         SYS_GETHART => (crate::task::hartid() % crate::MAX_HART) as isize,
         SYS_MEMSTAT => crate::mem::frame::free_frames() as isize,
+        SYS_SOCKET => sys_socket() as isize,
+        SYS_CONNECT => sys_connect(a0 as i32, a1 as u32, a2 as u16) as isize,
+        SYS_SEND => sys_send(a0 as i32, a1, a2) as isize,
+        SYS_RECV => sys_recv(a0 as i32, a1, a2) as isize,
         SYS_SHUTDOWN => {
             crate::println!("[SYS] shutdown");
             if crate::fs::use_disk() {
@@ -323,9 +333,24 @@ fn sys_open(path_ptr: usize, flags: i32) -> isize {
     }
 }
 
+/// v1.3: UDP sockets. fd_kind 7, fds[] = socket index. Only datagram
+/// semantics; no TCP, no bind (ephemeral ports), peer set by connect.
 fn sys_close(fd: i32) -> isize {
     if fd < 0 || fd >= 16 {
         return -1;
+    }
+    // v1.3: sockets free their slot on close (fd_kind 7, fds[] = sock idx)
+    let sock = crate::task::with_current(|p| {
+        if p.fd_kind[fd as usize] == 7 {
+            Some(p.fds[fd as usize])
+        } else {
+            None
+        }
+    });
+    if let Some(s) = sock {
+        if s >= 0 {
+            crate::net::sock_close(s as usize);
+        }
     }
     crate::task::with_current_mut(|p| {
         p.fd_kind[fd as usize] = 0;
@@ -333,6 +358,80 @@ fn sys_close(fd: i32) -> isize {
         p.fd_cloexec[fd as usize] = false;
     });
     0
+}
+
+fn sys_socket() -> isize {
+    let idx = match crate::net::sock_open() {
+        Some(i) => i,
+        None => return -1,
+    };
+    let mut ret: isize = -1;
+    crate::task::with_current_mut(|p| {
+        for i in 3..16 {
+            if p.fd_kind[i] == 0 {
+                p.fd_kind[i] = 7;
+                p.fds[i] = idx as i32;
+                p.fd_off[i] = 0;
+                p.fd_path[i] = 0;
+                p.fd_cloexec[i] = false;
+                ret = i as isize;
+                break;
+            }
+        }
+    });
+    if ret < 0 {
+        crate::net::sock_close(idx);
+    }
+    ret
+}
+
+fn sock_idx_of(fd: i32) -> Option<usize> {
+    crate::task::with_current(|p| {
+        if fd < 0 || fd >= 16 || p.fd_kind[fd as usize] != 7 || p.fds[fd as usize] < 0 {
+            None
+        } else {
+            Some(p.fds[fd as usize] as usize)
+        }
+    })
+}
+
+fn sys_connect(fd: i32, ip_be: u32, port: u16) -> isize {
+    match sock_idx_of(fd) {
+        Some(s) => {
+            if crate::net::sock_connect(s, ip_be, port) {
+                0
+            } else {
+                -1
+            }
+        }
+        None => -1,
+    }
+}
+
+fn sys_send(fd: i32, buf: usize, len: usize) -> isize {
+    if len == 0 || len > 65536 {
+        return -1;
+    }
+    match sock_idx_of(fd) {
+        Some(s) => unsafe {
+            let src = crate::fs::user_slice(buf, len);
+            crate::net::sock_send(s, src)
+        },
+        None => -1,
+    }
+}
+
+fn sys_recv(fd: i32, buf: usize, len: usize) -> isize {
+    if len == 0 || len > 65536 {
+        return -1;
+    }
+    match sock_idx_of(fd) {
+        Some(s) => unsafe {
+            let dst = crate::fs::user_slice_mut(buf, len);
+            crate::net::sock_recv(s, dst)
+        },
+        None => -1,
+    }
 }
 
 fn sys_dup(fd: i32) -> isize {

@@ -1145,6 +1145,7 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     run_one(b"/bin/smp_test\0", &mut jobs);
     run_one(b"/bin/reclaim_test\0", &mut jobs);
     run_one(b"/bin/stress\0", &mut jobs);
+    run_one(b"/bin/udpping\0", &mut jobs);
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

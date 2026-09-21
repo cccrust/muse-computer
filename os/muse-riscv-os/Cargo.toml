@@ -16,6 +16,7 @@ members = [
   "user/smp_test",
   "user/reclaim_test",
   "user/stress",
+  "user/udpping",
   "tools/mkfs",
   "host-tests",
 ]

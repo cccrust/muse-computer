@@ -42,6 +42,8 @@ mod task;
 mod syscall;
 #[cfg(not(test))]
 mod fs;
+#[cfg(not(test))]
+mod net;
 mod embed;
 
 #[cfg(not(test))]
@@ -174,6 +176,10 @@ pub extern "C" fn rust_main() -> ! {
         println!("[TEST] ipi PASS");
     }
     println!("[TEST] boot markers ready");
+    // v1.3: zero the contention verdict counters here: everything before
+    // this point is boot-time run_on spinning (all misses, no signal).
+    // What halt prints later reflects post-boot operation only.
+    crate::task::contention_reset();
     task::run();
     unreachable!();
 }

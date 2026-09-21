@@ -16,6 +16,8 @@ pub fn use_disk() -> bool {
 pub fn init() {
     pipe::init();
     virtio::init();
+    // v1.3: net device probe (SKIP without one; independent of disk)
+    crate::net::init();
     if disk::mount() {
         USE_DISK.store(true, Ordering::Release);
         return;
