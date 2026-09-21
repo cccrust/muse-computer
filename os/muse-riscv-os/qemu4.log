@@ -65,7 +65,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [BOOT] hart booted in S-mode, kernel @ 0x80200000
 [MM] heap init ok
 [MM] frame allocator ok
-[MM] root=0x80b29000
+[MM] root=0x80b2a000
 [MM] text mapped
 [MM] rodata mapped
 [MM] data mapped
@@ -92,12 +92,12 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [SMP] hart2 starting
 [SMP] hart3 starting
 [PLIC] hart2 ctx irq10+virtio1-8 enabled
-[SMP] hart2 up
-[DBG] soft hart=2 n=0 sip=0x202->0x200
-[PLIC] hart1 ctx irq10+virtio1-8 enabled
 [PLIC] hart3 ctx irq10+virtio1-8 enabled
-[SMP] hart1 up
+[PLIC] hart1 ctx irq10+virtio1-8 enabled
 [SMP] hart3 up
+[SMP] hart2 up
+[SMP] hart1 up
+[DBG] soft hart=3 n=0 sip=0x202->0x200
 [TEST] ipi PASS
 [TEST] boot markers ready
 [TEST] virtio-irq PASS
@@ -170,14 +170,14 @@ echo: hi from unix-v6
 [PROC] fork pid=11 -> child=13
 [PROC] fork pid=11 -> child=14
 [PROC] fork pid=11 -> child=15
-[smp] child on hart 3->3
+[smp] child on hart 1->1
 [PROC] pid=12 exited(40)
-[smp] child on hart 3->3
+[smp] child on hart 1->1
 [PROC] pid=13 exited(41)
-[smp] child on hart 3->3
-[smp] child on hart 3->3
-[PROC] pid=15 exited(43)
+[smp] child on hart 1->1
 [PROC] pid=14 exited(42)
+[smp] child on hart 1->1
+[PROC] pid=15 exited(43)
 [TEST] smp PASS
 [PROC] pid=11 exited(0)
 [PROC] fork pid=2 -> child=16
@@ -830,6 +830,17 @@ echo: hi from unix-v6
 [PROC] pid=37 exited(0)
 [PROC] fork pid=2 -> child=338
 [PROC] exec pid=338 -> /bin/udpping (argc=0)
+[DBG] soft hart=2 n=0 sip=0x2->0x0
+[DBG] soft hart=1 n=0 sip=0x2->0x0
+[DBG] soft hart=2 n=1 sip=0x2->0x0
+[DBG] soft hart=1 n=1 sip=0x2->0x0
+[DBG] soft hart=1 n=2 sip=0x2->0x0
+[DBG] soft hart=2 n=2 sip=0x2->0x0
+[DBG] soft hart=3 n=1 sip=0x2->0x0
+[DBG] soft hart=0 n=0 sip=0x2->0x0
+[DBG] soft hart=3 n=2 sip=0x2->0x0
+[DBG] soft hart=0 n=1 sip=0x2->0x0
+[DBG] soft hart=0 n=2 sip=0x2->0x0
 [TEST] net FAIL
 [PROC] pid=338 exited(0)
 [PROC] fork pid=2 -> child=339
@@ -849,19 +860,19 @@ hello-arg
 [bg] pipe_test &
 [PROC] fork pid=2 -> child=343
 [PROC] exec pid=342 -> /bin/pipe_test (argc=0)
+[PROC] fork pid=342 -> child=344
 [PROC] exec pid=343 -> /bin/ls (argc=1)
+[PROC] pid=344 exited(0)
+[TEST] pipe PASS
+[PROC] pid=342 exited(0)
 /:
 bin/
 README ok
-TESTDATA[PROC] fork pid=342 -> child=344
- ok
+TESTDATA ok
 WD/
 /bin:
 init ok
-sh[PROC] pid=344 exited(0)
-[TEST] pipe PASS
-[PROC] pid=342 exited(0)
- ok
+sh ok
 ls ok
 cat ok
 echo ok
@@ -880,7 +891,6 @@ udpping ok
 [PROC] pid=343 exited(0)
 [bg] done
 [TEST] bg PASS
-[DBG] soft hart=3 n=0 sip=0x22->0x20
 [TEST] sleep PASS
 [PROC] fork pid=2 -> child=345
 [PROC] pid=345 killed
@@ -959,5 +969,5 @@ sh: halting
 [SYS] shutdown
 [FS] cache stats hits=5277 miss=955 dev_rd=1873 dev_wr=20
 [FS] marked clean
-[SMP] steals=4
-[SMP] contention sched=11168659/10337403
+[SMP] steals=137
+[SMP] contention sched=1276050/150564

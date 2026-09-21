@@ -33,7 +33,7 @@ Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,d
 Experimental SBI Extensions : none
 
 Domain0 Name                : root
-Domain0 Boot HART           : 2
+Domain0 Boot HART           : 0
 Domain0 HARTs               : 0*,1*,2*,3*
 Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
 Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
@@ -49,7 +49,7 @@ Domain0 Next Mode           : S-mode
 Domain0 SysReset            : yes
 Domain0 SysSuspend          : yes
 
-Boot HART ID                : 2
+Boot HART ID                : 0
 Boot HART Domain            : root
 Boot HART Priv Version      : v1.12
 Boot HART Base ISA          : rv64imafdch
@@ -65,7 +65,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [BOOT] hart booted in S-mode, kernel @ 0x80200000
 [MM] heap init ok
 [MM] frame allocator ok
-[MM] root=0x80b29000
+[MM] root=0x80b2a000
 [MM] text mapped
 [MM] rodata mapped
 [MM] data mapped
@@ -74,7 +74,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [MM] mmio mapped, activating...
 [MM] activated
 [MMU] SV39 enabled (satp MODE=8, 3-level)
-[PLIC] hart2 ctx irq10+virtio1-8 enabled
+[PLIC] hart0 ctx irq10+virtio1-8 enabled
 [PLIC] uart irq10 + virtio irq1-8 enabled
 [TRAP] stvec set
 [TIMER] enabled (10ms tick)
@@ -86,18 +86,18 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [FS] disk mount ok (MUSEFS01, 8192 blocks)
 [PROC] init pid=1
 [PROC] spawn init
-[SMP] boot hart2
-[SMP] hart2 up
-[SMP] hart0 starting
-[SMP] hart1 starting
-[SMP] hart3 starting
-[PLIC] hart3 ctx irq10+virtio1-8 enabled
-[PLIC] hart1 ctx irq10+virtio1-8 enabled
-[PLIC] hart0 ctx irq10+virtio1-8 enabled
-[SMP] hart3 up
-[SMP] hart1 up
+[SMP] boot hart0
 [SMP] hart0 up
-[DBG] soft hart=3 n=0 sip=0x202->0x200
+[SMP] hart1 starting
+[SMP] hart2 starting
+[SMP] hart3 starting
+[PLIC] hart2 ctx irq10+virtio1-8 enabled
+[PLIC] hart3 ctx irq10+virtio1-8 enabled
+[SMP] hart2 up
+[SMP] hart3 up
+[PLIC] hart1 ctx irq10+virtio1-8 enabled
+[SMP] hart1 up
+[DBG] soft hart=2 n=0 sip=0x202->0x200
 [TEST] ipi PASS
 [TEST] boot markers ready
 [TEST] virtio-irq PASS
@@ -170,13 +170,13 @@ echo: hi from unix-v6
 [PROC] fork pid=11 -> child=13
 [PROC] fork pid=11 -> child=14
 [PROC] fork pid=11 -> child=15
-[smp] child on hart 2->2
+[smp] child on hart 1->1
 [PROC] pid=12 exited(40)
-[smp] child on hart 2->2
+[smp] child on hart 1->1[smp] child on hart 
 [PROC] pid=13 exited(41)
-[smp] child on hart 2->2
-[PROC] pid=14 exited(42)
-[smp] child on hart 2->2
+1[smp] child on hart ->01
+->[PROC] pid=14 exited(42)
+1
 [PROC] pid=15 exited(43)
 [TEST] smp PASS
 [PROC] pid=11 exited(0)
@@ -830,6 +830,17 @@ echo: hi from unix-v6
 [PROC] pid=37 exited(0)
 [PROC] fork pid=2 -> child=338
 [PROC] exec pid=338 -> /bin/udpping (argc=0)
+[DBG] soft hart=1 n=0 sip=0x2->0x0
+[DBG] soft hart=0 n=0 sip=0x2->0x0
+[DBG] soft hart=2 n=1 sip=0x2->0x0
+[DBG] soft hart=0 n=1 sip=0x2->0x0
+[DBG] soft hart=3 n=0 sip=0x2->0x0
+[DBG] soft hart=0 n=2 sip=0x2->0x0
+[DBG] soft hart=1 n=1 sip=0x2->0x0
+[DBG] soft hart=3 n=1 sip=0x2->0x0
+[DBG] soft hart=1 n=2 sip=0x2->0x0
+[DBG] soft hart=3 n=2 sip=0x2->0x0
+[DBG] soft hart=2 n=2 sip=0x2->0x0
 [TEST] net FAIL
 [PROC] pid=338 exited(0)
 [PROC] fork pid=2 -> child=339
@@ -849,8 +860,11 @@ hello-arg
 [bg] pipe_test &
 [PROC] fork pid=2 -> child=343
 [PROC] exec pid=342 -> /bin/pipe_test (argc=0)
-[PROC] fork pid=342 -> child=344
 [PROC] exec pid=343 -> /bin/ls (argc=1)
+[PROC] fork pid=342 -> child=344
+[PROC] pid=344 exited(0)
+[TEST] pipe PASS
+[PROC] pid=342 exited(0)
 /:
 bin/
 README ok
@@ -862,10 +876,7 @@ sh ok
 ls ok
 cat ok
 echo ok
-grep[PROC] pid=344 exited(0)
-[TEST] pipe PASS
-[PROC] pid=342 exited(0)
- ok
+grep ok
 fork_test ok
 pipe_test ok
 usertests ok
@@ -880,7 +891,6 @@ udpping ok
 [PROC] pid=343 exited(0)
 [bg] done
 [TEST] bg PASS
-[DBG] soft hart=2 n=0 sip=0x2->0x0
 [TEST] sleep PASS
 [PROC] fork pid=2 -> child=345
 [PROC] pid=345 killed
@@ -907,11 +917,11 @@ udpping ok
 [PROC] pid=349 exited(0)
 [TEST] env PASS
 [PROC] fork pid=2 -> child=351
+[bg] started
 [PROC] execve pid=351 -> /bin/echo (argc=2 envc=1)
 hi
 [TEST] echo PASS
 [PROC] pid=351 exited(0)
-[bg] started
 [bg] done
 [TEST] fg PASS
 [TEST] history PASS
@@ -955,9 +965,6 @@ hi
 [TEST] redirenv PASS
 sh$ [TEST] uart-tx-irq PASS
 [TTY] Ctrl-C -> kill fg
-[DBG] soft hart=2 n=1 sip=0x2->0x0
-[PROC] pid=2 killed
-[PROC] pid=2 exited(130)
 [PROC] pid=2 killed
 [PROC] pid=2 exited(130)
 [USER] init: sh exited, respawn
@@ -1029,14 +1036,14 @@ echo: hi from unix-v6
 [PROC] fork pid=373 -> child=375
 [PROC] fork pid=373 -> child=376
 [PROC] fork pid=373 -> child=377
-[smp] child on hart 3->3
-[PROC] pid=374 exited(40)
-[smp] child on hart 3->3
+[smp] child on hart 1->1
+[smp] child on hart 1->1
 [PROC] pid=375 exited(41)
-[smp] child on hart 3->3
-[PROC] pid=377 exited(43)
-[smp] child on hart 3->3
+[smp] child on hart 1->1
 [PROC] pid=376 exited(42)
+[smp] child on hart 1->1
+[PROC] pid=377 exited(43)
+[PROC] pid=374 exited(40)
 [TEST] smp PASS
 [PROC] pid=373 exited(0)
 [PROC] fork pid=364 -> child=378
@@ -1710,10 +1717,10 @@ hello-arg
 [PROC] exec pid=704 -> /bin/pipe_test (argc=0)
 [PROC] fork pid=704 -> child=706
 [PROC] exec pid=705 -> /bin/ls (argc=1)
-/:
 [PROC] pid=706 exited(0)
 [TEST] pipe PASS
 [PROC] pid=704 exited(0)
+/:
 bin/
 README ok
 TESTDATA ok
@@ -1817,5 +1824,5 @@ sh: halting
 [SYS] shutdown
 [FS] cache stats hits=10555 miss=1906 dev_rd=3738 dev_wr=40
 [FS] marked clean
-[SMP] steals=4
-[SMP] contention sched=11370263/14354306
+[SMP] steals=251
+[SMP] contention sched=2146992/245614

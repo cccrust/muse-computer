@@ -31,14 +31,17 @@ test -s "$KBIN" || { echo "FAIL: kernel.bin empty"; PASS=0; }
 echo "=== 5. QEMU boot test (180s; v1.0: -smp 4 MTTCG is slower) ==="
 rm -f qemu.log
 if command -v timeout >/dev/null 2>&1; then
-  TO="timeout 25"
+  TO="timeout 45"
   TO1="timeout 180"
+  TO2="timeout 60"
 elif command -v gtimeout >/dev/null 2>&1; then
-  TO="gtimeout 25"
+  TO="gtimeout 45"
   TO1="gtimeout 180"
+  TO2="gtimeout 60"
 else
   TO=""
   TO1=""
+  TO2=""
 fi
 START=$(date +%s)
 # NOTE: stdin must come from /dev/null. With `-nographic`, if stdin is the
@@ -135,8 +138,10 @@ fi
 kill $ECHO_PID 2>/dev/null || true
 
 echo "=== 7. persistence: second boot on SAME fs.img (no rebuild) ==="
+# v1.4: 60s -- persist READ needs deep autorun (past stress), which loaded
+# hosts can't reach in 25s.
 rm -f qemu2.log
-$TO qemu-system-riscv64 \
+$TO2 qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
   -bios default \

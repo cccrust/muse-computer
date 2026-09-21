@@ -265,9 +265,10 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
                 }
                 2 | 12 | 13 | 15 => {
                     crate::println!(
-                        "[TRAP] page fault cause={} pid={} sepc={:#x} stval={:#x} -> kill",
+                        "[TRAP] page fault cause={} pid={} hart={} sepc={:#x} stval={:#x} -> kill",
                         code,
                         crate::task::current_pid(),
+                        crate::task::hartid() % crate::MAX_HART,
                         tfm.sepc,
                         stval
                     );

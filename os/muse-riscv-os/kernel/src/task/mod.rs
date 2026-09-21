@@ -34,6 +34,9 @@ pub const BLOCK_VIRTIO: u8 = 3;
 // wake_net; the timer tick does NOT auto-wake these (unlike virtio-blk's
 // watchdog) -- callers use bounded userspace retry instead.
 pub const BLOCK_NET: u8 = 4;
+// v1.4: waitpid sleepers. Woken by exit() of a child (only when
+// blocked_on == WAIT -- a stdin-blocked sh is never disturbed).
+pub const BLOCK_WAIT: u8 = 5;
 
 pub struct Proc {
     pub pid: usize,
@@ -699,8 +702,35 @@ pub fn exec(pid: usize, path: &str, args: &[Vec<u8>], env: &[Vec<u8>]) -> bool {
 }
 
 pub fn exit(pid: usize, code: i32) {
+    let h = hartid() % crate::MAX_HART;
     let next = {
         let mut s = sched_lock();
+        match s.procs.get(pid).and_then(|o| o.as_ref()) {
+            Some(p) if p.state == State::Zombie => {
+                // v1.4 DBG: corpse re-entry (double-run symptom). Dump
+                // ownership and idle out instead of switching blindly.
+                crate::println!(
+                    "[DBG] REEXIT pid={} hart={} current=[{},{},{},{}] idle=[{},{},{},{}] qlen=[{},{},{},{}]",
+                    pid,
+                    h,
+                    s.current[0],
+                    s.current[1],
+                    s.current[2],
+                    s.current[3],
+                    s.idle[0] as u8,
+                    s.idle[1] as u8,
+                    s.idle[2] as u8,
+                    s.idle[3] as u8,
+                    s.queues[0].len(),
+                    s.queues[1].len(),
+                    s.queues[2].len(),
+                    s.queues[3].len()
+                );
+                drop(s);
+                idle_on_hart(h);
+            }
+            _ => {}
+        }
         if let Some(Some(p)) = s.procs.get_mut(pid) {
             p.state = State::Zombie;
             p.exit_code = code;
@@ -735,7 +765,30 @@ pub fn exit(pid: usize, code: i32) {
                 me.children.clear();
             }
         }
-        // wake parent if waiting? parent polls.
+        // v1.4: wake the parent if it truly sleeps in waitpid
+        // (Blocked/WAIT). Only that reason qualifies -- a parent blocked
+        // on stdin/pipe/sleep must not be disturbed. The woken parent
+        // re-checks (target may be another child) and re-blocks if needed.
+        let h = hartid() % crate::MAX_HART;
+        let par = match s.procs.get(pid).and_then(|o| o.as_ref()) {
+            Some(p) => p.parent,
+            None => 0,
+        };
+        if par != 0 {
+            let blocked_wait = match s.procs.get(par).and_then(|o| o.as_ref()) {
+                Some(pp) => pp.state == State::Blocked && pp.blocked_on == BLOCK_WAIT,
+                None => false,
+            };
+            if blocked_wait {
+                if let Some(Some(pp)) = s.procs.get_mut(par) {
+                    pp.state = State::Runnable;
+                    pp.blocked_on = 0;
+                }
+                // borrow ended; enqueue under the same lock (exactly-once:
+                // par is not current[] anywhere -- it was Blocked).
+                enqueue_locked(&mut s, par, h);
+            }
+        }
         // pick next runnable
         find_next(&mut s, pid)
     };
@@ -1190,8 +1243,16 @@ idle_loop:
 
 /// Enter the idle loop on this hart. Diverges (sret to kernel wfi loop);
 /// a later trap redrives schedule_point, which may pick a real task.
+/// v1.4: parks on the immortal KERNEL_ROOT, never on a task root. An idle
+/// hart keeps its satp across wfi; if it parked on a task root that later
+/// gets reaped+recycled (v1.2 teardown), the next timer trap would walk
+/// kernel mappings through garbage tables (observed: kernel STORE faults
+/// inside __trap_entry, then nested-trap TF clobbering with kernel sepc).
+/// The kernel root is never freed and maps everything idle/traps need
+/// (text, stacks, heap, idle TFs via identity, MMIO).
 fn idle_on_hart(h: usize) -> ! {
     let tf = idle_tf(h);
+    crate::mem::pagetable::activate(crate::mem::kernel_root());
     unsafe {
         core::arch::asm!(
             "csrw sscratch, {tf}",
@@ -1221,6 +1282,21 @@ fn switch_to(next: Option<usize>) {    match next {
                     drop(s);
                     // fall back to scheduling: re-enter trap epilogue path
                     // by idling; a later trap will pick a live task
+                    idle_on_hart(h);
+                }
+                // v1.4 DBG+HARDEN: never enter a task owned elsewhere
+                // (schedule_point's DUP detector only covers its own picks;
+                // switch_to had no check). Idle out instead of double-run.
+                let mut dup = false;
+                for hh in 0..crate::MAX_HART {
+                    if hh != h && s.current[hh] == pid {
+                        dup = true;
+                        break;
+                    }
+                }
+                if dup {
+                    crate::println!("[DBG] DUP-SWITCH pid={} hart={}", pid, h);
+                    drop(s);
                     idle_on_hart(h);
                 }
                 s.current[h] = pid;
@@ -1523,6 +1599,20 @@ pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
             } else if nohang {
                 Some((0, 0))
             } else {
+                // v1.4: true blocking (was yield-spin). Mark Blocked/WAIT
+                // in THIS critical section -- atomic with the zombie check
+                // above, so an exit()+wake cannot slip between (no lost
+                // wakeup). The trap epilogue deschedules us; exit() of any
+                // child wakes us. Userspace protocol unchanged (-2 retry).
+                let h = hartid() % crate::MAX_HART;
+                let cur = s.current[h];
+                if let Some(Some(p)) = s.procs.get_mut(cur) {
+                    if p.state == State::Running {
+                        p.state = State::Blocked;
+                        p.blocked_on = BLOCK_WAIT;
+                        p.wake_at = 0;
+                    }
+                }
                 None
             }
         }
