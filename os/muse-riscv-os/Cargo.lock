@@ -17,6 +17,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "curl"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
 name = "echo"
 version = "0.1.0"
 dependencies = [
@@ -62,6 +69,13 @@ dependencies = [
 [[package]]
 name = "mkfs"
 version = "0.1.0"
+
+[[package]]
+name = "nslookup"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
 
 [[package]]
 name = "persist"
@@ -139,6 +153,13 @@ dependencies = [
 
 [[package]]
 name = "webserver"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
+name = "wget"
 version = "0.1.0"
 dependencies = [
  "user-lib",

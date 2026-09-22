@@ -51,6 +51,74 @@ pub fn jnl_w32(b: &mut [u8], o: usize, v: u32) {
     b[o..o + 4].copy_from_slice(&v.to_le_bytes());
 }
 
+// v1.7: DNS reply parsing mirror (mirrored in user-lib for no_std; answers
+// use compression pointers, questions don't). Returns first A/IN rdata.
+pub fn dns_skip_name(p: &[u8], mut o: usize) -> Option<usize> {
+    let mut jumps = 0;
+    loop {
+        if o >= p.len() {
+            return None;
+        }
+        let b = p[o];
+        if b & 0xc0 == 0xc0 {
+            if o + 1 >= p.len() {
+                return None;
+            }
+            return Some(o + 2);
+        }
+        if b == 0 {
+            return Some(o + 1);
+        }
+        if (b as usize) > 63 || o + 1 + (b as usize) > p.len() {
+            return None;
+        }
+        o += 1 + (b as usize);
+        jumps += 1;
+        if jumps > 16 {
+            return None;
+        }
+    }
+}
+pub fn dns_find_a(p: &[u8]) -> Option<u32> {
+    if p.len() < 12 {
+        return None;
+    }
+    if p[2] & 0x80 == 0 || p[3] & 0x0f != 0 {
+        return None;
+    }
+    let qd = ((p[4] as usize) << 8) | p[5] as usize;
+    let an = ((p[6] as usize) << 8) | p[7] as usize;
+    if qd != 1 || an == 0 {
+        return None;
+    }
+    let mut o = dns_skip_name(p, 12)? + 4; // question + QTYPE/QCLASS
+    let mut ai = 0;
+    while ai < an {
+        o = dns_skip_name(p, o)?;
+        if o + 10 > p.len() {
+            return None;
+        }
+        let typ = ((p[o] as usize) << 8) | p[o + 1] as usize;
+        let cls = ((p[o + 2] as usize) << 8) | p[o + 3] as usize;
+        let rdlen = ((p[o + 8] as usize) << 8) | p[o + 9] as usize;
+        o += 10;
+        if o + rdlen > p.len() {
+            return None;
+        }
+        if typ == 1 && cls == 1 && rdlen == 4 {
+            return Some(
+                ((p[o] as u32) << 24) | ((p[o + 1] as u32) << 16) | ((p[o + 2] as u32) << 8) | p[o + 3] as u32,
+            );
+        }
+        o += rdlen;
+        ai += 1;
+        if ai > 16 {
+            return None;
+        }
+    }
+    None
+}
+
 #[derive(Default)]
 pub struct RunQueue {
     q: Vec<usize>,
@@ -127,5 +195,101 @@ mod tests {
         let mut torn = d;
         torn[511] ^= 0xff;
         assert_ne!(jnl_crc(1234, 777, &torn), jnl_r32(&a, 16));
+    }
+    #[test]
+    fn dns_compressed_answer() {
+        // response for "h.example": question + answer with pointer to qname
+        let mut p = [0u8; 64];
+        // header: response, NOERROR, qd=1, an=1
+        p[2] = 0x80;
+        p[5] = 1;
+        p[7] = 1;
+        // question: 1[h]7[example]0, QTYPE=A, QCLASS=IN
+        let mut o = 12;
+        p[o] = 1;
+        o += 1;
+        p[o] = b'h';
+        o += 1;
+        p[o] = 7;
+        o += 1;
+        p[o..o + 7].copy_from_slice(b"example");
+        o += 7;
+        p[o] = 0;
+        o += 1;
+        p[o] = 0;
+        p[o + 1] = 1;
+        p[o + 2] = 0;
+        p[o + 3] = 1;
+        o += 4;
+        // answer: pointer to offset 12, A IN, ttl, rdlen=4, 10.9.8.7
+        p[o] = 0xc0;
+        p[o + 1] = 12;
+        p[o + 2] = 0;
+        p[o + 3] = 1;
+        p[o + 4] = 0;
+        p[o + 5] = 1;
+        p[o + 10] = 0;
+        p[o + 11] = 4;
+        p[o + 12] = 10;
+        p[o + 13] = 9;
+        p[o + 14] = 8;
+        p[o + 15] = 7;
+        o += 16;
+        assert_eq!(dns_find_a(&p[..o]), Some(0x0a09_0807));
+    }
+    #[test]
+    fn dns_cname_then_a() {
+        // CNAME first (skipped), A second (taken)
+        let mut p = [0u8; 96];
+        p[2] = 0x80;
+        p[5] = 1;
+        p[7] = 2;
+        // question: 1[x]0 + QTYPE/QCLASS
+        let mut o = 12;
+        p[o] = 1;
+        o += 1;
+        p[o] = b'x';
+        o += 1;
+        p[o] = 0;
+        o += 1;
+        p[o] = 0;
+        p[o + 1] = 1;
+        p[o + 2] = 0;
+        p[o + 3] = 1;
+        o += 4;
+        // answer 1: pointer, CNAME, rdlen=2 -> pointer (alias, skipped)
+        p[o] = 0xc0;
+        p[o + 1] = 12;
+        p[o + 2] = 0;
+        p[o + 3] = 5;
+        p[o + 4] = 0;
+        p[o + 5] = 1;
+        p[o + 10] = 0;
+        p[o + 11] = 2;
+        p[o + 12] = 0xc0;
+        p[o + 13] = 12;
+        o += 14;
+        // answer 2: pointer, A, 1.2.3.4
+        p[o] = 0xc0;
+        p[o + 1] = 12;
+        p[o + 2] = 0;
+        p[o + 3] = 1;
+        p[o + 4] = 0;
+        p[o + 5] = 1;
+        p[o + 10] = 0;
+        p[o + 11] = 4;
+        p[o + 12] = 1;
+        p[o + 13] = 2;
+        p[o + 14] = 3;
+        p[o + 15] = 4;
+        o += 16;
+        assert_eq!(dns_find_a(&p[..o]), Some(0x0102_0304));
+        // garbage is rejected
+        assert_eq!(dns_find_a(&p[..10]), None);
+        let mut bad = [0u8; 64];
+        bad[2] = 0x80;
+        bad[3] = 0x03; // NXDOMAIN
+        bad[5] = 1;
+        assert_eq!(dns_find_a(&bad), None);
     }
 }

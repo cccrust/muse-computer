@@ -468,6 +468,11 @@ fn sys_accept(fd: i32) -> isize {
 fn sys_connect(fd: i32, ip_be: u32, port: u16) -> isize {
     match sock_idx_of(fd) {
         Some(s) => {
+            // v1.7: TCP sockets take the active-open path (0/-2/-1);
+            // UDP/ICMP keep the boolean path.
+            if crate::net::sock_kind(s) == Some(1) {
+                return crate::net::sock_connect_tcp(s, ip_be, port);
+            }
             if crate::net::sock_connect(s, ip_be, port) {
                 0
             } else {

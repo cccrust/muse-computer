@@ -20,6 +20,10 @@ members = [
   "user/webserver",
   "user/crashwrite",
   "user/ping",
+  "user/nslookup",
+  "user/wget",
+  "user/curl",
+  "user/ping",
   "tools/mkfs",
   "host-tests",
 ]

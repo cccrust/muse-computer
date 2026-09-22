@@ -1154,6 +1154,24 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     let _ws = spawn_one(b"/bin/webserver\0");
     run_one(b"/bin/udpping\0", &mut jobs);
     run_one(b"/bin/ping\0", &mut jobs);
+    // v1.7: online clients (host stubs must be up: test.sh starts them).
+    // nslookup resolves via the stub DNS (10.0.2.2:5353); wget/curl fetch
+    // /test.txt from the stub HTTP (10.0.2.2:8090).
+    run_args(
+        b"/bin/nslookup\0",
+        &[b"nslookup", b"test.local", b"10.0.2.2", b"15353"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/wget\0",
+        &[b"wget", b"10.0.2.2", b"8090", b"/test.txt", b"/dl.txt"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/curl\0",
+        &[b"curl", b"10.0.2.2", b"8090", b"/test.txt"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

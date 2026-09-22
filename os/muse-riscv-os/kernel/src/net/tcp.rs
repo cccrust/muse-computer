@@ -31,12 +31,13 @@ pub enum TState {
     Closed = 0,
     Listen = 1,
     SynRcvd = 2,
-    Est = 3,
-    FinW1 = 4,
-    FinW2 = 5,
-    Closing = 6,
-    CloseWait = 7,
-    LastAck = 8,
+    SynSent = 3,
+    Est = 4,
+    FinW1 = 5,
+    FinW2 = 6,
+    Closing = 7,
+    CloseWait = 8,
+    LastAck = 9,
 }
 
 pub struct Tcb {
@@ -112,8 +113,14 @@ fn tx_seg(n: &mut NetState, dst_ip: u32, dport: u16, sport: u16, seq: u32, ack: 
     if total > 2048 {
         return false;
     }
+    // v1.7: destination MAC from the generic cache (gratuitous learning on
+    // RX means reply paths always hit; active paths pre-resolve in connect).
+    let mac = match super::mac_for(n, dst_ip) {
+        Some(m) => m,
+        None => return false,
+    };
     let mut f = [0u8; 2048];
-    super::eth_build(&n.gw_mac, 0x0800, &mut f);
+    super::eth_build(&mac, 0x0800, &mut f);
     // IP (no options)
     f[14] = 0x45;
     f[15] = 0;
@@ -365,6 +372,20 @@ fn child_rx(n: &mut NetState, i: usize, seq: u32, ackn: u32, flags: u8, payload:
             if flags & F_SYN != 0 {
                 reply = Some((t.iss, t.rcv_nxt, F_SYN | F_ACK));
             }
+        } else if t.state == TState::SynSent {
+            // v1.7: active open completes on SYN|ACK (ack == iss+1).
+            // Simultaneous SYN (no ACK): drop (peer retransmits; the
+            // common SLIRP/host case always answers SYN|ACK).
+            if flags & F_SYN != 0 && flags & F_ACK != 0 && ackn == t.snd_nxt {
+                t.rcv_nxt = seq.wrapping_add(1);
+                t.state = TState::Est;
+                t.rto_at = crate::timer::ticks() as u64 + RTO_TICKS;
+                t.retries = 0;
+                wake = true;
+                reply = Some((t.snd_nxt, t.rcv_nxt, F_ACK));
+            }
+            // data on a bare SYN is ignored (handshake first); pure ACKs
+            // with wrong numbers are ignored below by the generic path.
         } else if t.state == TState::Est || t.state == TState::FinW2 || t.state == TState::CloseWait {
             // data?
             if !payload.is_empty() {
@@ -436,6 +457,50 @@ fn child_rx(n: &mut NetState, i: usize, seq: u32, ackn: u32, flags: u8, payload:
 
 // ---- socket-level API (called with NET lock held by wrappers in mod.rs,
 // but these take it themselves like the UDP API for symmetry) ----
+/// v1.7: active open. Non-blocking (house style): ARP miss -> -2 (user
+/// retries connect); SYN sent -> 0. Only from Closed (fresh socket).
+pub fn tcp_connect(n: &mut NetState, idx: usize, ip: u32, port: u16) -> isize {
+    if idx >= NSOCK || !n.socks[idx].used || n.socks[idx].kind != 1 {
+        return -1;
+    }
+    if n.socks[idx].tcp.state != TState::Closed || ip == 0 || port == 0 {
+        return -1;
+    }
+    if super::mac_for(n, ip).is_none() {
+        super::arp_query(n, ip);
+        return -2;
+    }
+    let iss = (crate::timer::ticks() as u32)
+        .wrapping_add((n.socks[idx].lport as u32) << 16)
+        .wrapping_add(0x5_5a5a);
+    {
+        let s = &mut n.socks[idx];
+        s.tcp.state = TState::SynSent;
+        s.tcp.rip = ip;
+        s.tcp.rport = port;
+        s.tcp.iss = iss;
+        s.tcp.snd_una = iss;
+        s.tcp.snd_nxt = iss.wrapping_add(1); // SYN consumes one
+        s.tcp.rcv_nxt = 0;
+        s.tcp.accepted = true; // client side: no accept needed
+        s.tcp.parent = None;
+        s.tcp.unacked.clear();
+        s.tcp.rx.clear();
+        s.tcp.rto_at = crate::timer::ticks() as u64 + RTO_TICKS;
+        s.tcp.retries = 0;
+    }
+    let lport = n.socks[idx].lport;
+    if tx_seg(n, ip, port, lport, iss, 0, F_SYN, &[]) {
+        0
+    } else {
+        // TX failed (link hiccup): roll back to Closed, caller retries
+        // the whole connect (idempotent: no peer state yet... peer may
+        // have our SYN; its SYN_RCVD times out. fine).
+        n.socks[idx].tcp.reset();
+        -1
+    }
+}
+
 pub fn tcp_bind(n: &mut NetState, idx: usize, port: u16) -> bool {
     if idx >= NSOCK || !n.socks[idx].used || n.socks[idx].kind != 1 || port == 0 {
         return false;
@@ -487,6 +552,10 @@ pub fn tcp_send(n: &mut NetState, idx: usize, data: &[u8]) -> isize {
         return -1;
     }
     let st = n.socks[idx].tcp.state;
+    // v1.7: SYN_SENT (handshake in flight) is not-ready, not-error.
+    if st == TState::SynSent {
+        return -2;
+    }
     if st != TState::Est && st != TState::CloseWait {
         return -1;
     }
@@ -600,7 +669,9 @@ pub fn tcp_tick(n: &mut NetState, now: u64) -> bool {
         }
         let st = n.socks[i].tcp.state;
         match st {
-            TState::SynRcvd => {
+            TState::SynRcvd | TState::SynSent => {
+                // half-open retransmit (SYN+ACK for server children, SYN
+                // for active-open clients). Give up after MAX_RETRY.
                 if now >= n.socks[i].tcp.rto_at {
                     if n.socks[i].tcp.retries >= MAX_RETRY {
                         // half-open never completed: drop
@@ -609,11 +680,13 @@ pub fn tcp_tick(n: &mut NetState, now: u64) -> bool {
                         wake = true;
                         continue;
                     }
-                    let (rip, rport, lport, iss, rnx) = {
+                    let (rip, rport, lport, iss, rnx, synsent) = {
                         let s = &n.socks[i];
-                        (s.tcp.rip, s.tcp.rport, s.lport, s.tcp.iss, s.tcp.rcv_nxt)
+                        (s.tcp.rip, s.tcp.rport, s.lport, s.tcp.iss, s.tcp.rcv_nxt,
+                         s.tcp.state == TState::SynSent)
                     };
-                    tx_seg(n, rip, rport, lport, iss, rnx, F_SYN | F_ACK, &[]);
+                    let fl = if synsent { F_SYN } else { F_SYN | F_ACK };
+                    tx_seg(n, rip, rport, lport, iss, rnx, fl, &[]);
                     n.socks[i].tcp.retries += 1;
                     n.socks[i].tcp.rto_at = now + RTO_TICKS;
                 }

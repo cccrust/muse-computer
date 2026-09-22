@@ -37,6 +37,12 @@ mod real {
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/webserver");
     pub const CRASH_ELF: &[u8] =
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/crashwrite");
+    pub const NSLOOKUP_ELF: &[u8] =
+        include_bytes!("../../target/riscv64gc-unknown-none-elf/release/nslookup");
+    pub const WGET_ELF: &[u8] =
+        include_bytes!("../../target/riscv64gc-unknown-none-elf/release/wget");
+    pub const CURL_ELF: &[u8] =
+        include_bytes!("../../target/riscv64gc-unknown-none-elf/release/curl");
     pub const PING_ELF: &[u8] =
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/ping");
 }
@@ -63,6 +69,9 @@ pub fn get_by_name(name: &str) -> Option<Vec<u8>> {
         "udpping" => UDP_ELF,
         "webserver" => WEB_ELF,
         "crashwrite" => CRASH_ELF,
+        "nslookup" => NSLOOKUP_ELF,
+        "wget" => WGET_ELF,
+        "curl" => CURL_ELF,
         "ping" => PING_ELF,
         _ => return None,
     };
@@ -108,5 +117,11 @@ pub const UDP_ELF: &[u8] = b"test";
 pub const WEB_ELF: &[u8] = b"test";
 #[cfg(test)]
 pub const CRASH_ELF: &[u8] = b"test";
+#[cfg(test)]
+pub const NSLOOKUP_ELF: &[u8] = b"test";
+#[cfg(test)]
+pub const WGET_ELF: &[u8] = b"test";
+#[cfg(test)]
+pub const CURL_ELF: &[u8] = b"test";
 #[cfg(test)]
 pub const PING_ELF: &[u8] = b"test";

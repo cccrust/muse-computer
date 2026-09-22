@@ -204,6 +204,282 @@ pub fn accept(fd: isize) -> isize {
     ecall(43, fd as usize, 0, 0)
 }
 
+/// v1.7: dotted-decimal "a.b.c.d" -> BE u32. Strict (4 parts, 0-255).
+pub fn parse_ip(s: &[u8]) -> Option<u32> {
+    let mut parts = [0u32; 4];
+    let mut pi = 0usize;
+    let mut cur = 0u32;
+    let mut digits = 0usize;
+    let mut i = 0usize;
+    // allow trailing NUL (argv slices are already trimmed, but be safe)
+    let n = s.len();
+    while i <= n {
+        let c = if i < n { s[i] } else { b'.' };
+        if c >= b'0' && c <= b'9' {
+            cur = cur * 10 + (c - b'0') as u32;
+            if cur > 255 {
+                return None;
+            }
+            digits += 1;
+            if digits > 3 {
+                return None;
+            }
+        } else if (c == b'.' || c == 0) && digits > 0 {
+            if pi >= 4 {
+                return None;
+            }
+            parts[pi] = cur;
+            pi += 1;
+            cur = 0;
+            digits = 0;
+            if c == 0 {
+                break;
+            }
+        } else {
+            return None;
+        }
+        i += 1;
+    }
+    if pi != 4 {
+        return None;
+    }
+    Some((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3])
+}
+
+/// v1.7: build "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+/// into buf. Returns request length (0 = doesn't fit).
+pub fn http_req(buf: &mut [u8], host: &[u8], path: &[u8]) -> usize {
+    let parts: [&[u8]; 6] = [b"GET ", path, b" HTTP/1.0\r\nHost: ", host, b"\r\nConnection: close\r\n\r\n", b""];
+    let mut n = 0;
+    for p in parts.iter() {
+        if n + p.len() > buf.len() {
+            return 0;
+        }
+        buf[n..n + p.len()].copy_from_slice(p);
+        n += p.len();
+    }
+    n
+}
+
+/// v1.7: split an HTTP response at "\r\n\r\n". Returns (status_code, body_off).
+/// status 0 = unparseable.
+pub fn http_split(resp: &[u8]) -> (u16, usize) {
+    let mut i = 0;
+    while i + 4 <= resp.len() {
+        if resp[i] == b'\r' && resp[i + 1] == b'\n' && resp[i + 2] == b'\r' && resp[i + 3] == b'\n' {
+            let code = http_status(resp);
+            return (code, i + 4);
+        }
+        i += 1;
+    }
+    (0, 0)
+}
+
+fn http_status(resp: &[u8]) -> u16 {
+    // "HTTP/1.x NNN ..."
+    let mut i = 0;
+    while i < resp.len() && resp[i] != b' ' {
+        i += 1;
+    }
+    if i + 4 > resp.len() || resp[i] != b' ' {
+        return 0;
+    }
+    let (a, b, c) = (resp[i + 1], resp[i + 2], resp[i + 3]);
+    if !a.is_ascii_digit() || !b.is_ascii_digit() || !c.is_ascii_digit() {
+        return 0;
+    }
+    (a - b'0') as u16 * 100 + (b - b'0') as u16 * 10 + (c - b'0') as u16
+}
+
+/// v1.7: DNS A-query resolve via a UDP socket opened internally.
+/// name: "example.com" labels (no trailing dot needed); server: BE ip + port.
+/// Returns BE IPv4 on success. Retries 3x with ~2s deadlines. Follows one
+/// CNAME hop implicitly by taking the first A record (standard single-
+/// question responses carry the chain then the answer).
+pub fn dns_resolve(name: &[u8], server_ip: u32, server_port: u16) -> Option<u32> {
+    let fd = socket(0);
+    if fd < 0 {
+        return None;
+    }
+    let r = dns_resolve_on(fd, name, server_ip, server_port);
+    close(fd);
+    r
+}
+
+fn dns_resolve_on(fd: isize, name: &[u8], server_ip: u32, server_port: u16) -> Option<u32> {
+    if connect(fd, server_ip, server_port) != 0 {
+        return None;
+    }
+    // build query: id + flags(RD) + qd=1 + an/ns/ar=0, QNAME, QTYPE=A, QCLASS=IN
+    let mut q = [0u8; 300];
+    if name.len() + 16 > q.len() {
+        return None;
+    }
+    q[0] = 0x12;
+    q[1] = 0x34;
+    q[2] = 0x01;
+    q[3] = 0x00;
+    q[4] = 0x00;
+    q[5] = 0x01;
+    // qdcount already 1; ancount/nscount/arcount zero
+    let mut n = 12;
+    let mut li = 0;
+    // encode labels; tolerate one trailing dot
+    let mut end = name.len();
+    while end > 0 && name[end - 1] == b'.' {
+        end -= 1;
+    }
+    let mut i = 0;
+    while i < end {
+        let mut j = i;
+        while j < end && name[j] != b'.' {
+            j += 1;
+        }
+        let lab = j - i;
+        if lab == 0 || lab > 63 || n + 1 + lab + 5 > q.len() {
+            return None;
+        }
+        q[n] = lab as u8;
+        n += 1;
+        q[n..n + lab].copy_from_slice(&name[i..j]);
+        n += lab;
+        li += 1;
+        if li > 8 {
+            return None;
+        }
+        i = if j < end { j + 1 } else { j };
+    }
+    q[n] = 0;
+    n += 1;
+    q[n] = 0;
+    q[n + 1] = 1; // QTYPE A
+    q[n + 2] = 0;
+    q[n + 3] = 1; // QCLASS IN
+    n += 4;
+    let mut attempt = 0;
+    while attempt < 3 {
+        // (re)send; WouldBlock (ARP) just retries inside the deadline
+        let mut s = 0;
+        let mut sent = false;
+        while s < 200 {
+            let r = send(fd, q.as_ptr(), n);
+            if r == n as isize {
+                sent = true;
+                break;
+            }
+            if r >= 0 || r != -2 {
+                break;
+            }
+            sleep(1);
+            s += 1;
+        }
+        if !sent {
+            attempt += 1;
+            continue;
+        }
+        // wait reply
+        let mut rb = [0u8; 512];
+        let mut w = 0;
+        while w < 200 {
+            let r = recv(fd, rb.as_mut_ptr(), rb.len());
+            if r > 0 {
+                if let Some(ip) = dns_parse_reply(&rb[..r as usize]) {
+                    return Some(ip);
+                }
+                break; // got something unparseable: next attempt
+            }
+            if r != -2 {
+                break;
+            }
+            sleep(1);
+            w += 1;
+        }
+        attempt += 1;
+    }
+    None
+}
+
+/// Parse a DNS response; first A/IN rdata wins (CNAME chains resolve to
+/// the A that follows them in single-question responses).
+fn dns_parse_reply(p: &[u8]) -> Option<u32> {
+    if p.len() < 12 {
+        return None;
+    }
+    if p[2] & 0x80 == 0 {
+        return None; // not a response
+    }
+    if p[3] & 0x0f != 0 {
+        return None; // RCODE != 0
+    }
+    let qd = ((p[4] as usize) << 8) | p[5] as usize;
+    let an = ((p[6] as usize) << 8) | p[7] as usize;
+    if qd != 1 || an == 0 {
+        return None;
+    }
+    // skip question section
+    let mut o = 12;
+    o = dns_skip_name(p, o)?;
+    if o + 4 > p.len() {
+        return None;
+    }
+    o += 4; // QTYPE + QCLASS
+    // scan answers
+    let mut ai = 0;
+    while ai < an {
+        o = dns_skip_name(p, o)?;
+        if o + 10 > p.len() {
+            return None;
+        }
+        let typ = ((p[o] as usize) << 8) | p[o + 1] as usize;
+        let cls = ((p[o + 2] as usize) << 8) | p[o + 3] as usize;
+        let rdlen = ((p[o + 8] as usize) << 8) | p[o + 9] as usize;
+        o += 10;
+        if o + rdlen > p.len() {
+            return None;
+        }
+        if typ == 1 && cls == 1 && rdlen == 4 {
+            return Some(
+                ((p[o] as u32) << 24) | ((p[o + 1] as u32) << 16) | ((p[o + 2] as u32) << 8) | p[o + 3] as u32,
+            );
+        }
+        o += rdlen;
+        ai += 1;
+        if ai > 16 {
+            return None;
+        }
+    }
+    None
+}
+
+/// Skip a (possibly compressed) domain name; returns offset past it.
+fn dns_skip_name(p: &[u8], mut o: usize) -> Option<usize> {
+    let mut jumps = 0;
+    loop {
+        if o >= p.len() {
+            return None;
+        }
+        let b = p[o];
+        if b & 0xc0 == 0xc0 {
+            // pointer: 2 bytes, terminates this name
+            if o + 1 >= p.len() {
+                return None;
+            }
+            return Some(o + 2);
+        }
+        if b == 0 {
+            return Some(o + 1);
+        }
+        if (b as usize) > 63 || o + 1 + (b as usize) > p.len() {
+            return None;
+        }
+        o += 1 + (b as usize);
+        jumps += 1;
+        if jumps > 16 {
+            return None;
+        }
+    }
+}
+
 /// v0.9: ps(buf, len) fills "pid ppid state brk cwd\n" lines; trace(pid, on).
 pub fn ps(buf: *mut u8, len: usize) -> isize {
     ecall(32, buf as usize, len, 0)

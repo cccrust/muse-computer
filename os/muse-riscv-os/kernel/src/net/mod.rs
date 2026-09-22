@@ -71,6 +71,17 @@ impl Sock {
     }
 }
 
+struct ArpEnt {
+    ip: u32, // BE; 0 = empty slot
+    mac: [u8; 6],
+}
+
+impl ArpEnt {
+    const fn new() -> Self {
+        Self { ip: 0, mac: [0; 6] }
+    }
+}
+
 struct NetState {
     rx_avail: u16,
     rx_used: u16,
@@ -78,9 +89,12 @@ struct NetState {
     tx_used: u16,
     // staged complete RX packets (raw ether frames, parsed on recv path
     // or parsed here -- parse here, stage per-socket directly)
-    arp_ok: bool,
-    gw_mac: [u8; 6],
-    arp_req_at: u64, // ticks of last ARP request (rate limit)
+    // v1.7: generic ARP cache (any destination; SLIRP proxy-ARPs the whole
+    // range). Replaces the v1.3 single-gateway gw_mac/arp_ok.
+    arp: [ArpEnt; 4],
+    arp_victim: usize, // FIFO replacement index
+    arp_req_ip: u32,   // BE ip with an in-flight request (0 = none)
+    arp_req_at: u64,   // ticks of last ARP request (rate limit)
     socks: [Sock; NSOCK],
     next_port: u16, // ephemeral allocator
 }
@@ -92,8 +106,9 @@ impl NetState {
             rx_used: 0,
             tx_avail: 0,
             tx_used: 0,
-            arp_ok: false,
-            gw_mac: [0; 6],
+            arp: [ArpEnt::new(), ArpEnt::new(), ArpEnt::new(), ArpEnt::new()],
+            arp_victim: 0,
+            arp_req_ip: 0,
             arp_req_at: 0,
             socks: [
                 Sock::new(),
@@ -417,9 +432,48 @@ fn eth_build(dst: &[u8; 6], etype: u16, out: &mut [u8]) {
     wbe16(&mut out[12..14], etype);
 }
 
-// ---- ARP ----
-fn arp_request_locked(n: &mut NetState) {
-    // broadcast ARP request for GW_IP. Rate-limited by caller.
+// ---- ARP (v1.7: generic cache; SLIRP proxy-ARPs the whole range) ----
+/// Look up a resolved MAC. None = unknown (caller ARPs + WouldBlocks).
+fn mac_for(n: &NetState, ip: u32) -> Option<[u8; 6]> {
+    for e in n.arp.iter() {
+        if e.ip == ip && ip != 0 {
+            return Some(e.mac);
+        }
+    }
+    None
+}
+
+/// Learn/insert (FIFO replace). Called for any ARP reply about us and for
+/// the sender of any ARP/IP packet (gratuitous learning is standard).
+fn arp_learn(n: &mut NetState, ip: u32, mac: &[u8; 6]) {
+    if ip == 0 {
+        return;
+    }
+    for e in n.arp.iter_mut() {
+        if e.ip == ip {
+            e.mac.copy_from_slice(mac);
+            return;
+        }
+    }
+    let v = n.arp_victim % n.arp.len();
+    n.arp_victim = n.arp_victim.wrapping_add(1);
+    n.arp[v].ip = ip;
+    n.arp[v].mac.copy_from_slice(mac);
+}
+
+/// Send an ARP request for `target` if none in flight (or stale >1s).
+/// Always returns false (caller returns WouldBlock and retries; the reply
+/// path wakes net sleepers, the retry then hits the cache).
+fn arp_query(n: &mut NetState, target: u32) -> bool {
+    let now = crate::timer::ticks() as u64;
+    if n.arp_req_ip != target || now.wrapping_sub(n.arp_req_at) > 100 {
+        arp_request_locked(n, target);
+    }
+    false
+}
+
+fn arp_request_locked(n: &mut NetState, target: u32) {
+    // broadcast ARP request for `target`. Rate-limited by caller.
     let mut f = [0u8; 42];
     eth_build(&[0xff; 6], 0x0806, &mut f);
     wbe16(&mut f[14..16], 1); // htype ethernet
@@ -432,11 +486,12 @@ fn arp_request_locked(n: &mut NetState) {
     }
     wbe32(&mut f[28..32], GUEST_IP);
     f[32..38].copy_from_slice(&[0; 6]);
-    wbe32(&mut f[38..42], GW_IP);
+    wbe32(&mut f[38..42], target);
     unsafe {
         TXH[..10].copy_from_slice(&[0; 10]);
         TXP[..42].copy_from_slice(&f);
     }
+    n.arp_req_ip = target;
     n.arp_req_at = crate::timer::ticks() as u64;
     tx_submit_locked(n, 42);
 }
@@ -447,8 +502,15 @@ fn udp_send_locked(n: &mut NetState, dst_ip: u32, dport: u16, sport: u16, data: 
     if total > 2048 {
         return false;
     }
+    // v1.7: resolved MAC required here (sock_send no longer pre-checks;
+    // unresolvable targets WouldBlock one layer up, not here).
     let mut f = [0u8; 2048];
-    eth_build(&n.gw_mac, 0x0800, &mut f);
+    // NOTE: caller guarantees resolution via mac_for + arp_query.
+    let mac = match mac_for(n, dst_ip) {
+        Some(m) => m,
+        None => return false,
+    };
+    eth_build(&mac, 0x0800, &mut f);
     // IP
     f[14] = 0x45;
     f[15] = 0;
@@ -546,27 +608,53 @@ fn parse_frame(n: &mut NetState, f: &[u8]) {
     }
     let etype = be16(&f[12..14]);
     if etype == 0x0806 {
-        // ARP
+        // ARP: learn the sender of any packet about us; answer requests
+        // for our IP (SLIRP/host may ARP the guest); replies complete
+        // pending queries (wake happens via got=true below).
         if f.len() < 42 {
             return;
         }
-        if be16(&f[20..22]) != 2 {
-            return; // not a reply
-        }
-        if be32(&f[28..32]) != GW_IP {
-            return; // not from our gateway
-        }
-        if be32(&f[38..42]) != GUEST_IP {
+        let op = be16(&f[20..22]);
+        let spa = be32(&f[28..32]);
+        let tpa = be32(&f[38..42]);
+        if tpa != GUEST_IP {
             return; // not for us
         }
-        n.gw_mac.copy_from_slice(&f[22..28]);
-        n.arp_ok = true;
+        let mut smac = [0u8; 6];
+        smac.copy_from_slice(&f[22..28]);
+        arp_learn(n, spa, &smac);
+        if op == 1 {
+            // echo the request back as a reply
+            let mut r = [0u8; 42];
+            eth_build(&smac, 0x0806, &mut r);
+            wbe16(&mut r[14..16], 1);
+            wbe16(&mut r[16..18], 0x0800);
+            r[18] = 6;
+            r[19] = 4;
+            wbe16(&mut r[20..22], 2);
+            unsafe {
+                r[22..28].copy_from_slice(&MAC);
+            }
+            wbe32(&mut r[28..32], GUEST_IP);
+            r[32..38].copy_from_slice(&smac);
+            wbe32(&mut r[38..42], spa);
+            unsafe {
+                TXH[..10].copy_from_slice(&[0; 10]);
+                TXP[..42].copy_from_slice(&r);
+            }
+            tx_submit_locked(n, 42);
+        }
         return;
     }
     if etype != 0x0800 {
         return;
     }
-    // IPv4
+    // IPv4: learn sender MAC (gratuitous learning; replies then need no ARP)
+    if f.len() >= 34 {
+        let mut smac = [0u8; 6];
+        smac.copy_from_slice(&f[0..6]);
+        arp_learn(n, be32(&f[26..30]), &smac);
+    }
     if f.len() < 34 || f[14] >> 4 != 4 {
         return;
     }
@@ -763,13 +851,30 @@ pub fn sock_connect(idx: usize, ip_be: u32, port: u16) -> bool {
         return false;
     }
     // v1.6: UDP (peer ip+port) and ICMP (peer ip; port unused) share this.
-    // TCP has no active open: connect on a TCP socket fails.
+    // v1.7: TCP uses sock_connect_tcp (three outcomes); kept out of here.
     if n.socks[idx].kind == 1 {
         return false;
     }
     n.socks[idx].peer_ip = ip_be;
     n.socks[idx].peer_port = port;
     true
+}
+
+/// v1.7: TCP active open. 0 = SYN sent, -2 = ARP pending (retry connect),
+/// -1 = hard error (bad state/fd).
+pub fn sock_connect_tcp(idx: usize, ip_be: u32, port: u16) -> isize {
+    let mut n = NET.lock();
+    tcp::tcp_connect(&mut n, idx, ip_be, port)
+}
+
+/// v1.7: socket kind probe for the syscall layer (0 UDP, 1 TCP, 2 ICMP).
+pub fn sock_kind(idx: usize) -> Option<u8> {
+    let n = NET.lock();
+    if idx < NSOCK && n.socks[idx].used {
+        Some(n.socks[idx].kind)
+    } else {
+        None
+    }
 }
 
 pub fn sock_send(idx: usize, data: &[u8]) -> isize {
@@ -793,20 +898,17 @@ pub fn sock_send(idx: usize, data: &[u8]) -> isize {
     if idx >= NSOCK || !n.socks[idx].used || n.socks[idx].kind != 0 {
         return -1;
     }
-    if !n.arp_ok {
-        // (re)send ARP request at most once/sec; caller retries
-        let now = crate::timer::ticks() as u64;
-        if now.wrapping_sub(n.arp_req_at) > 100 {
-            arp_request_locked(&mut n);
-        }
-        return -2;
-    }
     let (ip, port, sport) = {
         let s = &n.socks[idx];
         (s.peer_ip, s.peer_port, s.lport)
     };
     if ip == 0 || port == 0 {
         return -1; // not connected
+    }
+    // v1.7: resolve via the generic cache (ARP + WouldBlock on miss).
+    if mac_for(&n, ip).is_none() {
+        arp_query(&mut n, ip);
+        return -2;
     }
     if udp_send_locked(&mut n, ip, port, sport, data) {
         data.len() as isize
@@ -850,12 +952,17 @@ fn icmp_rx(n: &mut NetState, src_ip: u32, msg: &[u8]) {
     }
     if typ == 8 {
         // echo request -> reply (swap, recompute checksum). Best effort:
-        // TX failure just drops the reply.
+        // TX failure just drops the reply. Dest MAC just learned (gratuitous
+        // learning in parse_frame); missing entry = drop.
         if msg.len() > 2048 - 14 - 20 {
             return;
         }
+        let mac = match mac_for(n, src_ip) {
+            Some(m) => m,
+            None => return,
+        };
         let mut f = [0u8; 2048];
-        eth_build(&n.gw_mac, 0x0800, &mut f);
+        eth_build(&mac, 0x0800, &mut f);
         f[14] = 0x45;
         f[15] = 0;
         wbe16(&mut f[16..18], (20 + msg.len()) as u16);
@@ -906,13 +1013,7 @@ fn icmp_send(n: &mut NetState, idx: usize, data: &[u8]) -> isize {
     if data.len() > 1400 {
         return -1;
     }
-    if !n.arp_ok {
-        let now = crate::timer::ticks() as u64;
-        if now.wrapping_sub(n.arp_req_at) > 100 {
-            arp_request_locked(n);
-        }
-        return -2;
-    }
+    // v1.7: generic cache (was: gateway-only).
     let (ip, seq, lport) = {
         let s = &n.socks[idx];
         (s.peer_ip, s.peer_port, s.lport)
@@ -920,10 +1021,20 @@ fn icmp_send(n: &mut NetState, idx: usize, data: &[u8]) -> isize {
     if ip == 0 {
         return -1; // not connected
     }
+    if mac_for(n, ip).is_none() {
+        arp_query(n, ip);
+        return -2;
+    }
     n.socks[idx].peer_port = seq.wrapping_add(1);
     let total = 14 + 20 + 8 + data.len();
     let mut f = [0u8; 2048];
-    eth_build(&n.gw_mac, 0x0800, &mut f);
+    // NOTE: mac re-fetched (arp_query cannot have resolved it synchronously,
+    // but gratuitous learning may have; re-check instead of assuming).
+    let mac = match mac_for(n, ip) {
+        Some(m) => m,
+        None => return -2,
+    };
+    eth_build(&mac, 0x0800, &mut f);
     f[14] = 0x45;
     f[15] = 0;
     wbe16(&mut f[16..18], (20 + 8 + data.len()) as u16);

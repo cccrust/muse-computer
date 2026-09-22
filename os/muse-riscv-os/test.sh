@@ -8,7 +8,7 @@ echo "=== 1. host unit tests ==="
 cargo test -p kernel -p host-tests -p mkfs || PASS=0
 
 echo "=== 2. build user ELFs ==="
-cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver -p crashwrite -p ping || PASS=0
+cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver -p crashwrite -p ping -p nslookup -p wget -p curl || PASS=0
 
 echo "=== 3. mkfs ==="
 cargo run --release -p mkfs -- fs.img || PASS=0
@@ -56,6 +56,11 @@ START=$(date +%s)
 # v1.3: UDP echo server for udpping (background, killed after §6).
 python3 tools/udp_echo.py > /tmp/muse-echo.log 2>&1 &
 ECHO_PID=$!
+# v1.7: HTTP + DNS stubs for wget/curl/nslookup (background, killed after §6).
+python3 tools/http_server.py > /tmp/muse-http.log 2>&1 &
+HTTP_PID=$!
+python3 tools/dns_stub.py > /tmp/muse-dns.log 2>&1 &
+DNS_PID=$!
 sleep 1
 # v1.5: run1 keeps QEMU alive in background so the host web client can
 # fetch from the guest webserver mid-run (a timeout-killed QEMU can't be
@@ -132,6 +137,9 @@ check "net PASS"
 check "net-dev PASS"
 check "web PASS"
 check "ping PASS"
+check "nslookup PASS"
+check "wget PASS"
+check "curl PASS"
 check "ipi PASS"
 check "hart0 up"
 check "hart1 up"
@@ -170,8 +178,10 @@ if grep -q "PANIC" qemu.log; then
 else
   echo "OK: no PANIC"
 fi
-# v1.3: stop the UDP echo server (run1 only)
+# v1.3/v1.7: stop the stub servers (run1 only)
 kill $ECHO_PID 2>/dev/null || true
+kill $HTTP_PID 2>/dev/null || true
+kill $DNS_PID 2>/dev/null || true
 
 echo "=== 7. persistence: second boot on SAME fs.img (no rebuild) ==="
 # v1.4: 60s -- persist READ needs deep autorun (past stress), which loaded
