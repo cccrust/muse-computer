@@ -147,7 +147,10 @@ pub fn write(lba: u32, data: &[u8; 512]) {
     // write-through: device first WITHOUT holding the cache lock (virtio
     // I/O may block the task; v1.0 never holds a spinlock across that),
     // then a short locked cache update.
+    // v1.6: journal-first (write-ahead record before the home write; the
+    // journal's own raw writes bypass cache+journal, no recursion).
     bump_wr();
+    crate::fs::jnl::record(lba, data);
     crate::fs::virtio::write_block(lba, data);
     let mut c = CACHE.lock();
     if let Some(i) = lookup(&c, lba) {

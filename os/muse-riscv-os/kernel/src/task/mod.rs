@@ -93,6 +93,9 @@ pub fn print_stats() {
         SCHED_MISS.load(core::sync::atomic::Ordering::SeqCst),
         SCHED_ACQ.load(core::sync::atomic::Ordering::SeqCst)
     );
+    // v1.6: heap watermark (fragmentation watch after dealloc coalescing).
+    let (hfree, hlarge) = crate::mem::heap::stats();
+    crate::println!("[MM] heap free={} largest={}", hfree, hlarge);
 }
 
 static mut SCHED: Option<crate::sync::SpinMutex<Sched>> = None;

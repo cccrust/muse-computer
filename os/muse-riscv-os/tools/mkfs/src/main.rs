@@ -4,6 +4,9 @@ use std::path::Path;
 // ---- MUSEFS layout (MUST match kernel/src/fs/disk.rs) ----
 pub const BLOCK: usize = 512;
 pub const NBLOCKS: u32 = 8192; // 4MB image
+// v1.6: journal area (disk tail): 512 sectors = 256 records of 2 sectors.
+pub const JLBA: u32 = NBLOCKS - 512;
+pub const JB: u32 = 512;
 pub const MAGIC: &[u8; 8] = b"MUSEFS01";
 pub const BMAP_LBA: u32 = 1;
 pub const BMAP_BLOCKS: u32 = 2; // 8192 bits = 1024B
@@ -52,8 +55,15 @@ impl Image {
         w32(sb, 40, ROOT_INO);
         w32(sb, 44, 2); // version 2: nlink field present
         w32(sb, 48, 1); // dirty: needs bitmap check on first mount
+        // v1.6: journal area (disk tail; zeroed content = no valid records)
+        w32(sb, 52, JLBA);
+        w32(sb, 56, JB);
         // mark reserved blocks used: 0..data_lba
         for b in 0..data_lba {
+            img.set_used(b);
+        }
+        // v1.6: journal blocks are never data (mark used + keep zeroed)
+        for b in JLBA..JLBA + JB {
             img.set_used(b);
         }
         // root + bin dirs
@@ -84,6 +94,10 @@ impl Image {
     }
     fn balloc(&mut self) -> u32 {
         for b in 0..NBLOCKS {
+            // v1.6: journal area is never data
+            if b >= JLBA {
+                continue;
+            }
             if !self.is_used(b) {
                 self.set_used(b);
                 let o = b as usize * BLOCK;
@@ -276,6 +290,7 @@ fn main() {
     let names = [
         "init", "sh", "ls", "cat", "echo", "grep", "fork_test", "pipe_test", "usertests",
         "persist", "printenv", "smp_test", "reclaim_test", "stress", "udpping", "webserver",
+        "crashwrite", "ping",
     ];
     let mut img = Image::new(names.len() + 1); // + README
     for n in names {

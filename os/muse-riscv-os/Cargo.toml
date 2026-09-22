@@ -18,6 +18,8 @@ members = [
   "user/stress",
   "user/udpping",
   "user/webserver",
+  "user/crashwrite",
+  "user/ping",
   "tools/mkfs",
   "host-tests",
 ]

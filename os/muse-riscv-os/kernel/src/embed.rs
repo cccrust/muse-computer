@@ -35,6 +35,10 @@ mod real {
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/udpping");
     pub const WEB_ELF: &[u8] =
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/webserver");
+    pub const CRASH_ELF: &[u8] =
+        include_bytes!("../../target/riscv64gc-unknown-none-elf/release/crashwrite");
+    pub const PING_ELF: &[u8] =
+        include_bytes!("../../target/riscv64gc-unknown-none-elf/release/ping");
 }
 #[cfg(not(test))]
 pub use real::*;
@@ -58,6 +62,8 @@ pub fn get_by_name(name: &str) -> Option<Vec<u8>> {
         "stress" => STRESS_ELF,
         "udpping" => UDP_ELF,
         "webserver" => WEB_ELF,
+        "crashwrite" => CRASH_ELF,
+        "ping" => PING_ELF,
         _ => return None,
     };
     Some(Vec::from(b))
@@ -100,3 +106,7 @@ pub const STRESS_ELF: &[u8] = b"test";
 pub const UDP_ELF: &[u8] = b"test";
 #[cfg(test)]
 pub const WEB_ELF: &[u8] = b"test";
+#[cfg(test)]
+pub const CRASH_ELF: &[u8] = b"test";
+#[cfg(test)]
+pub const PING_ELF: &[u8] = b"test";

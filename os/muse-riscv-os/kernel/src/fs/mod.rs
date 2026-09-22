@@ -3,6 +3,7 @@ pub mod pipe;
 pub mod virtio;
 pub mod blk;
 pub mod disk;
+pub mod jnl;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};

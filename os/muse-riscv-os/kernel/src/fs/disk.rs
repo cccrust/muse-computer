@@ -3,6 +3,7 @@
 //   LBA0: superblock magic[8]=MUSEFS01 bs u32 nblocks u32 bmap_lba u32
 //         bmap_blocks u32 ino_lba u32 ino_blocks u32 ninodes u32
 //         data_lba u32 root_ino u32
+//         [v1.6] journal_lba u32@52 journal_blocks u32@56 (both zero = none)
 //   bitmap: 1 bit/block. inodes: 64B (kind u8, pad[3], size u32,
 //         direct[8] u32, indirect u32, rsv). dirent: name[28] + ino u32.
 
@@ -25,6 +26,20 @@ static mut INO_LBA: u32 = 0;
 static mut NINODES: u32 = 0;
 static mut ROOT_INO: u32 = 1;
 static mut DATA_LBA: u32 = 0;
+// v1.6: journal area (disk tail); zero = no journal on this image.
+static mut JLBA: u32 = 0;
+static mut JB: u32 = 0;
+
+pub fn journal_lba() -> u32 {
+    unsafe { JLBA }
+}
+pub fn journal_blocks() -> u32 {
+    unsafe { JB }
+}
+fn in_journal(lba: u32) -> bool {
+    let (j, n) = unsafe { (JLBA, JB) };
+    n != 0 && lba >= j && lba < j + n
+}
 
 fn r32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
@@ -52,6 +67,13 @@ pub fn mount() -> bool {
         if ROOT_INO == 0 {
             ROOT_INO = 1;
         }
+        // v1.6: journal area (zero = none, graceful on old images)
+        JLBA = r32(&sb, 52);
+        JB = r32(&sb, 56);
+        if JLBA == 0 || JB < 3 || JLBA + JB > NBLOCKS {
+            JLBA = 0;
+            JB = 0;
+        }
     }
     // verify root is a dir
     if get_ino(root()).is_none() {
@@ -59,14 +81,27 @@ pub fn mount() -> bool {
     }
     MOUNTED.store(true, Ordering::Release);
     crate::println!("[FS] disk mount ok (MUSEFS01, {} blocks)", nblocks());
+    // v1.6: journal-first recovery (before fsck-lite; replay is idempotent).
+    // init() also seeds the record sequence past surviving records.
+    if journal_blocks() != 0 {
+        crate::fs::jnl::init(journal_lba(), journal_blocks());
+    }
     // fsck-lite: rebuild bitmap if dirty, then clear flag
     let mut sb2 = [0u8; 512];
     crate::fs::blk::read(0, &mut sb2);
     if r32(&sb2, 48) != 0 {
+        if journal_blocks() != 0 {
+            let (n, _) = crate::fs::jnl::replay();
+            crate::println!("[FS] journal replayed {}", n);
+        }
         rebuild_bitmap();
         set_dirty(false);
         crate::println!("[FS] fsck: bitmap rebuilt");
     }
+    // v1.6: mark dirty AFTER the recovery above (a mount that never cleanly
+    // shuts down must replay next time; a clean halt clears it). Without
+    // this, kill -9 mounts "clean" and replays nothing (observed).
+    set_dirty(true);
     true
 }
 
@@ -104,6 +139,16 @@ fn rebuild_bitmap() {
     while b < data_start() {
         mark(b);
         b += 1;
+    }
+    // v1.6: journal area is always used (keeps bitmap honest; balloc and
+    // free_blocks also exclude it by range as belt-and-braces)
+    {
+        let (j, n) = unsafe { (JLBA, JB) };
+        let mut k = 0u32;
+        while k < n {
+            mark(j + k);
+            k += 1;
+        }
     }
     // all inode data blocks
     let mut ino = 1u32;
@@ -175,6 +220,11 @@ pub fn free_blocks() -> u32 {
     let mut free = 0u32;
     let mut b = 0u32;
     while b < nb {
+        // v1.6: journal blocks are never free (even if bitmap says so)
+        if in_journal(b) {
+            b += 1;
+            continue;
+        }
         let byte = (b / 8) as usize;
         let lb = bmap_lba() + (byte / BLOCK) as u32;
         let off = byte % BLOCK;
@@ -308,6 +358,10 @@ fn data_block(rec: &mut Ino, ino: u32, idx: u32, alloc: bool) -> Option<u32> {
 fn balloc() -> Option<u32> {
     let nb = nblocks();
     for b in 0..nb {
+        // v1.6: never hand out journal blocks (log corruption)
+        if in_journal(b) {
+            continue;
+        }
         let byte = (b / 8) as usize;
         let lb = bmap_lba() + (byte / BLOCK) as u32;
         let off = byte % BLOCK;

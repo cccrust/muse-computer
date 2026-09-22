@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "crashwrite"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
 name = "echo"
 version = "0.1.0"
 dependencies = [
@@ -58,6 +65,13 @@ version = "0.1.0"
 
 [[package]]
 name = "persist"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
+name = "ping"
 version = "0.1.0"
 dependencies = [
  "user-lib",

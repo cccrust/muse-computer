@@ -73,11 +73,56 @@ unsafe impl GlobalAlloc for HeapAlloc {
             return;
         }
         let _g = HEAP_LOCK.lock();
-        let node = (ptr as usize - 16) as *mut Node;
-        (*node).next = FREE_HEAD;
-        FREE_HEAD = node;
+        // v1.6: insert sorted by address + coalesce neighbors. Without
+        // this the LIFO list fragments into slivers under steady syscall
+        // churn (Strings/Vecs per op) and large contiguours requests fail
+        // while megabytes sit free (observed: 32KB fail on an 8MB heap
+        // after a full autorun + writer soak).
+        let mut node = (ptr as usize - 16) as *mut Node;
+        let mut prev: *mut Node = null_mut();
+        let mut cur = FREE_HEAD;
+        while !cur.is_null() && (cur as usize) < node as usize {
+            prev = cur;
+            cur = (*cur).next;
+        }
+        // merge with next?
+        if !cur.is_null() && (node as usize) + (*node).size == cur as usize {
+            (*node).size += (*cur).size;
+            (*node).next = (*cur).next;
+        } else {
+            (*node).next = cur;
+        }
+        // merge with prev?
+        if !prev.is_null() && (prev as usize) + (*prev).size == node as usize {
+            (*prev).size += (*node).size;
+            (*prev).next = (*node).next;
+        } else if prev.is_null() {
+            FREE_HEAD = node;
+        } else {
+            (*prev).next = node;
+        }
     }
 }
 
 #[global_allocator]
 static A: HeapAlloc = HeapAlloc;
+
+/// v1.6: heap watermark for OOM forensics (total free + largest run).
+/// Called on the halt path; a shrinking largest-run with steady total
+/// means fragmentation (fixed by dealloc coalescing above).
+pub fn stats() -> (usize, usize) {
+    unsafe {
+        let _g = HEAP_LOCK.lock();
+        let mut total = 0usize;
+        let mut largest = 0usize;
+        let mut cur = FREE_HEAD;
+        while !cur.is_null() {
+            total += (*cur).size;
+            if (*cur).size > largest {
+                largest = (*cur).size;
+            }
+            cur = (*cur).next;
+        }
+        (total, largest)
+    }
+}

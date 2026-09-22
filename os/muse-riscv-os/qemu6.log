@@ -84,7 +84,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [NET] net @ 0x10002000 MAC 52:54:00:12:34:56 ip 10.0.2.15
 [TEST] net-dev PASS
 [FS] disk mount ok (MUSEFS01, 8192 blocks)
-[FS] journal replayed 0
+[FS] journal replayed 22
 [FS] fsck: bitmap rebuilt
 [PROC] init pid=1
 [PROC] spawn init
@@ -93,13 +93,13 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [SMP] hart0 starting
 [SMP] hart2 starting
 [SMP] hart3 starting
-[PLIC] hart0 ctx irq10+virtio1-8 enabled
 [PLIC] hart3 ctx irq10+virtio1-8 enabled
 [PLIC] hart2 ctx irq10+virtio1-8 enabled
-[SMP] hart0 up
+[PLIC] hart0 ctx irq10+virtio1-8 enabled
 [SMP] hart3 up
 [SMP] hart2 up
-[DBG] soft hart=0 n=0 sip=0x202->0x200
+[SMP] hart0 up
+[DBG] soft hart=3 n=0 sip=0x202->0x200
 [TEST] ipi PASS
 [TEST] boot markers ready
 [TEST] virtio-irq PASS
@@ -131,6 +131,8 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 /:
 bin/
 README ok
+TESTDATA ok
+WD/
 /bin:
 init ok
 sh ok
@@ -177,10 +179,10 @@ echo: hi from unix-v6
 [PROC] pid=12 exited(40)
 [smp] child on hart 1->1
 [PROC] pid=13 exited(41)
-[smp] child on hart 1->1
-[PROC] pid=15 exited(43)
-[smp] child on hart 1->1
+[smp] child on hart [smp] child on hart 11->->12
+
 [PROC] pid=14 exited(42)
+[PROC] pid=15 exited(43)
 [TEST] smp PASS
 [PROC] pid=11 exited(0)
 [PROC] fork pid=2 -> child=16
@@ -832,13 +834,22 @@ echo: hi from unix-v6
 [TEST] stress DONE
 [PROC] pid=37 exited(0)
 [PROC] fork pid=2 -> child=338
-[PROC] exec pid=338 -> /bin/webserver (argc=0)
 [PROC] fork pid=2 -> child=339
-[PROC] exec pid=339 -> /bin/udpping (argc=0)
+[PROC] exec pid=338 -> /bin/webserver (argc=0)
 [NET] webserver listening on :80
+[PROC] exec pid=339 -> /bin/udpping (argc=0)
+[DBG] soft hart=2 n=0 sip=0x2->0x0
+[DBG] soft hart=0 n=0 sip=0x2->0x0
+[DBG] soft hart=1 n=0 sip=0x2->0x0
 [DBG] soft hart=0 n=1 sip=0x2->0x0
+[DBG] soft hart=1 n=1 sip=0x2->0x0
 [DBG] soft hart=0 n=2 sip=0x2->0x0
-[TEST] net PASS
+[DBG] soft hart=3 n=1 sip=0x2->0x0
+[DBG] soft hart=3 n=2 sip=0x2->0x0
+[DBG] soft hart=2 n=1 sip=0x2->0x0
+[DBG] soft hart=1 n=2 sip=0x2->0x0
+[DBG] soft hart=2 n=2 sip=0x2->0x0
+[TEST] net FAIL
 [PROC] pid=339 exited(0)
 [PROC] fork pid=2 -> child=340
 [PROC] exec pid=340 -> /bin/ping (argc=0)
@@ -846,8 +857,7 @@ echo: hi from unix-v6
 [PROC] pid=340 exited(0)
 [PROC] fork pid=2 -> child=341
 [PROC] exec pid=341 -> /bin/persist (argc=0)
-[TEST] link PASS
-[TEST] persist WRITE PASS
+[TEST] persist READ PASS
 [PROC] pid=341 exited(0)
 [PROC] fork pid=2 -> child=342
 [PROC] exec pid=342 -> /bin/cat (argc=2)
@@ -860,8 +870,8 @@ hello-arg
 [PROC] pid=343 exited(0)
 [PROC] fork pid=2 -> child=344
 [bg] pipe_test &
-[PROC] fork pid=2 -> child=345
 [PROC] exec pid=344 -> /bin/pipe_test (argc=0)
+[PROC] fork pid=2 -> child=345
 [PROC] exec pid=345 -> /bin/ls (argc=1)
 [PROC] fork pid=344 -> child=346
 [PROC] pid=346 exited(0)
@@ -871,12 +881,11 @@ hello-arg
 bin/
 README ok
 TESTDATA ok
+WD/
 /bin:
 init ok
-sh[DBG] soft hart=2 n=0 sip=0x2->0x0
- ok
-ls[DBG] soft hart=2 n=1 sip=0x2->0x0
- ok
+sh ok
+ls ok
 cat ok
 echo ok
 grep ok
@@ -884,23 +893,19 @@ fork_test ok
 pipe_test ok
 usertests ok
 persist ok
-printenv[DBG] soft hart=1 n=0 sip=0x2->0x0
- ok
+printenv ok
 smp_test ok
 reclaim_test ok
 stress ok
 udpping ok
 webserver ok
 crashwrite ok
-ping[DBG] soft hart=1 n=1 sip=0x2->0x0
- ok
+ping ok
 [TEST] fstat PASS
 [TEST] ls PASS
 [PROC] pid=345 exited(0)
 [bg] done
 [TEST] bg PASS
-[DBG] soft hart=2 n=2 sip=0x2->0x0
-[DBG] soft hart=3 n=0 sip=0x2->0x0
 [TEST] sleep PASS
 [PROC] fork pid=2 -> child=347
 [PROC] pid=347 killed
@@ -927,9 +932,8 @@ ping[DBG] soft hart=1 n=1 sip=0x2->0x0
 [PROC] pid=351 exited(0)
 [TEST] env PASS
 [PROC] fork pid=2 -> child=353
-[bg] started
-[DBG] soft hart=3 n=1 sip=0x2->0x0
 [PROC] execve pid=353 -> /bin/echo (argc=2 envc=1)
+[bg] started
 hi
 [TEST] echo PASS
 [PROC] pid=353 exited(0)
@@ -948,7 +952,7 @@ hi
 [TEST] strace DONE
 [PROC] fork pid=2 -> child=356
 [PROC] fork pid=356 -> child=357
-[PROC] execve pid=357 -> /bin/echo (argc=2 envc=1)
+[PROC] execve pid=357 -> /bin/echo (argc=3 envc=1)
 [PROC] pid=357 exited(0)
 [PROC] pid=356 exited(0)
 [PROC] fork pid=2 -> child=358
@@ -971,14 +975,12 @@ hi
 [PROC] fork pid=2 -> child=364
 [PROC] fork pid=364 -> child=365
 [PROC] execve pid=365 -> /bin/cat (argc=2 envc=3)
-[DBG] soft hart=3 n=2 sip=0x2->0x0
 [PROC] pid=365 exited(0)
 [PROC] pid=364 exited(0)
-[DBG] soft hart=1 n=2 sip=0x2->0x0
 [TEST] redirenv PASS
-sh$ [DBG] lookup dport=80 flags=0x2 child=-1 listener=1
-[DBG] synack sent=1 ci=0
-[DBG] lookup dport=80 flags=0x10 child=0 listener=-1
-[DBG] lookup dport=80 flags=0x18 child=0 listener=-1
-[TEST] web PASS
-qemu-system-riscv64: terminating on signal 15 from pid 63250 (<unknown process>)
+sh$ [TEST] uart-tx-irq PASS
+crashwrite write &
+[PROC] fork pid=2 -> child=366
+[bg] started
+sh$ [PROC] execve pid=366 -> /bin/crashwrite (argc=2 envc=3)
+[TEST] crashwrite running

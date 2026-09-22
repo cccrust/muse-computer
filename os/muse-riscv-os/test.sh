@@ -8,7 +8,7 @@ echo "=== 1. host unit tests ==="
 cargo test -p kernel -p host-tests -p mkfs || PASS=0
 
 echo "=== 2. build user ELFs ==="
-cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver || PASS=0
+cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver -p crashwrite -p ping || PASS=0
 
 echo "=== 3. mkfs ==="
 cargo run --release -p mkfs -- fs.img || PASS=0
@@ -131,6 +131,7 @@ check "stress DONE"
 check "net PASS"
 check "net-dev PASS"
 check "web PASS"
+check "ping PASS"
 check "ipi PASS"
 check "hart0 up"
 check "hart1 up"
@@ -345,6 +346,85 @@ else
   else
     echo "OK: no PANIC (fifth boot)"
   fi
+fi
+
+echo "=== 11. power loss: SIGKILL mid-write, journal must recover ==="
+# v1.6: bootA backgrounds crashwrite, we wait for versions to accumulate,
+# then SIGKILL with no shutdown (true power loss). bootB on the SAME image
+# must replay + verify every page old-or-new (kill timing is not
+# load-bearing: torn pages fail regardless of when the kill lands).
+# Input timing: the command is sent ONLY after the sh prompt is up. Early
+# input gets nibbled by autorun's console readers (observed: grep/sh byte
+# reads ate "cr" off "crashwrite"), so polling for `sh$ ` is mandatory.
+rm -f qemu6.log
+( for i in $(seq 1 150); do grep -q '^sh\$ ' qemu6.log 2>/dev/null && break; sleep 1; done; printf 'crashwrite write &\n'; sleep 60 ) | qemu-system-riscv64 \
+  -machine virt -smp 4 \
+  -nographic \
+  -bios default \
+  -kernel "$KBIN" \
+  -drive file=fs.img,if=none,format=raw,id=x0 \
+  -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
+  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
+  > qemu6.log 2>&1 &
+QEMU6=$!
+for i in $(seq 1 120); do
+  if grep -q "crashwrite running" qemu6.log 2>/dev/null; then
+    echo "writer up, accumulating versions"
+    break
+  fi
+  if ! kill -0 $QEMU6 2>/dev/null; then
+    echo "FAIL: bootA died before writer started"; PASS=0
+    break
+  fi
+  sleep 1
+done
+sleep 25
+kill -9 $QEMU6 2>/dev/null || true
+wait $QEMU6 2>/dev/null || true
+# NOTE: the feeder subshell (sleep 60 tail) exits on its own; not waited.
+
+echo "=== 11b. reboot after power loss: replay + verify ==="
+rm -f qemu7.log
+( for i in $(seq 1 150); do grep -q '^sh\$ ' qemu7.log 2>/dev/null && break; sleep 1; done; printf 'crashwrite check\n'; sleep 30 ) | qemu-system-riscv64 \
+  -machine virt -smp 4 \
+  -nographic \
+  -bios default \
+  -kernel "$KBIN" \
+  -drive file=fs.img,if=none,format=raw,id=x0 \
+  -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
+  -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
+  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
+  > qemu7.log 2>&1 &
+QEMU7=$!
+for i in $(seq 1 120); do
+  if grep -q "crash PASS\|crash FAIL" qemu7.log 2>/dev/null; then
+    echo "check done"
+    break
+  fi
+  if ! kill -0 $QEMU7 2>/dev/null; then
+    echo "FAIL: bootB died before check finished"; PASS=0
+    break
+  fi
+  sleep 1
+done
+kill $QEMU7 2>/dev/null || true
+wait $QEMU7 2>/dev/null || true
+
+if grep -q "journal replayed" qemu7.log; then
+  echo "OK: journal replayed (run7)"
+else
+  echo "FAIL: missing [journal replayed] in qemu7.log"; PASS=0
+fi
+if grep -q "crash PASS" qemu7.log; then
+  echo "OK: crash PASS (run7)"
+else
+  echo "FAIL: missing [crash PASS] in qemu7.log"; PASS=0
+fi
+if grep -q "PANIC" qemu6.log qemu7.log; then
+  echo "FAIL: PANIC in power-loss runs"; PASS=0
+else
+  echo "OK: no PANIC (power-loss runs)"
 fi
 
 if [ "$PASS" = "1" ]; then

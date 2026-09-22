@@ -111,6 +111,9 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
             crate::println!("[SYS] shutdown");
             if crate::fs::use_disk() {
                 crate::fs::blk::sync();
+                // v1.6: void the journal generation BEFORE clearing dirty
+                // (either order is safe: dirty + fresh gen replays nothing).
+                crate::fs::jnl::reset();
                 crate::fs::disk::set_dirty(false);
                 crate::println!("[FS] marked clean");
             }
@@ -368,8 +371,8 @@ fn sys_close(fd: i32) -> isize {
 }
 
 fn sys_socket(kind: usize) -> isize {
-    // v1.5: kind 0 = UDP, 1 = TCP.
-    if kind > 1 {
+    // v1.5: kind 0 = UDP, 1 = TCP. v1.6: kind 2 = ICMP (ping).
+    if kind > 2 {
         return -1;
     }
     let idx = match crate::net::sock_open_kind(kind as u8) {

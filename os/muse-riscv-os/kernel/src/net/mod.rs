@@ -574,8 +574,8 @@ fn parse_frame(n: &mut NetState, f: &[u8]) {
     if ihl < 20 || f.len() < 14 + ihl + 8 {
         return;
     }
-    if f[23] != 17 && f[23] != tcp::TCP_PROTO {
-        return; // neither UDP nor TCP
+    if f[23] != 17 && f[23] != tcp::TCP_PROTO && f[23] != 1 {
+        return; // neither UDP nor TCP nor ICMP
     }
     if be32(&f[30..34]) != GUEST_IP {
         return; // not for us
@@ -589,6 +589,15 @@ fn parse_frame(n: &mut NetState, f: &[u8]) {
             return;
         }
         tcp::tcp_rx(n, be32(&f[26..30]), &f[14 + ihl..14 + ip_len]);
+        return;
+    }
+    if f[23] == 1 {
+        // v1.6: ICMP (echo only; length likewise from IP total-length).
+        let ip_len = be16(&f[16..18]) as usize;
+        if ip_len < ihl || f.len() < 14 + ip_len {
+            return;
+        }
+        icmp_rx(n, be32(&f[26..30]), &f[14 + ihl..14 + ip_len]);
         return;
     }
     let src_ip = be32(&f[26..30]);
@@ -753,6 +762,11 @@ pub fn sock_connect(idx: usize, ip_be: u32, port: u16) -> bool {
     if idx >= NSOCK || !n.socks[idx].used {
         return false;
     }
+    // v1.6: UDP (peer ip+port) and ICMP (peer ip; port unused) share this.
+    // TCP has no active open: connect on a TCP socket fails.
+    if n.socks[idx].kind == 1 {
+        return false;
+    }
     n.socks[idx].peer_ip = ip_be;
     n.socks[idx].peer_port = port;
     true
@@ -767,6 +781,9 @@ pub fn sock_send(idx: usize, data: &[u8]) -> isize {
     }
     if n.socks[idx].kind == 1 {
         return tcp::tcp_send(&mut n, idx, data);
+    }
+    if n.socks[idx].kind == 2 {
+        return icmp_send(&mut n, idx, data);
     }
     drop(n);
     if data.len() > MAXUDP {
@@ -808,6 +825,7 @@ pub fn sock_recv(idx: usize, out: &mut [u8]) -> isize {
     if n.socks[idx].kind == 1 {
         return tcp::tcp_recv(&mut n, idx, out);
     }
+    // kinds 0 (UDP) and 2 (ICMP) share the datagram rx staging
     match n.socks[idx].rx.pop_front() {
         Some((_ip, _port, pkt)) => {
             let k = core::cmp::min(out.len(), pkt.len());
@@ -815,5 +833,128 @@ pub fn sock_recv(idx: usize, out: &mut [u8]) -> isize {
             k as isize
         }
         None => -2,
+    }
+}
+
+/// v1.6: ICMP echo (ping). kind==2 sockets: id=lport, seq in peer_port.
+/// Inbound echo requests are answered on the spot; replies matching
+/// (id, any seq) are staged to the owning socket. Others dropped.
+fn icmp_rx(n: &mut NetState, src_ip: u32, msg: &[u8]) {
+    if msg.len() < 8 {
+        return;
+    }
+    let typ = msg[0];
+    // validate checksum over the message as received
+    if ip_cksum(msg) != 0 {
+        return;
+    }
+    if typ == 8 {
+        // echo request -> reply (swap, recompute checksum). Best effort:
+        // TX failure just drops the reply.
+        if msg.len() > 2048 - 14 - 20 {
+            return;
+        }
+        let mut f = [0u8; 2048];
+        eth_build(&n.gw_mac, 0x0800, &mut f);
+        f[14] = 0x45;
+        f[15] = 0;
+        wbe16(&mut f[16..18], (20 + msg.len()) as u16);
+        wbe16(&mut f[18..20], 0);
+        wbe16(&mut f[20..22], 0);
+        f[22] = 64;
+        f[23] = 1;
+        wbe16(&mut f[24..26], 0);
+        wbe32(&mut f[26..30], GUEST_IP);
+        wbe32(&mut f[30..34], src_ip);
+        let mut cks = ip_cksum(&f[14..34]);
+        if cks == 0 {
+            cks = 0xffff;
+        }
+        wbe16(&mut f[24..26], cks);
+        f[34] = 0; // echo reply
+        f[35] = 0;
+        wbe16(&mut f[36..38], 0);
+        // id/seq/payload mirrored
+        f[38..38 + msg.len() - 4].copy_from_slice(&msg[4..]);
+        let c = ip_cksum(&f[34..34 + msg.len()]);
+        wbe16(&mut f[36..38], if c == 0 { 0xffff } else { c });
+        let total = 14 + 20 + msg.len();
+        unsafe {
+            TXH[..10].copy_from_slice(&[0; 10]);
+            TXP[..total].copy_from_slice(&f[..total]);
+        }
+        tx_submit_locked(n, total);
+        return;
+    }
+    if typ != 0 {
+        return; // only echo replies staged
+    }
+    let id = be16(&msg[4..6]);
+    for s in n.socks.iter_mut() {
+        if s.used && !s.closing && s.kind == 2 && s.lport == id {
+            if s.rx.len() < 8 {
+                s.rx.push_back((src_ip, be16(&msg[6..8]), Vec::from(&msg[8..])));
+            }
+            break;
+        }
+    }
+}
+
+/// v1.6: ICMP echo request TX (socket send path). Returns WouldBlock (-2)
+/// while ARP unresolved, else bytes accepted or -1.
+fn icmp_send(n: &mut NetState, idx: usize, data: &[u8]) -> isize {
+    if data.len() > 1400 {
+        return -1;
+    }
+    if !n.arp_ok {
+        let now = crate::timer::ticks() as u64;
+        if now.wrapping_sub(n.arp_req_at) > 100 {
+            arp_request_locked(n);
+        }
+        return -2;
+    }
+    let (ip, seq, lport) = {
+        let s = &n.socks[idx];
+        (s.peer_ip, s.peer_port, s.lport)
+    };
+    if ip == 0 {
+        return -1; // not connected
+    }
+    n.socks[idx].peer_port = seq.wrapping_add(1);
+    let total = 14 + 20 + 8 + data.len();
+    let mut f = [0u8; 2048];
+    eth_build(&n.gw_mac, 0x0800, &mut f);
+    f[14] = 0x45;
+    f[15] = 0;
+    wbe16(&mut f[16..18], (20 + 8 + data.len()) as u16);
+    wbe16(&mut f[18..20], 0);
+    wbe16(&mut f[20..22], 0);
+    f[22] = 64;
+    f[23] = 1;
+    wbe16(&mut f[24..26], 0);
+    wbe32(&mut f[26..30], GUEST_IP);
+    wbe32(&mut f[30..34], ip);
+    let mut cks = ip_cksum(&f[14..34]);
+    if cks == 0 {
+        cks = 0xffff;
+    }
+    wbe16(&mut f[24..26], cks);
+    let io = 34;
+    f[io] = 8; // echo request
+    f[io + 1] = 0;
+    wbe16(&mut f[io + 2..io + 4], 0);
+    wbe16(&mut f[io + 4..io + 6], lport); // id = socket port
+    wbe16(&mut f[io + 6..io + 8], seq);
+    f[io + 8..io + 8 + data.len()].copy_from_slice(data);
+    let c = ip_cksum(&f[io..io + 8 + data.len()]);
+    wbe16(&mut f[io + 2..io + 4], if c == 0 { 0xffff } else { c });
+    unsafe {
+        TXH[..10].copy_from_slice(&[0; 10]);
+        TXP[..total].copy_from_slice(&f[..total]);
+    }
+    if tx_submit_locked(n, total) {
+        data.len() as isize
+    } else {
+        -1
     }
 }
