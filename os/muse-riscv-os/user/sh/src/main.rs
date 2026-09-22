@@ -1346,6 +1346,18 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
                 user_lib::print("[TEST] df FAIL\n");
             }
         }
+        // v1.8: monotonic clock (strictly increasing, sleep(5)=50ms nominal,
+        // 30ms floor for emulation slop)
+        {
+            let t0 = user_lib::uptime_ms();
+            user_lib::sleep(5);
+            let t1 = user_lib::uptime_ms();
+            if t0 >= 0 && t1 > t0 && t1 - t0 >= 30 {
+                user_lib::print("[TEST] time PASS\n");
+            } else {
+                user_lib::print("[TEST] time FAIL\n");
+            }
+        }
         // back to root for interactive prompt
         user_lib::chdir(b"/\0".as_ptr());
     }

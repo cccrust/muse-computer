@@ -65,7 +65,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [BOOT] hart booted in S-mode, kernel @ 0x80200000
 [MM] heap init ok
 [MM] frame allocator ok
-[MM] root=0x80c7e000
+[MM] root=0x80bd6000
 [MM] text mapped
 [MM] rodata mapped
 [MM] data mapped
@@ -93,12 +93,12 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [SMP] hart0 starting
 [SMP] hart2 starting
 [SMP] hart3 starting
-[PLIC] hart3 ctx irq10+virtio1-8 enabled
 [PLIC] hart2 ctx irq10+virtio1-8 enabled
 [PLIC] hart0 ctx irq10+virtio1-8 enabled
+[PLIC] hart3 ctx irq10+virtio1-8 enabled
 [SMP] hart2 up
-[SMP] hart0 up
 [SMP] hart3 up
+[SMP] hart0 up
 [DBG] soft hart=2 n=0 sip=0x202->0x200
 [TEST] ipi PASS
 [TEST] boot markers ready
@@ -179,13 +179,13 @@ echo: hi from unix-v6
 [PROC] fork pid=11 -> child=13
 [PROC] fork pid=11 -> child=14
 [PROC] fork pid=11 -> child=15
-[smp] child on hart 3->3
+[smp] child on hart 0->0
 [PROC] pid=12 exited(40)
 [smp] child on hart 3->3
-[smp] child on hart 3->[PROC] pid=13 exited(41)
-0[smp] child on hart 
-3[PROC] pid=14 exited(42)
-->3
+[PROC] pid=13 exited(41)
+[smp] child on hart 3->3
+[PROC] pid=14 exited(42)
+[smp] child on hart 3->3
 [PROC] pid=15 exited(43)
 [TEST] smp PASS
 [PROC] pid=11 exited(0)
@@ -840,18 +840,18 @@ echo: hi from unix-v6
 [PROC] fork pid=2 -> child=338
 [PROC] fork pid=2 -> child=339
 [PROC] exec pid=338 -> /bin/webserver (argc=0)
-[NET] webserver listening on :80
 [PROC] exec pid=339 -> /bin/udpping (argc=0)
-[DBG] soft hart=1 n=0 sip=0x2->0x0
-[DBG] soft hart=0 n=0 sip=0x2->0x0
+[NET] webserver listening on :80
 [DBG] soft hart=3 n=0 sip=0x2->0x0
-[DBG] soft hart=0 n=1 sip=0x2->0x0
+[DBG] soft hart=0 n=0 sip=0x2->0x0
 [DBG] soft hart=2 n=1 sip=0x2->0x0
-[DBG] soft hart=0 n=2 sip=0x2->0x0
-[DBG] soft hart=3 n=1 sip=0x2->0x0
-[DBG] soft hart=1 n=1 sip=0x2->0x0
+[DBG] soft hart=1 n=0 sip=0x2->0x0
 [DBG] soft hart=2 n=2 sip=0x2->0x0
+[DBG] soft hart=1 n=1 sip=0x2->0x0
 [DBG] soft hart=1 n=2 sip=0x2->0x0
+[DBG] soft hart=0 n=1 sip=0x2->0x0
+[DBG] soft hart=3 n=1 sip=0x2->0x0
+[DBG] soft hart=0 n=2 sip=0x2->0x0
 [DBG] soft hart=3 n=2 sip=0x2->0x0
 [TEST] net FAIL
 [PROC] pid=339 exited(0)
@@ -939,6 +939,7 @@ ping ok
 [PROC] pid=351 exited(42)
 [TEST] waitpid PASS
 [TEST] df PASS
+[TEST] time PASS
 [PROC] fork pid=2 -> child=352
 [PROC] fork pid=352 -> child=353
 [PROC] execve pid=353 -> /bin/echo (argc=2 envc=0)

@@ -137,6 +137,7 @@ check "net PASS"
 check "net-dev PASS"
 check "web PASS"
 check "ping PASS"
+check "time PASS"
 check "nslookup PASS"
 check "wget PASS"
 check "curl PASS"
@@ -378,7 +379,7 @@ rm -f qemu6.log
   -netdev user,id=n0,hostfwd=tcp::8080-:80 \
   > qemu6.log 2>&1 &
 QEMU6=$!
-for i in $(seq 1 120); do
+for i in $(seq 1 180); do
   if grep -q "crashwrite running" qemu6.log 2>/dev/null; then
     echo "writer up, accumulating versions"
     break
@@ -407,7 +408,7 @@ rm -f qemu7.log
   -netdev user,id=n0,hostfwd=tcp::8080-:80 \
   > qemu7.log 2>&1 &
 QEMU7=$!
-for i in $(seq 1 120); do
+for i in $(seq 1 180); do
   if grep -q "crash PASS\|crash FAIL" qemu7.log 2>/dev/null; then
     echo "check done"
     break

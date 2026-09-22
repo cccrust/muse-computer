@@ -49,6 +49,8 @@ pub const SYS_SOCKET: usize = 37;
 pub const SYS_CONNECT: usize = 38;
 pub const SYS_SEND: usize = 39;
 pub const SYS_RECV: usize = 40;
+// v1.8: monotonic ms since boot (no wall clock: virt has no RTC hw).
+pub const SYS_TIME: usize = 44;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -63,8 +65,22 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         }
         SYS_WAIT => sys_wait(a0) as isize,
         SYS_READ => sys_read(a0 as i32, a1, a2) as isize,
-        SYS_WRITE => sys_write(a0 as i32, a1, a2) as isize,
-        SYS_OPEN => sys_open(a0, a1 as i32) as isize,
+        // v1.8: mutating syscalls run inside one journal TX (per-syscall
+        // atomic durability): begin/commit bracket the whole op; syscalls
+        // don't nest, and commit() with zero records writes nothing (so
+        // console/pipe writes cost nothing extra).
+        SYS_WRITE => {
+            crate::fs::jnl::begin();
+            let r = sys_write(a0 as i32, a1, a2) as isize;
+            crate::fs::jnl::commit();
+            r
+        }
+        SYS_OPEN => {
+            crate::fs::jnl::begin();
+            let r = sys_open(a0, a1 as i32) as isize;
+            crate::fs::jnl::commit();
+            r
+        }
         SYS_CLOSE => sys_close(a0 as i32) as isize,
         SYS_DUP => sys_dup(a0 as i32) as isize,
         SYS_PIPE => sys_pipe(a0) as isize,
@@ -77,11 +93,26 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
             0
         }
         SYS_KILL => sys_kill(a0) as isize,
-        SYS_MKDIR => sys_mkdir(a0) as isize,
+        SYS_MKDIR => {
+            crate::fs::jnl::begin();
+            let r = sys_mkdir(a0) as isize;
+            crate::fs::jnl::commit();
+            r
+        }
         SYS_CHDIR => sys_chdir(a0) as isize,
         SYS_MKNOD => 0,
-        SYS_LINK => sys_link(a0, a1) as isize,
-        SYS_UNLINK => sys_unlink(a0) as isize,
+        SYS_LINK => {
+            crate::fs::jnl::begin();
+            let r = sys_link(a0, a1) as isize;
+            crate::fs::jnl::commit();
+            r
+        }
+        SYS_UNLINK => {
+            crate::fs::jnl::begin();
+            let r = sys_unlink(a0) as isize;
+            crate::fs::jnl::commit();
+            r
+        }
         SYS_FSTAT => sys_fstat(a0 as i32, a1) as isize,
         SYS_YIELD => {
             crate::task::yield_now();
@@ -104,6 +135,8 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_CONNECT => sys_connect(a0 as i32, a1 as u32, a2 as u16) as isize,
         SYS_SEND => sys_send(a0 as i32, a1, a2) as isize,
         SYS_RECV => sys_recv(a0 as i32, a1, a2) as isize,
+        // v1.8: monotonic ms since boot (timer::ticks is 10ms units).
+        SYS_TIME => (crate::timer::ticks() * 10) as isize,
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,

@@ -27,20 +27,17 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 }
 
 // v1.6 crash-consistency workload (with test.sh §11 power-loss stage).
-// Sector-granular on purpose: the journal makes every 512B sector write
-// atomic (old-or-new), but NOT multi-sector spans (standard ordered-mode
-// semantics; cross-block atomicity needs TX batching, v1.7+). So each page
-// here is exactly one sector: [ver:u32][idx:u32][fill 504].
-// write: loop versions over /CRASHDAT. check: every page is untouched-zero
-// or one complete version (torn = FAIL). The property holds for ANY kill
-// point, so the test.sh kill timing is not load-bearing.
-const NPAGE: usize = 64;
+// v1.8: 4K pages (were 512B sectors in v1.6, the old guarantee boundary).
+// Each page's 8 sectors ride one write() = one journal TX, so a page is
+// old-or-new whole; torn = FAIL. The property holds for ANY kill point,
+// so the test.sh kill timing is not load-bearing.
+const NPAGE: usize = 16;
 const PATH: &[u8] = b"/CRASHDAT\0";
 
-fn page_pat(ver: u32, idx: u32, out: &mut [u8; 512]) {
+fn page_pat(ver: u32, idx: u32, out: &mut [u8; 4096]) {
     let mut x = ver.wrapping_mul(0x9e37_79b9).wrapping_add(idx.wrapping_mul(0x85eb_ca6b));
     let mut i = 0;
-    while i < 512 {
+    while i < 4096 {
         x = x.wrapping_mul(0x27d4_eb2f).wrapping_add(0x1656_63b5);
         out[i] = (x >> 24) as u8;
         i += 1;
@@ -56,7 +53,7 @@ fn page_pat(ver: u32, idx: u32, out: &mut [u8; 512]) {
 }
 
 // 0 = untouched-zero, 1 = one complete version, 2 = torn.
-fn verify_page(p: &[u8; 512], idx: u32) -> u8 {
+fn verify_page(p: &[u8; 4096], idx: u32) -> u8 {
     let mut zero = true;
     for &b in p.iter() {
         if b != 0 {
@@ -72,7 +69,7 @@ fn verify_page(p: &[u8; 512], idx: u32) -> u8 {
     if ver == 0 || pi != idx {
         return 2;
     }
-    let mut exp = [0u8; 512];
+    let mut exp = [0u8; 4096];
     page_pat(ver, idx, &mut exp);
     if exp[..] == p[..] {
         1
@@ -102,7 +99,7 @@ fn do_write() -> ! {
     // readiness marker (test.sh §11 polls for this, then sleeps for
     // versions to accumulate before SIGKILL).
     user_lib::print("[TEST] crashwrite running\n");
-    let mut page = [0u8; 512];
+    let mut page = [0u8; 4096];
     let mut ver: u32 = 1;
     loop {
         let fd = user_lib::open(PATH.as_ptr(), user_lib::O_CREATE);
@@ -112,14 +109,14 @@ fn do_write() -> ! {
         let mut i = 0u32;
         while i < NPAGE as u32 {
             page_pat(ver, i, &mut page);
-            if user_lib::lseek(fd, (i as usize * 512) as isize, 0) < 0 {
+            if user_lib::lseek(fd, (i as usize * 4096) as isize, 0) < 0 {
                 user_lib::close(fd);
                 user_lib::exit(1);
             }
             // single 512B write = single journaled sector = atomic
             let mut k = 0;
-            while k < 512 {
-                let r = user_lib::write(fd, unsafe { page.as_ptr().add(k) }, 512 - k);
+            while k < 4096 {
+                let r = user_lib::write(fd, unsafe { page.as_ptr().add(k) }, 4096 - k);
                 if r <= 0 {
                     user_lib::close(fd);
                     user_lib::exit(1);
@@ -144,24 +141,24 @@ fn do_check() -> ! {
         user_lib::print("[TEST] crash FAIL (no file)\n");
         user_lib::exit(1);
     }
-    let mut page = [0u8; 512];
+    let mut page = [0u8; 4096];
     let mut i = 0u32;
     let mut ok = true;
     let mut touched = 0;
     while i < NPAGE as u32 {
-        if user_lib::lseek(fd, (i as usize * 512) as isize, 0) < 0 {
+        if user_lib::lseek(fd, (i as usize * 4096) as isize, 0) < 0 {
             ok = false;
             break;
         }
         let mut k = 0;
-        while k < 512 {
-            let r = user_lib::read(fd, unsafe { page.as_mut_ptr().add(k) }, 512 - k);
+        while k < 4096 {
+            let r = user_lib::read(fd, unsafe { page.as_mut_ptr().add(k) }, 4096 - k);
             if r <= 0 {
                 break;
             }
             k += r as usize;
         }
-        if k != 512 {
+        if k != 4096 {
             ok = false;
             break;
         }

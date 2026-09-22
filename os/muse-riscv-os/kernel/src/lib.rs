@@ -33,9 +33,16 @@ pub fn satp_token(mode: u64, asid: u64, ppn: u64) -> u64 {
 
 // v1.6: journal pure-logic mirror (mirrored in fs/jnl.rs for no_std; the
 // crc binds (seq, lba, data) so torn slot mixes can never validate).
-pub fn jnl_crc(seq: u32, lba: u32, data: &[u8; 512]) -> u32 {
+// v1.8: tx added to the bind; grouping rule mirrored in tests below.
+pub fn jnl_crc(seq: u32, lba: u32, tx: u32, data: &[u8; 512]) -> u32 {
     let mut crc: u32 = 0xffff_ffff;
-    for &b in seq.to_le_bytes().iter().chain(lba.to_le_bytes().iter()).chain(data.iter()) {
+    for &b in seq
+        .to_le_bytes()
+        .iter()
+        .chain(lba.to_le_bytes().iter())
+        .chain(tx.to_le_bytes().iter())
+        .chain(data.iter())
+    {
         crc ^= b as u32;
         for _ in 0..8 {
             let m = if crc & 1 != 0 { 0xedb8_8320 } else { 0 };
@@ -174,13 +181,14 @@ mod tests {
     #[test]
     fn jnl_crc_binds() {
         let d = [0xabu8; 512];
-        let c0 = jnl_crc(7, 100, &d);
+        let c0 = jnl_crc(7, 100, 5, &d);
         let mut d2 = d;
         d2[0] ^= 1;
-        assert_ne!(jnl_crc(7, 100, &d2), c0);
-        assert_ne!(jnl_crc(8, 100, &d), c0);
-        assert_ne!(jnl_crc(7, 101, &d), c0);
-        assert_eq!(jnl_crc(7, 100, &d), c0);
+        assert_ne!(jnl_crc(7, 100, 5, &d2), c0);
+        assert_ne!(jnl_crc(8, 100, 5, &d), c0);
+        assert_ne!(jnl_crc(7, 101, 5, &d), c0);
+        assert_ne!(jnl_crc(7, 100, 6, &d), c0);
+        assert_eq!(jnl_crc(7, 100, 5, &d), c0);
     }
     #[test]
     fn jnl_record_roundtrip() {
@@ -189,12 +197,35 @@ mod tests {
         jnl_w32(&mut a, 0, 0x4a52_4e41);
         jnl_w32(&mut a, 8, 1234);
         jnl_w32(&mut a, 12, 777);
-        jnl_w32(&mut a, 16, jnl_crc(1234, 777, &d));
+        jnl_w32(&mut a, 20, 5);
+        jnl_w32(&mut a, 16, jnl_crc(1234, 777, 5, &d));
         assert_eq!(jnl_r32(&a, 8), 1234);
-        assert_eq!(jnl_crc(jnl_r32(&a, 8), jnl_r32(&a, 12), &d), jnl_r32(&a, 16));
+        assert_eq!(jnl_crc(jnl_r32(&a, 8), jnl_r32(&a, 12), jnl_r32(&a, 20), &d), jnl_r32(&a, 16));
         let mut torn = d;
         torn[511] ^= 0xff;
-        assert_ne!(jnl_crc(1234, 777, &torn), jnl_r32(&a, 16));
+        assert_ne!(jnl_crc(1234, 777, 5, &torn), jnl_r32(&a, 16));
+    }
+    #[test]
+    fn jnl_tx_grouping() {
+        // grouping rule mirror: legacy (tx=0) applies; a TX applies whole
+        // (commit + exact member count) or not at all.
+        struct Rec {
+            tx: u32,
+            committed: bool,
+            count: u32,
+            members: u32,
+        }
+        fn applies(r: &Rec) -> bool {
+            if r.tx == 0 {
+                return true;
+            }
+            r.committed && r.members == r.count
+        }
+        assert!(applies(&Rec { tx: 0, committed: false, count: 0, members: 0 }));
+        assert!(applies(&Rec { tx: 9, committed: true, count: 3, members: 3 }));
+        assert!(!applies(&Rec { tx: 9, committed: false, count: 0, members: 3 }));
+        assert!(!applies(&Rec { tx: 9, committed: true, count: 3, members: 2 }));
+        assert!(!applies(&Rec { tx: 9, committed: true, count: 2, members: 3 }));
     }
     #[test]
     fn dns_compressed_answer() {

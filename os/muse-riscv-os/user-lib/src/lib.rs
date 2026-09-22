@@ -177,6 +177,12 @@ pub fn memstat() -> isize {
     ecall(36, 0, 0, 0)
 }
 
+/// v1.8: uptime_ms (SYS_TIME=44): monotonic ms since boot. No wall clock
+/// (virt has no RTC hardware); good for timeouts, not timestamps.
+pub fn uptime_ms() -> isize {
+    ecall(44, 0, 0, 0)
+}
+
 /// v1.3: UDP sockets (SYS_SOCKET=37 .. SYS_RECV=40). connect takes BE
 /// IPv4 u32 + port; send/recv are datagrams on the connected peer.
 /// send/recv return -2 (WouldBlock) when ARP is unresolved / no packet;
