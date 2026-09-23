@@ -49,6 +49,8 @@ mod real {
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/chroot_test");
     pub const NSTEST_ELF: &[u8] =
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/nstest");
+    pub const CGTEST_ELF: &[u8] =
+        include_bytes!("../../target/riscv64gc-unknown-none-elf/release/cgtest");
     pub const PING_ELF: &[u8] =
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/ping");
 }
@@ -81,6 +83,7 @@ pub fn get_by_name(name: &str) -> Option<Vec<u8>> {
         "ctr" => CTR_ELF,
         "chroot_test" => CHROOTT_ELF,
         "nstest" => NSTEST_ELF,
+        "cgtest" => CGTEST_ELF,
         "ping" => PING_ELF,
         _ => return None,
     };
@@ -138,5 +141,7 @@ pub const CTR_ELF: &[u8] = b"test";
 pub const CHROOTT_ELF: &[u8] = b"test";
 #[cfg(test)]
 pub const NSTEST_ELF: &[u8] = b"test";
+#[cfg(test)]
+pub const CGTEST_ELF: &[u8] = b"test";
 #[cfg(test)]
 pub const PING_ELF: &[u8] = b"test";

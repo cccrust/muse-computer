@@ -55,6 +55,10 @@ pub const SYS_TIME: usize = 44;
 pub const SYS_CHROOT: usize = 45;
 // v2.1: unshare (pid namespace only for now; other flags -> -1).
 pub const SYS_UNSHARE: usize = 46;
+// v2.2: cgroup-lite (create-with-limit / enter / set-limit).
+pub const SYS_CGCREATE: usize = 47;
+pub const SYS_CGENTER: usize = 48;
+pub const SYS_CGLIMIT: usize = 49;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -145,6 +149,9 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_TIME => (crate::timer::ticks() * 10) as isize,
         SYS_CHROOT => sys_chroot(a0) as isize,
         SYS_UNSHARE => sys_unshare(a0) as isize,
+        SYS_CGCREATE => sys_cgcreate(a0 as u64) as isize,
+        SYS_CGENTER => sys_cgenter(a0) as isize,
+        SYS_CGLIMIT => sys_cglimit(a0, a1 as u64) as isize,
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,
@@ -720,12 +727,17 @@ fn sys_sbrk(inc: i32) -> isize {
         let new_brk = old + inc as usize;
         let pid = crate::task::current_pid();
         let root = crate::task::with_current(|p| p.root);
-        crate::mem::alloc_map_user(
+        // v2.2: fallible (cap-hit/OOM returns -1, never panics). Partial
+        // mappings stay mapped (harmless: brk is only advanced on success).
+        if !crate::mem::alloc_map_user(
             root,
             old,
             inc as usize,
             crate::mem::pagetable::PTE_R | crate::mem::pagetable::PTE_W,
-        );
+            crate::task::current_cg(),
+        ) {
+            return -1;
+        }
         crate::task::with_current_mut(|p| {
             p.brk = new_brk;
         });
@@ -792,7 +804,10 @@ fn sys_mmap(_hint: usize, len: usize, prot: usize) -> isize {
     if new_base < brk {
         return -1;
     }
-    crate::mem::alloc_map_user(root, new_base, pages, _flags);
+    // v2.2: fallible (cap-hit/OOM returns -1; frontier untouched on failure).
+    if !crate::mem::alloc_map_user(root, new_base, pages, _flags, crate::task::current_cg()) {
+        return -1;
+    }
     // fresh frames are zeroed by the frame allocator; ensure visibility
     unsafe {
         core::arch::asm!("sfence.vma");
@@ -909,6 +924,35 @@ fn sys_chroot(path_ptr: usize) -> isize {
 /// a new ns; other flags rejected.
 fn sys_unshare(flags: usize) -> isize {
     if crate::task::unshare(flags) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// v2.2: create a child cgroup with a frame limit; returns id or -1.
+/// (usize::MAX from the task layer maps to -1 here.)
+fn sys_cgcreate(limit: u64) -> isize {
+    let id = crate::task::cgcreate(limit);
+    if id == usize::MAX {
+        -1
+    } else {
+        id as isize
+    }
+}
+
+/// v2.2: move self into cgroup id.
+fn sys_cgenter(id: usize) -> isize {
+    if crate::task::cgenter(id) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// v2.2: set the frame limit of cgroup id (0 = unlimited).
+fn sys_cglimit(id: usize, limit: u64) -> isize {
+    if crate::task::cgsetlimit(id, limit) {
         0
     } else {
         -1

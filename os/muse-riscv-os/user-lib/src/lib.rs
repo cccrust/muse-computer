@@ -151,6 +151,19 @@ pub fn unshare(flags: usize) -> isize {
 }
 /// Linux CLONE_NEWPID value (accepted by unshare()).
 pub const CLONE_NEWPID: usize = 0x20000000;
+/// v2.2: cgroup-lite (SYS_CGCREATE=47, CGENTER=48, CGLIMIT=49).
+/// cgcreate(limit_frames) makes a child cgroup with a cap, returns its id
+/// (or -1 when full). cgenter(id) moves self. cglimit(id, lim) sets a cap
+/// (0 = unlimited). No permission model: existence is the only check.
+pub fn cgcreate(limit_frames: usize) -> isize {
+    ecall(47, limit_frames, 0, 0)
+}
+pub fn cgenter(id: isize) -> isize {
+    ecall(48, id as usize, 0, 0)
+}
+pub fn cglimit(id: isize, limit_frames: usize) -> isize {
+    ecall(49, id as usize, limit_frames, 0)
+}
 pub fn getcwd(buf: *mut u8, len: usize) -> isize {
     ecall(25, buf as usize, len, 0)
 }

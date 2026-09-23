@@ -170,14 +170,14 @@ pub fn init() {
         }
         let q = core::cmp::min(max, QDEPTH);
         w32(BLK_BASE, R_QNUM, q as u32);
-        let f0 = match crate::mem::frame::alloc_frame() {
+        let f0 = match crate::mem::frame::alloc_frame_cg(0) {
             Some(p) => p,
             None => {
                 crate::println!("[VIRTIO] oom queue");
                 return;
             }
         };
-        let f1 = match crate::mem::frame::alloc_frame() {
+        let f1 = match crate::mem::frame::alloc_frame_cg(0) {
             Some(p) => p,
             None => {
                 crate::println!("[VIRTIO] oom queue used");

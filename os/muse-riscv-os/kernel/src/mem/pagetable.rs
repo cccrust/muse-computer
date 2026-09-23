@@ -31,19 +31,23 @@ pub fn pte_flags(pte: u64) -> u64 {
 
 /// Map a VA range in the page table rooted at `root_pa`.
 /// root_pa: physical address of root page table (4K aligned).
-pub fn map(root_pa: usize, va: usize, pa: usize, len: usize, flags: u64) {
+/// v2.2: `cg` charges fresh table pages (false on OOM instead of panic).
+pub fn map(root_pa: usize, va: usize, pa: usize, len: usize, flags: u64, cg: usize) -> bool {
     let mut off = 0usize;
     while off < len {
-        map_one(root_pa, va + off, pa + off, flags);
+        if !map_one(root_pa, va + off, pa + off, flags, cg) {
+            return false;
+        }
         off += PAGE_SIZE;
     }
+    true
 }
 
 fn table_at(pa: usize) -> *mut u64 {
     pa as *mut u64
 }
 
-pub fn map_one(root_pa: usize, va: usize, pa: usize, flags: u64) {
+pub fn map_one(root_pa: usize, va: usize, pa: usize, flags: u64, cg: usize) -> bool {
     let mut cur = root_pa;
     for level in [2, 1].iter().cloned() {
         let idx = vpn(va, level);
@@ -51,12 +55,13 @@ pub fn map_one(root_pa: usize, va: usize, pa: usize, flags: u64) {
             let t = table_at(cur);
             let e = *t.add(idx);
             if e & PTE_V == 0 {
-                match crate::mem::frame::alloc_frame() {
+                match crate::mem::frame::alloc_frame_cg(cg) {
                     Some(npa) => {
                         *t.add(idx) = pte_new(npa, PTE_V);
                         cur = npa;
                     }
-                    None => panic!("out of frames in map"),
+                    // v2.2: OOM/cap-hit returns false (was panic).
+                    None => return false,
                 }
             } else {
                 cur = pte_pa(e);
@@ -68,6 +73,7 @@ pub fn map_one(root_pa: usize, va: usize, pa: usize, flags: u64) {
         let t = table_at(cur);
         *t.add(idx) = pte_new(pa, flags | PTE_V | PTE_A | PTE_D);
     }
+    true
 }
 
 /// Translate VA -> PA using root table. Returns None if unmapped.
@@ -94,8 +100,10 @@ pub fn translate(root_pa: usize, va: usize) -> Option<usize> {
 }
 
 /// Clone all user (U-flag) leaves from src root into a fresh root.
-/// Returns new root pa. Kernel (non-U) mappings are re-created by caller.
-pub fn clone_user(src_root: usize, dst_root: usize) {
+/// Fresh frames (copies + tables) charge to `cg`. Returns false if any
+/// allocation failed (v2.2: was silent partial-copy; caller cleans up).
+/// Kernel (non-U) mappings are re-created by caller.
+pub fn clone_user(src_root: usize, dst_root: usize, cg: usize) -> bool {
     for v2 in 0..512 {
         let e2 = unsafe { *(table_at(src_root) as *const u64).add(v2) };
         if e2 & PTE_V == 0 {
@@ -110,7 +118,10 @@ pub fn clone_user(src_root: usize, dst_root: usize) {
         }
         let l1 = pte_pa(e2);
         // ensure dst l1
-        let dst_l1 = ensure_next(dst_root, v2);
+        let dst_l1 = match ensure_next(dst_root, v2, cg) {
+            Some(t) => t,
+            None => return false,
+        };
         for v1 in 0..512 {
             let e1 = unsafe { *(table_at(l1) as *const u64).add(v1) };
             if e1 & PTE_V == 0 {
@@ -120,7 +131,10 @@ pub fn clone_user(src_root: usize, dst_root: usize) {
                 continue; // no 2M leaves
             }
             let l0 = pte_pa(e1);
-            let dst_l0 = ensure_next(dst_l1, v1);
+            let dst_l0 = match ensure_next(dst_l1, v1, cg) {
+                Some(t) => t,
+                None => return false,
+            };
             for v0 in 0..512 {
                 let e0 = unsafe { *(table_at(l0) as *const u64).add(v0) };
                 if e0 & PTE_V == 0 {
@@ -130,7 +144,7 @@ pub fn clone_user(src_root: usize, dst_root: usize) {
                     continue;
                 }
                 // copy page
-                if let Some(npa) = crate::mem::frame::alloc_frame() {
+                if let Some(npa) = crate::mem::frame::alloc_frame_cg(cg) {
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             pte_pa(e0) as *const u8,
@@ -140,22 +154,26 @@ pub fn clone_user(src_root: usize, dst_root: usize) {
                         let flags = pte_flags(e0);
                         *(table_at(dst_l0).add(v0)) = pte_new(npa, flags);
                     }
+                } else {
+                    return false;
                 }
             }
         }
     }
+    true
 }
 
-fn ensure_next(root: usize, idx: usize) -> usize {
+fn ensure_next(root: usize, idx: usize, cg: usize) -> Option<usize> {
     unsafe {
         let t = table_at(root);
         let e = *t.add(idx);
         if e & PTE_V == 0 {
-            let npa = crate::mem::frame::alloc_frame().expect("oom ensure");
+            // v2.2: fallible (was expect); table pages charge to cg.
+            let npa = crate::mem::frame::alloc_frame_cg(cg)?;
             *t.add(idx) = pte_new(npa, PTE_V);
-            npa
+            Some(npa)
         } else {
-            pte_pa(e)
+            Some(pte_pa(e))
         }
     }
 }

@@ -67,6 +67,9 @@ pub struct Proc {
     pub mmap_base: usize, // v0.8: top-down anonymous mmap frontier
     pub brk_min: usize,   // v0.8: sbrk may not shrink below this
     pub traced: bool,     // v0.9: strace-lite prints this proc's syscalls
+    // v2.2: cgroup id (frame accounting + memory cap; 0 = root, unlimited).
+    // Inherited across fork; kept across exec.
+    pub cg: usize,
     // v2.1: pid namespace. `ns` indexes Sched.ns (0 = root/init ns);
     // `lpid` is the in-namespace pid (root ns: == global pid, identity).
     // `pending_ns` = unshare() armed: next forked child founds a new ns.
@@ -98,6 +101,16 @@ struct Sched {
     // v2.1: pid namespaces (under the big lock -- no new lock, no new order).
     // ns[0] is the root namespace, pre-created at init.
     ns: Vec<Ns>,
+    // v2.2: cgroup parent linkage (flat enforcement in v2.2; hierarchy is
+    // bookkeeping for later). cg[0] is root. Limits live mirrored in
+    // frame.rs (single-lock check); this table only structures ids.
+    cg: Vec<Cg>,
+}
+
+/// v2.2: cgroup descriptor (metadata only; usage+limits live in frame.rs
+/// under the ALLOC lock -- see _doc/v2.2.md for why they must not live here).
+pub struct Cg {
+    pub parent: usize,
 }
 
 // v1.1: successful cross-hart steals (informational; printed at halt).
@@ -206,6 +219,79 @@ pub fn current_lpid() -> usize {
         .and_then(|o| o.as_ref())
         .map(|p| p.lpid)
         .unwrap_or(cur)
+}
+
+/// v2.2: cgroup of current (what frame charges bill to). Scheduler
+/// inactive (boot) or no current task -> 0 (root, unlimited).
+/// Safe to call with NO locks held (takes + releases sched_lock); NEVER
+/// call it while holding sched_lock (non-reentrant) -- all mem-alloc call
+/// sites are lock-free by construction (see _doc/v2.2.md).
+pub fn current_cg() -> usize {
+    if !scheduler_active() {
+        return 0;
+    }
+    let s = sched_lock();
+    let cur = s.current[hartid() % crate::MAX_HART];
+    s.procs
+        .get(cur)
+        .and_then(|o| o.as_ref())
+        .map(|p| p.cg)
+        .unwrap_or(0)
+}
+
+/// v2.2: create a child cgroup of the caller's, with a frame limit
+/// (0 = unlimited). Returns the new id, or usize::MAX if table full.
+/// Limit is mirrored into frame.rs under its own lock (sequential, never
+/// nested with sched_lock).
+pub fn cgcreate(limit: u64) -> usize {
+    let id = {
+        let mut s = sched_lock();
+        let cur = s.current[hartid() % crate::MAX_HART];
+        let parent = s
+            .procs
+            .get(cur)
+            .and_then(|o| o.as_ref())
+            .map(|p| p.cg)
+            .unwrap_or(0);
+        if s.cg.len() >= crate::mem::frame::MAX_CG {
+            return usize::MAX;
+        }
+        let id = s.cg.len();
+        s.cg.push(Cg { parent });
+        id
+    };
+    crate::mem::frame::set_cg_limit(id, limit);
+    id
+}
+
+/// v2.2: move self into cgroup `id` (must exist). Flat permission model
+/// (no users): existence is the only check.
+pub fn cgenter(id: usize) -> bool {
+    let mut s = sched_lock();
+    if id >= s.cg.len() {
+        return false;
+    }
+    let cur = s.current[hartid() % crate::MAX_HART];
+    match s.procs.get_mut(cur).and_then(|o| o.as_mut()) {
+        Some(p) => {
+            p.cg = id;
+            true
+        }
+        None => false,
+    }
+}
+
+/// v2.2: set the frame limit of cgroup `id` (0 = unlimited). Flat
+/// permission model: existence is the only check.
+pub fn cgsetlimit(id: usize, limit: u64) -> bool {
+    {
+        let s = sched_lock();
+        if id >= s.cg.len() {
+            return false;
+        }
+    }
+    crate::mem::frame::set_cg_limit(id, limit);
+    true
 }
 
 /// v2.1: arm one-shot namespace creation for the next forked child.
@@ -320,7 +406,12 @@ fn kick_idle() {
 }
 
 fn alloc_tf() -> usize {
-    crate::mem::frame::alloc_frame().expect("oom tf")
+    crate::mem::frame::alloc_frame_cg(0).expect("oom tf")
+}
+
+/// v2.2: fallible TF alloc for fork paths (charged to cg).
+fn alloc_tf_cg(cg: usize) -> Option<usize> {
+    crate::mem::frame::alloc_frame_cg(cg)
 }
 
 fn tf_of(proc: &Proc) -> *mut TrapFrame {
@@ -343,6 +434,8 @@ pub fn init() {
             idle: [false; crate::MAX_HART],
             // v2.1: root pid namespace pre-created (id 0).
             ns: alloc::vec![Ns { parent: 0, next: 1 }],
+            // v2.2: root cgroup pre-created (id 0, unlimited).
+            cg: alloc::vec![Cg { parent: 0 }],
         }));
     }
     // create init from embedded ELF
@@ -357,20 +450,32 @@ pub fn init() {
     // pre-spawn shell test tasks? init will exec sh
 }
 
-fn new_proc(name: &str, parent: usize) -> (usize, usize, usize) {
-    // returns (pid, root, tf_pa)
+fn new_proc(name: &str, parent: usize, cg: usize) -> Option<(usize, usize, usize)> {
+    // returns (pid, root, tf_pa). Frames first, pid last (no pid leak on
+    // OOM); partial roots are torn down via free_user_space (never leaks
+    // into a cap-exhaustion loop -- see _doc/v2.2.md).
+    let root = mem::new_user_space(cg)?;
+    let tf_pa = match alloc_tf_cg(cg) {
+        Some(t) => t,
+        None => {
+            crate::mem::free_user_space(root);
+            return None;
+        }
+    };
+    // map TF VA -> tf_pa (S-only RW, no U)
+    if !pt::map_one(root, TRAPFRAME_VA, tf_pa, pt::PTE_R | pt::PTE_W, cg) {
+        crate::mem::frame::dealloc_frame(tf_pa);
+        crate::mem::free_user_space(root);
+        return None;
+    }
     let mut s = sched_lock();
     let pid = s.next_pid;
     s.next_pid += 1;
-    let root = mem::new_user_space();
-    let tf_pa = alloc_tf();
-    // map TF VA -> tf_pa (S-only RW, no U)
-    pt::map_one(root, TRAPFRAME_VA, tf_pa, pt::PTE_R | pt::PTE_W);
     // reserve slot
     while s.procs.len() <= pid {
         s.procs.push(None);
     }
-    (pid, root, tf_pa)
+    Some((pid, root, tf_pa))
 }
 
 fn finish_spawn(
@@ -381,14 +486,18 @@ fn finish_spawn(
     name: &str,
     entry: usize,
     brk: usize,
+    cg: usize,
 ) {
-    // map user stack
-    mem::alloc_map_user(
+    // map user stack (spawn path is boot-only: OOM is fatal, panic loudly)
+    if !mem::alloc_map_user(
         root,
         USER_STACK_TOP - USER_STACK_PAGES * 4096,
         USER_STACK_PAGES * 4096,
         pt::PTE_R | pt::PTE_W,
-    );
+        cg,
+    ) {
+        panic!("spawn oom stack");
+    }
     // init TF (via PA, identity); empty argv+env on stack
     let sp = push_args(root, &[], &[]);
     unsafe {
@@ -476,6 +585,8 @@ fn finish_spawn(
         ns: 0,
         lpid: pid,
         pending_ns: false,
+        // v2.2: spawn (init only) lives in the root cgroup (unlimited).
+        cg: 0,
     };
     s.procs[pid] = Some(proc);
     if parent != 0 {
@@ -514,20 +625,26 @@ fn finish_spawn(
 }
 
 pub fn spawn_from_elf(name: &str, elf_bytes: &[u8], parent: usize) -> usize {
-    let (pid, root, tf_pa) = new_proc(name, parent);
+    // v2.2: init-only spawn charges cgroup 0 (boot; scheduler inactive).
+    // Boot OOM is fatal (expect), same as before.
+    let (pid, root, tf_pa) = new_proc(name, parent, 0).expect("spawn oom");
     let info = elf::parse(elf_bytes).expect("bad elf");
     let mut brk = 0usize;
     for i in 0..info.nprog {
         let p = &info.progs[i];
         let flags = elf::pte_flags_for(p.flags);
-        // map + copy
-        mem::map_user(root, p.vaddr, &elf_bytes[p.offset..p.offset + p.filesz], flags);
+        // map + copy (boot-only: OOM is fatal, panic loudly)
+        if !mem::map_user(root, p.vaddr, &elf_bytes[p.offset..p.offset + p.filesz], flags, 0) {
+            panic!("spawn oom seg");
+        }
         // zero bss part
         if p.memsz > p.filesz {
             let zb = p.vaddr + p.filesz;
             let zl = p.memsz - p.filesz;
             // ensure mapped
-            mem::alloc_map_user(root, zb, zl, flags);
+            if !mem::alloc_map_user(root, zb, zl, flags, 0) {
+                panic!("spawn oom bss");
+            }
             // zero via translate loop
             for k in 0..zl {
                 let va = zb + k;
@@ -553,7 +670,7 @@ pub fn spawn_from_elf(name: &str, elf_bytes: &[u8], parent: usize) -> usize {
     // on the target root directly (page table walk, no satp switch), so it works
     // even when satp=kernel. translate walks target root tables. Good.
     // But copy in map_user also uses translate on target root -> works. OK.
-    finish_spawn(pid, parent, root, tf_pa, name, info.entry, brk.max(0x20000));
+    finish_spawn(pid, parent, root, tf_pa, name, info.entry, brk.max(0x20000), 0);
     pid
 }
 
@@ -628,17 +745,27 @@ fn push_args(root: usize, args: &[Vec<u8>], env: &[Vec<u8>]) -> usize {
     sp
 }
 
-/// Fork current process. Returns child pid. Caller sets child a0=0.
+/// Fork current process. Returns child pid (usize::MAX on OOM/cap-hit;
+/// user callers already treat <0 as failure). Caller sets child a0=0.
 pub fn fork(parent_pid: usize) -> usize {
     // gather parent info without holding lock across allocs
-    let (p_root, p_tf, p_brk, p_kind, p_fds, p_off, p_path, pname, p_cwd, p_cwd_len, p_cloexec, p_mmap_base, p_brk_min, p_fsroot, p_fsroot_len) = {
+    let (p_root, p_tf, p_brk, p_kind, p_fds, p_off, p_path, pname, p_cwd, p_cwd_len, p_cloexec, p_mmap_base, p_brk_min, p_fsroot, p_fsroot_len, p_cg) = {
         let s = sched_lock();
         let p = s.procs[parent_pid].as_ref().expect("no parent").clone_proc_info();
         p
     };
-    let (child, root, tf_pa) = new_proc("fork-child", parent_pid);
+    // v2.2: fallible construction (cap-hit/OOM); partial roots are torn
+    // down here so failures can't leak into an exhaustion loop.
+    let (child, root, tf_pa) = match new_proc("fork-child", parent_pid, p_cg) {
+        Some(t) => t,
+        None => return usize::MAX,
+    };
     // clone user mappings (U leaves)
-    pt::clone_user(p_root, root);
+    if !pt::clone_user(p_root, root, p_cg) {
+        crate::mem::frame::dealloc_frame(tf_pa);
+        crate::mem::free_user_space(root);
+        return usize::MAX;
+    }
     // map TF
     // (new_proc already mapped TF VA)
     // copy TF content, child return 0
@@ -714,6 +841,8 @@ pub fn fork(parent_pid: usize) -> usize {
         ns: cns,
         lpid: clpid,
         pending_ns: false,
+        // v2.2: cgroup follows the parent (limits are hierarchical fate-sharing)
+        cg: p_cg,
     };
     s.procs[child] = Some(proc);
     if let Some(Some(pp)) = s.procs.get_mut(parent_pid) {
@@ -730,6 +859,8 @@ pub fn fork(parent_pid: usize) -> usize {
 
 /// Exec path in current process with argv+env. Both must already be copied
 /// out of user memory (address space is replaced here).
+/// v2.2: fallible (cap-hit/OOM): the partial new root is torn down and
+/// false returned (old address space untouched -- exec is atomic here).
 pub fn exec(pid: usize, path: &str, args: &[Vec<u8>], env: &[Vec<u8>]) -> bool {
     let data = match crate::fs::read_file(path) {
         Some(d) => d,
@@ -739,40 +870,73 @@ pub fn exec(pid: usize, path: &str, args: &[Vec<u8>], env: &[Vec<u8>]) -> bool {
         Some(i) => i,
         None => return false,
     };
-    // new address space
-    let new_root = mem::new_user_space();
+    // new address space, charged to our own cgroup (no lock held here).
+    let cg = current_cg();
+    let new_root = match mem::new_user_space(cg) {
+        Some(r) => r,
+        None => return false,
+    };
     let tf_pa = {
         let s = sched_lock();
-        s.procs[pid].as_ref().unwrap().tf_pa
-    };
-    // remap TF into new root
-    pt::map_one(new_root, TRAPFRAME_VA, tf_pa, pt::PTE_R | pt::PTE_W);
-    let mut brk = 0usize;
-    for i in 0..info.nprog {
-        let p = &info.progs[i];
-        let flags = elf::pte_flags_for(p.flags);
-        mem::map_user(new_root, p.vaddr, &data[p.offset..p.offset + p.filesz], flags);
-        if p.memsz > p.filesz {
-            let zb = p.vaddr + p.filesz;
-            let zl = p.memsz - p.filesz;
-            mem::alloc_map_user(new_root, zb, zl, flags);
-            for k in 0..zl {
-                write_byte_to(new_root, zb + k, 0);
+        match s.procs.get(pid).and_then(|o| o.as_ref()) {
+            Some(p) => p.tf_pa,
+            None => {
+                crate::mem::free_user_space(new_root);
+                return false;
             }
         }
-        // v0.11: enforce segment permissions (see spawn path above).
-        pt::protect(new_root, p.vaddr, p.memsz, flags);
-        let end = (p.vaddr + p.memsz + 0xfff) & !0xfff;
-        if end > brk {
-            brk = end;
+    };
+    // NOTE: every fallible step below jumps to `fail`, which tears down
+    // the partial root. Keep them in one linear chain (no early returns
+    // past this point) so cleanup can't be skipped.
+    let ok = (|| {
+        // remap TF into new root
+        if !pt::map_one(new_root, TRAPFRAME_VA, tf_pa, pt::PTE_R | pt::PTE_W, cg) {
+            return None;
         }
-    }
-    mem::alloc_map_user(
+        let mut brk = 0usize;
+        for i in 0..info.nprog {
+            let p = &info.progs[i];
+            let flags = elf::pte_flags_for(p.flags);
+            if !mem::map_user(new_root, p.vaddr, &data[p.offset..p.offset + p.filesz], flags, cg) {
+                return None;
+            }
+            if p.memsz > p.filesz {
+                let zb = p.vaddr + p.filesz;
+                let zl = p.memsz - p.filesz;
+                if !mem::alloc_map_user(new_root, zb, zl, flags, cg) {
+                    return None;
+                }
+                for k in 0..zl {
+                    write_byte_to(new_root, zb + k, 0);
+                }
+            }
+            // v0.11: enforce segment permissions (see spawn path above).
+            pt::protect(new_root, p.vaddr, p.memsz, flags);
+            let end = (p.vaddr + p.memsz + 0xfff) & !0xfff;
+            if end > brk {
+                brk = end;
+            }
+        }
+        Some(brk)
+    })();
+    let brk = match ok {
+        Some(b) => b,
+        None => {
+            crate::mem::free_user_space(new_root);
+            return false;
+        }
+    };
+    if !mem::alloc_map_user(
         new_root,
         USER_STACK_TOP - USER_STACK_PAGES * 4096,
         USER_STACK_PAGES * 4096,
         pt::PTE_R | pt::PTE_W,
-    );
+        cg,
+    ) {
+        crate::mem::free_user_space(new_root);
+        return false;
+    }
     // reset TF with argv+env on stack
     let sp = push_args(new_root, args, env);
     unsafe {
@@ -1355,7 +1519,7 @@ static mut IDLE_TF_PA: [usize; crate::MAX_HART] = [0; crate::MAX_HART];
 /// Allocate per-hart idle TF frames. Boot hart only, before APs start.
 pub fn idle_init() {
     for h in 0..crate::MAX_HART {
-        let pa = crate::mem::frame::alloc_frame().expect("oom idle tf");
+        let pa = crate::mem::frame::alloc_frame_cg(0).expect("oom idle tf");
         let tf = pa as *mut TrapFrame;
         unsafe {
             *tf = TrapFrame::empty();
@@ -1660,6 +1824,7 @@ trait CloneInfo {
         usize,
         [u8; 128],
         usize,
+        usize,
     );
 }
 impl CloneInfo for Proc {
@@ -1681,6 +1846,7 @@ impl CloneInfo for Proc {
         usize,
         [u8; 128],
         usize,
+        usize,
     ) {
         (
             self.root,
@@ -1698,6 +1864,7 @@ impl CloneInfo for Proc {
             self.brk_min,
             self.fsroot,
             self.fsroot_len,
+            self.cg,
         )
     }
 }

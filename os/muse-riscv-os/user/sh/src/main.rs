@@ -1161,6 +1161,7 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     run_one(b"/bin/smp_test\0", &mut jobs);
     run_one(b"/bin/chroot_test\0", &mut jobs);
     run_one(b"/bin/nstest\0", &mut jobs);
+    run_one(b"/bin/cgtest\0", &mut jobs);
     run_one(b"/bin/reclaim_test\0", &mut jobs);
     run_one(b"/bin/stress\0", &mut jobs);
     // v1.5: webserver backgrounds (never exits by design); the test

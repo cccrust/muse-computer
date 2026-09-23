@@ -290,7 +290,7 @@ fn main() {
     let names = [
         "init", "sh", "ls", "cat", "echo", "grep", "fork_test", "pipe_test", "usertests",
         "persist", "printenv", "smp_test", "reclaim_test", "stress", "udpping", "webserver",
-        "crashwrite", "nslookup", "wget", "curl", "ctr", "chroot_test", "nstest", "ping",
+        "crashwrite", "nslookup", "wget", "curl", "ctr", "chroot_test", "nstest", "cgtest", "ping",
     ];
     let mut img = Image::new(names.len() + 1); // + README
     for n in names {

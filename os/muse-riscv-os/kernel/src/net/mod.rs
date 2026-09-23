@@ -278,8 +278,8 @@ fn qsetup(base: usize, qsel: usize) -> Option<(usize, usize)> {
         }
         let q = core::cmp::min(max, V::QDEPTH);
         V::w32(base, V::R_QNUM, q as u32);
-        let f0 = crate::mem::frame::alloc_frame()?;
-        let f1 = crate::mem::frame::alloc_frame()?;
+        let f0 = crate::mem::frame::alloc_frame_cg(0)?;
+        let f1 = crate::mem::frame::alloc_frame_cg(0)?;
         V::w16(f0, 0);
         V::w16(f0 + 2, 0);
         V::w16(f1, 0);

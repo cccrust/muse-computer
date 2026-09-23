@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cgtest"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
 name = "chroot_test"
 version = "0.1.0"
 dependencies = [

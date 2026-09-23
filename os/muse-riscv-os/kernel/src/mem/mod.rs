@@ -27,65 +27,69 @@ fn addr(f: unsafe extern "C" fn()) -> usize {
 
 pub fn init_kernel_space() {
     unsafe {
-        let root = crate::mem::frame::alloc_frame().expect("no frame for root");
+        let root = crate::mem::frame::alloc_frame_cg(0).expect("no frame for root");
         crate::println!("[MM] root={:#x}", root);
         // .text RX
-        pt::map(
+        assert!(pt::map(
             root,
             addr(_stext),
             addr(_stext),
             addr(_etext) - addr(_stext),
             pt::PTE_R | pt::PTE_X,
-        );
+            0,
+        ));
         crate::println!("[MM] text mapped");
         // .rodata R
-        pt::map(
+        assert!(pt::map(
             root,
             addr(_srodata),
             addr(_srodata),
             (addr(_erodata) - addr(_srodata)).max(4096),
             pt::PTE_R,
-        );
+            0,
+        ));
         crate::println!("[MM] rodata mapped");
         // .data RW
-        pt::map(
+        assert!(pt::map(
             root,
             addr(_sdata),
             addr(_sdata),
             (addr(_edata) - addr(_sdata)).max(4096),
             pt::PTE_R | pt::PTE_W,
-        );
+            0,
+        ));
         crate::println!("[MM] data mapped");
         // .bss RW
-        pt::map(
+        assert!(pt::map(
             root,
             addr(_sbss),
             addr(_sbss),
             (addr(_ebss) - addr(_sbss)).max(4096),
             pt::PTE_R | pt::PTE_W,
-        );
+            0,
+        ));
         crate::println!("[MM] bss mapped");
         // whole RAM identity RW (frames, stacks)
         // 0x80000000..0x88000000
         let mut a = 0x8000_0000usize;
         while a < 0x8800_0000 {
-            pt::map_one(root, a, a, pt::PTE_R | pt::PTE_W | pt::PTE_X);
+            assert!(pt::map_one(root, a, a, pt::PTE_R | pt::PTE_W | pt::PTE_X, 0));
             a += 4096;
         }
         crate::println!("[MM] ram mapped");
         // UART + VIRTIO MMIO
-        pt::map_one(root, 0x1000_0000, 0x1000_0000, pt::PTE_R | pt::PTE_W);
-        pt::map_one(root, 0x1000_1000, 0x1000_1000, pt::PTE_R | pt::PTE_W);
+        assert!(pt::map_one(root, 0x1000_0000, 0x1000_0000, pt::PTE_R | pt::PTE_W, 0));
+        assert!(pt::map_one(root, 0x1000_1000, 0x1000_1000, pt::PTE_R | pt::PTE_W, 0));
         // test MMIO range for virtio (0x10001000..0x10008000)
         let mut m = 0x1000_1000usize;
         while m < 0x1000_8000 {
-            pt::map_one(root, m, m, pt::PTE_R | pt::PTE_W);
+            assert!(pt::map_one(root, m, m, pt::PTE_R | pt::PTE_W, 0));
             m += 4096;
         }
         // PLIC (0x0c000000..0x0c300000): priority + enable + threshold/claim
         let mut p = 0x0c00_0000usize;
         while p < 0x0c30_0000 {
-            pt::map_one(root, p, p, pt::PTE_R | pt::PTE_W);
+            assert!(pt::map_one(root, p, p, pt::PTE_R | pt::PTE_W, 0));
             p += 4096;
         }
         crate::println!("[MM] mmio mapped, activating...");
@@ -97,16 +101,20 @@ pub fn init_kernel_space() {
 
 /// Build a fresh user-capable address space: clones kernel mappings
 /// (by re-mapping same kernel ranges) and returns new root.
-pub fn new_user_space() -> usize {
+/// v2.2: fallible (fresh table pages charge to cg); None on OOM/cap-hit.
+pub fn new_user_space(cg: usize) -> Option<usize> {
     unsafe {
-        let root = crate::mem::frame::alloc_frame().expect("no frame user root");
+        let root = crate::mem::frame::alloc_frame_cg(cg)?;
         // copy kernel mappings wholesale (non-U leaves + tables)
-        copy_kernel_tables(KERNEL_ROOT, root);
-        root
+        if !copy_kernel_tables(KERNEL_ROOT, root, cg) {
+            crate::mem::frame::dealloc_frame(root);
+            return None;
+        }
+        Some(root)
     }
 }
 
-fn copy_kernel_tables(src: usize, dst: usize) {
+fn copy_kernel_tables(src: usize, dst: usize, cg: usize) -> bool {
     // copy only non-U entries (tables + leaves)
     for v2 in 0..512 {
         let e2 = unsafe { *((src as *const u64).add(v2)) };
@@ -126,7 +134,10 @@ fn copy_kernel_tables(src: usize, dst: usize) {
         }
         let s1 = pt::pte_pa(e2);
         // check if this subtree contains any non-U leaf; if so clone table
-        let d1 = ensure_table(dst, v2);
+        let d1 = match ensure_table(dst, v2, cg) {
+            Some(t) => t,
+            None => return false,
+        };
         for v1 in 0..512 {
             let e1 = unsafe { *((s1 as *const u64).add(v1)) };
             if e1 & pt::PTE_V == 0 {
@@ -141,7 +152,10 @@ fn copy_kernel_tables(src: usize, dst: usize) {
                 continue;
             }
             let s0 = pt::pte_pa(e1);
-            let d0 = ensure_table(d1, v1);
+            let d0 = match ensure_table(d1, v1, cg) {
+                Some(t) => t,
+                None => return false,
+            };
             for v0 in 0..512 {
                 let e0 = unsafe { *((s0 as *const u64).add(v0)) };
                 if e0 & pt::PTE_V == 0 {
@@ -155,31 +169,39 @@ fn copy_kernel_tables(src: usize, dst: usize) {
             }
         }
     }
+    true
 }
 
-fn ensure_table(root: usize, idx: usize) -> usize {
+fn ensure_table(root: usize, idx: usize, cg: usize) -> Option<usize> {
     unsafe {
         let t = root as *mut u64;
         let e = *t.add(idx);
         if e & pt::PTE_V == 0 {
-            let npa = crate::mem::frame::alloc_frame().expect("oom ktab");
+            let npa = crate::mem::frame::alloc_frame_cg(cg)?;
             *t.add(idx) = pt::pte_new(npa, pt::PTE_V);
-            npa
+            Some(npa)
         } else {
-            pt::pte_pa(e)
+            Some(pt::pte_pa(e))
         }
     }
 }
 
-/// Map user ELF segment + stack + trapframe helpers
-pub fn map_user(root: usize, va: usize, data: &[u8], flags: u64) {
+/// Map user ELF segment + stack + trapframe helpers.
+/// v2.2: fallible (false on OOM/cap-hit); caller cleans up + propagates.
+pub fn map_user(root: usize, va: usize, data: &[u8], flags: u64, cg: usize) -> bool {
     let start = va & !0xfff;
     let end = (va + data.len() + 0xfff) & !0xfff;
     let mut cur = start;
     while cur < end {
         if pt::translate(root, cur).is_none() {
-            let pa = crate::mem::frame::alloc_frame().expect("oom user");
-            pt::map_one(root, cur, pa, flags | pt::PTE_U);
+            let pa = match crate::mem::frame::alloc_frame_cg(cg) {
+                Some(p) => p,
+                None => return false,
+            };
+            if !pt::map_one(root, cur, pa, flags | pt::PTE_U, cg) {
+                crate::mem::frame::dealloc_frame(pa);
+                return false;
+            }
         }
         cur += 4096;
     }
@@ -191,19 +213,27 @@ pub fn map_user(root: usize, va: usize, data: &[u8], flags: u64) {
             *(p as *mut u8) = *b;
         }
     }
+    true
 }
 
-pub fn alloc_map_user(root: usize, va: usize, len: usize, flags: u64) {
+pub fn alloc_map_user(root: usize, va: usize, len: usize, flags: u64, cg: usize) -> bool {
     let start = va & !0xfff;
     let end = (va + len + 0xfff) & !0xfff;
     let mut cur = start;
     while cur < end {
         if pt::translate(root, cur).is_none() {
-            let pa = crate::mem::frame::alloc_frame().expect("oom umap");
-            pt::map_one(root, cur, pa, flags | pt::PTE_U);
+            let pa = match crate::mem::frame::alloc_frame_cg(cg) {
+                Some(p) => p,
+                None => return false,
+            };
+            if !pt::map_one(root, cur, pa, flags | pt::PTE_U, cg) {
+                crate::mem::frame::dealloc_frame(pa);
+                return false;
+            }
         }
         cur += 4096;
     }
+    true
 }
 
 /// v1.2: tear down a dead user address space. Walks L2/L1/L0 (mirror of
