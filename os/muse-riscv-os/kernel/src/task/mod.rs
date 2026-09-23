@@ -58,6 +58,11 @@ pub struct Proc {
     pub wake_at: u64,
     pub cwd: [u8; 128],
     pub cwd_len: usize,
+    // v2.0: filesystem root jail (container groundwork). Absolute paths
+    // anchor here, ".." clamps here. NB: `root: usize` above is the page
+    // table root -- different thing, hence the longer name.
+    pub fsroot: [u8; 128],
+    pub fsroot_len: usize,
     pub fd_cloexec: [bool; 16],
     pub mmap_base: usize, // v0.8: top-down anonymous mmap frontier
     pub brk_min: usize,   // v0.8: sbrk may not shrink below this
@@ -402,6 +407,13 @@ fn finish_spawn(
             }
         },
         cwd_len: 1,
+        // v2.0: fresh procs start unjailed; parent==0 only at boot.
+        fsroot: {
+            let mut c = [0u8; 128];
+            c[0] = b'/';
+            c
+        },
+        fsroot_len: 1,
         fd_cloexec: [false; 16],
         // v0.8: mmap grows down from below the user stack; brk floor =
         // initial brk (brk is finish_spawn's param, in scope here)
@@ -411,9 +423,17 @@ fn finish_spawn(
     };
     s.procs[pid] = Some(proc);
     if parent != 0 {
-        // inherit cwd from parent (lock already held, direct index)
+        // inherit cwd + fsroot from parent (lock already held, direct index)
         let (cc, cl) = match s.procs.get(parent).and_then(|o| o.as_ref()) {
             Some(p) => (p.cwd, p.cwd_len),
+            None => {
+                let mut c = [0u8; 128];
+                c[0] = b'/';
+                (c, 1)
+            }
+        };
+        let (rc, rl) = match s.procs.get(parent).and_then(|o| o.as_ref()) {
+            Some(p) => (p.fsroot, p.fsroot_len),
             None => {
                 let mut c = [0u8; 128];
                 c[0] = b'/';
@@ -423,6 +443,8 @@ fn finish_spawn(
         if let Some(Some(me)) = s.procs.get_mut(pid) {
             me.cwd = cc;
             me.cwd_len = cl;
+            me.fsroot = rc;
+            me.fsroot_len = rl;
         }
         if let Some(Some(pp)) = s.procs.get_mut(parent) {
             pp.children.push(pid);
@@ -553,7 +575,7 @@ fn push_args(root: usize, args: &[Vec<u8>], env: &[Vec<u8>]) -> usize {
 /// Fork current process. Returns child pid. Caller sets child a0=0.
 pub fn fork(parent_pid: usize) -> usize {
     // gather parent info without holding lock across allocs
-    let (p_root, p_tf, p_brk, p_kind, p_fds, p_off, p_path, pname, p_cwd, p_cwd_len, p_cloexec, p_mmap_base, p_brk_min) = {
+    let (p_root, p_tf, p_brk, p_kind, p_fds, p_off, p_path, pname, p_cwd, p_cwd_len, p_cloexec, p_mmap_base, p_brk_min, p_fsroot, p_fsroot_len) = {
         let s = sched_lock();
         let p = s.procs[parent_pid].as_ref().expect("no parent").clone_proc_info();
         p
@@ -595,6 +617,9 @@ pub fn fork(parent_pid: usize) -> usize {
         name: nb,
         cwd: p_cwd,
         cwd_len: p_cwd_len,
+        // v2.0: jail follows the parent (a child cannot escape by forking)
+        fsroot: p_fsroot,
+        fsroot_len: p_fsroot_len,
         fd_cloexec: p_cloexec,
         // v0.8: child shares copies of all user pages (clone_user); the
         // mmap frontier must match or parent/child would map the same area
@@ -890,6 +915,15 @@ pub fn is_killed(pid: usize) -> bool {
     matches!(s.procs.get(pid), Some(Some(p)) if p.killed)
 }
 
+/// v2.0: is this pid currently Running (i.e., genuinely executing, not a
+/// stale current[] claim on a Blocked/Zombie task)? Gates the trap-entry
+/// kill check: a stale killed-zombie lingering in current[] (see switch_to
+/// None-arm) must be vacated by the scheduler, not re-executed to death.
+pub fn is_running(pid: usize) -> bool {
+    let s = sched_lock();
+    matches!(s.procs.get(pid), Some(Some(p)) if p.state == State::Running)
+}
+
 pub fn kill_code(pid: usize) -> i32 {
     let s = sched_lock();
     s.procs
@@ -1160,6 +1194,9 @@ pub fn schedule_point(_old_tf: *mut TrapFrame) {
                 // nothing runnable for this hart (current already vacated
                 // above); mark idle and sleep below instead of sret into
                 // a dead TF. kick_idle() will IPI us when work lands.
+                // v2.0: vacate current[] as well (a stale claim combined
+                // with a lingering kill flag re-enters do_exit forever).
+                s.current[h] = 0;
                 s.idle[h] = true;
                 None
             }
@@ -1237,12 +1274,23 @@ core::arch::global_asm!(
     r#"
     .section .text
     .globl idle_loop
+    .globl _idle_loop_end
     .align 2
 idle_loop:
     wfi
     j idle_loop
+_idle_loop_end:
 "#
 );
+
+/// v2.0: idle loop address range (for the nested-kernel-trap detector:
+/// traps with sepc in here are legitimate idle wakeups, not bugs).
+pub fn idle_range() -> (usize, usize) {
+    extern "C" {
+        fn _idle_loop_end();
+    }
+    (idle_loop_addr(), _idle_loop_end as usize)
+}
 
 /// Enter the idle loop on this hart. Diverges (sret to kernel wfi loop);
 /// a later trap redrives schedule_point, which may pick a real task.
@@ -1327,8 +1375,14 @@ fn switch_to(next: Option<usize>) {    match next {
             // trap redrive schedule_point. Global power-off is only via
             // the explicit SYS_SHUTDOWN (halt) path.
             // v1.1: mark idle under lock so kick_idle() can target us.
+            // v2.0: vacate current[] too -- a stale claim here makes the
+            // trap-entry kill check re-execute a dead task forever.
             let h = hartid() % crate::MAX_HART;
-            sched_lock().idle[h] = true;
+            {
+                let mut s = sched_lock();
+                s.idle[h] = true;
+                s.current[h] = 0;
+            }
             idle_on_hart(h);
         }
     }
@@ -1492,6 +1546,8 @@ trait CloneInfo {
         [bool; 16],
         usize,
         usize,
+        [u8; 128],
+        usize,
     );
 }
 impl CloneInfo for Proc {
@@ -1511,6 +1567,8 @@ impl CloneInfo for Proc {
         [bool; 16],
         usize,
         usize,
+        [u8; 128],
+        usize,
     ) {
         (
             self.root,
@@ -1526,6 +1584,8 @@ impl CloneInfo for Proc {
             self.fd_cloexec,
             self.mmap_base,
             self.brk_min,
+            self.fsroot,
+            self.fsroot_len,
         )
     }
 }
@@ -1661,25 +1721,44 @@ pub fn set_cwd(pid: usize, cwd: &str) -> bool {
     }
 }
 
-/// Resolve user path against cwd: absolute stays, relative joins cwd;
-/// normalizes `.`/`..`/`//`/trailing `/` (root stays `/`).
-/// Output is always absolute; over-long (>127) returns root-relative clamp.
-pub fn resolve_path(cwd: &str, path: &str) -> alloc::string::String {
+/// Resolve user path inside a jail: absolute paths anchor at `root`
+/// (`/bin/sh` -> `<root>/bin/sh`), relative ones at `cwd`; `..` clamps at
+/// the root boundary (the stack never shrinks below the root components).
+/// Output is always absolute and jail-contained BY CONSTRUCTION -- callers
+/// cannot bypass it, so every syscall going through resolve_for() is
+/// automatically confined. Over-long (>127) returns a clamped path.
+/// root=cwd="/" reproduces the pre-v2.0 behavior bit-for-bit.
+pub fn resolve_path(root: &str, cwd: &str, path: &str) -> alloc::string::String {
     use alloc::string::String;
     use alloc::vec::Vec;
-    let joined: String = if path.starts_with('/') {
-        String::from(path)
-    } else if cwd.ends_with('/') {
-        alloc::format!("{}{}", cwd, path)
-    } else {
-        alloc::format!("{}/{}", cwd, path)
-    };
+    // root components form the immovable base of the stack.
+    // NOTE (borrowck): `parts` borrows `root` (param) and `joined` (local);
+    // both outlive it, so keep `joined` alive to the end of the function.
     let mut parts: Vec<&str> = Vec::new();
-    for comp in joined.split('/') {
+    for comp in root.split('/') {
         match comp {
             "" | "." => {}
             ".." => {
                 parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    let base_len = parts.len();
+    // anchor: absolute paths start from root (strip the leading '/'),
+    // relative ones from cwd-inside-root (cwd is the jail-absolute view).
+    let joined: String = if path.starts_with('/') {
+        String::from(&path[1..])
+    } else {
+        alloc::format!("{}/{}", cwd.trim_start_matches('/'), path)
+    };
+    for comp in joined.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                if parts.len() > base_len {
+                    parts.pop();
+                }
             }
             c => parts.push(c),
         }
@@ -1693,8 +1772,60 @@ pub fn resolve_path(cwd: &str, path: &str) -> alloc::string::String {
 }
 
 pub fn resolve_for(pid: usize, path: &str) -> alloc::string::String {
-    let cwd = get_cwd(pid);
-    resolve_path(&cwd, path)
+    let s = sched_lock();
+    let (root, cwd) = match s.procs.get(pid).and_then(|o| o.as_ref()) {
+        Some(p) => {
+            let rn = p.fsroot_len.min(128);
+            let cn = p.cwd_len.min(128);
+            (
+                alloc::string::String::from_utf8_lossy(&p.fsroot[..rn]).into_owned(),
+                alloc::string::String::from_utf8_lossy(&p.cwd[..cn]).into_owned(),
+            )
+        }
+        None => (alloc::string::String::from("/"), alloc::string::String::from("/")),
+    };
+    drop(s);
+    resolve_path(&root, &cwd, path)
+}
+
+/// v2.0: read/write the fs jail root. set_root takes an ALREADY-RESOLVED
+/// absolute host path (sys_chroot resolves first under the OLD root, so
+/// the new root is a descendant by construction -- tightening only).
+pub fn get_root(pid: usize) -> alloc::string::String {
+    let s = sched_lock();
+    match s.procs.get(pid).and_then(|o| o.as_ref()) {
+        Some(p) => {
+            let n = p.fsroot_len.min(128);
+            alloc::string::String::from_utf8_lossy(&p.fsroot[..n]).into_owned()
+        }
+        None => alloc::string::String::from("/"),
+    }
+}
+
+pub fn set_root(pid: usize, root: &str) -> bool {
+    if !root.starts_with('/') || root.len() > 127 || root.is_empty() {
+        return false;
+    }
+    let mut s = sched_lock();
+    match s.procs.get_mut(pid).and_then(|o| o.as_mut()) {
+        Some(p) => {
+            let b = root.as_bytes();
+            p.fsroot[..b.len()].copy_from_slice(b);
+            for i in b.len()..128 {
+                p.fsroot[i] = 0;
+            }
+            p.fsroot_len = b.len();
+            // cwd is container-view; re-anchor it at the new root to keep
+            // (root, cwd) consistent (old cwd may point outside the jail).
+            p.cwd[0] = b'/';
+            for i in 1..128 {
+                p.cwd[i] = 0;
+            }
+            p.cwd_len = 1;
+            true
+        }
+        None => false,
+    }
 }
 
 // ---- v0.9: strace flag + ps snapshot ----

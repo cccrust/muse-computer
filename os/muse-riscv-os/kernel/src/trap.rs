@@ -148,9 +148,49 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
         let stval: usize;
         asm!("csrr {0}, scause", out(reg) scause);
         asm!("csrr {0}, stval", out(reg) stval);
-        // killed tasks die on any trap entry (covers timer-only victims)
+        // v2.0 DBG: nested kernel trap detector. SPP=1 means we trapped
+        // from S-mode. The ONLY legitimate source is the idle wfi loop
+        // (SIE=1 by design; sepc inside [idle_loop, end)): everything else
+        // is a kernel bug whose continuation would let trap.S save kernel
+        // state into whatever sscratch points at (possibly a LIVE user TF),
+        // cascading into mystery corpse-faults. Park loudly with raw-CSR
+        // evidence instead (no TF/heap touches below: TF may be clobbered).
+        let sstatus: usize;
+        asm!("csrr {0}, sstatus", out(reg) sstatus);
+        if sstatus & (1 << 8) != 0 {
+            let sepc0: usize;
+            asm!("csrr {0}, sepc", out(reg) sepc0);
+            let (ilo, ihi) = crate::task::idle_range();
+            if sepc0 < ilo || sepc0 >= ihi {
+            let sepc: usize;
+            asm!("csrr {0}, sepc", out(reg) sepc);
+            let satp: usize;
+            asm!("csrr {0}, satp", out(reg) satp);
+            let sscratch: usize;
+            asm!("csrr {0}, sscratch", out(reg) sscratch);
+            let sp: usize;
+            asm!("mv {0}, sp", out(reg) sp);
+            crate::println!(
+                "[TRAP] KERNEL-TRAP scause={:#x} sepc={:#x} stval={:#x} hart={} satp={:#x} sscratch={:#x} sp={:#x} -- parking",
+                scause,
+                sepc,
+                stval,
+                crate::task::hartid() % crate::MAX_HART,
+                satp,
+                sscratch,
+                sp
+            );
+            loop {
+                core::arch::asm!("wfi");
+            }
+            } // end: genuine nested kernel trap (non-idle sepc)
+        }
+        // killed tasks die on any trap entry (covers timer-only victims).
+        // v2.0: gate on Running -- a stale current[] claim (Blocked/Zombie
+        // left behind by an idle transition) must fall through to the
+        // scheduler (which vacates it), not re-enter do_exit forever.
         let cur = crate::task::current_pid();
-        if crate::task::is_killed(cur) {
+        if crate::task::is_killed(cur) && crate::task::is_running(cur) {
             let code = crate::task::kill_code(cur);
             crate::println!("[PROC] pid={} killed", cur);
             crate::syscall::do_exit(code);

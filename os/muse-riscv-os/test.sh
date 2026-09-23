@@ -8,7 +8,7 @@ echo "=== 1. host unit tests ==="
 cargo test -p kernel -p host-tests -p mkfs || PASS=0
 
 echo "=== 2. build user ELFs ==="
-cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver -p crashwrite -p ping -p nslookup -p wget -p curl || PASS=0
+cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver -p crashwrite -p ping -p nslookup -p wget -p curl -p ctr -p chroot_test || PASS=0
 
 echo "=== 3. mkfs ==="
 cargo run --release -p mkfs -- fs.img || PASS=0
@@ -30,18 +30,27 @@ test -s "$KBIN" || { echo "FAIL: kernel.bin empty"; PASS=0; }
 
 echo "=== 5. QEMU boot test (180s; v1.0: -smp 4 MTTCG is slower) ==="
 rm -f qemu.log
+# v2.0: short runs need headroom for loaded hosts (autorun keeps growing;
+# fixed 25-60s timeouts expire mid-autorun and look like kernel failures).
+# TO3/TO4 cover prompt-gated interactive runs; run2 is poll-based below.
 if command -v timeout >/dev/null 2>&1; then
-  TO="timeout 45"
+  TO="timeout 120"
   TO1="timeout 180"
-  TO2="timeout 60"
+  TO2="timeout 120"
+  TO3="timeout 360"
+  TO4="timeout 300"
 elif command -v gtimeout >/dev/null 2>&1; then
-  TO="gtimeout 45"
+  TO="gtimeout 120"
   TO1="gtimeout 180"
-  TO2="gtimeout 60"
+  TO2="gtimeout 120"
+  TO3="gtimeout 360"
+  TO4="gtimeout 300"
 else
   TO=""
   TO1=""
   TO2=""
+  TO3=""
+  TO4=""
 fi
 START=$(date +%s)
 # NOTE: stdin must come from /dev/null. With `-nographic`, if stdin is the
@@ -92,8 +101,11 @@ for i in $(seq 1 150); do
   sleep 1
 done
 python3 tools/web_fetch.py || PASS=0
-# wait for autorun to finish (or budget out)
-for i in $(seq 1 150); do
+# wait for autorun to finish (or budget out). v2.0: 480s -- a loaded
+# host needs it (fork/exit/RFENCE churn under MTTCG is ~1-3s/round);
+# death points advance between runs (working, not wedged), so budget,
+# don't trim the workload further.
+for i in $(seq 1 480); do
   if grep -q "redirenv PASS" qemu.log 2>/dev/null; then
     echo "autorun finished"
     break
@@ -147,6 +159,7 @@ check "hart1 up"
 check "hart2 up"
 check "hart3 up"
 check "mmap PASS"
+check "chroot PASS"
 check "VIRTIO"
 check "virtio-irq PASS"
 check "virtio-blk RW PASS"
@@ -185,10 +198,11 @@ kill $HTTP_PID 2>/dev/null || true
 kill $DNS_PID 2>/dev/null || true
 
 echo "=== 7. persistence: second boot on SAME fs.img (no rebuild) ==="
-# v1.4: 60s -- persist READ needs deep autorun (past stress), which loaded
-# hosts can't reach in 25s.
+# v1.4: persist READ needs deep autorun (past stress), which loaded hosts
+# can't reach quickly. v2.0: poll-based like run1 (kill after the marker +
+# margin) instead of a fixed window that expires mid-autorun.
 rm -f qemu2.log
-$TO2 qemu-system-riscv64 \
+qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
   -bios default \
@@ -197,7 +211,22 @@ $TO2 qemu-system-riscv64 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
   -netdev user,id=n0,hostfwd=tcp::8080-:80 \
-  < /dev/null 2>&1 | tee qemu2.log || true
+  < /dev/null > qemu2.log 2>&1 &
+QEMU2=$!
+for i in $(seq 1 280); do
+  if grep -q "persist READ PASS\|persist READ FAIL" qemu2.log 2>/dev/null; then
+    echo "persist stage done"
+    break
+  fi
+  if ! kill -0 $QEMU2 2>/dev/null; then
+    echo "QEMU2 exited early"
+    break
+  fi
+  sleep 1
+done
+sleep 5
+kill $QEMU2 2>/dev/null || true
+wait $QEMU2 2>/dev/null || true
 
 if [ ! -s qemu2.log ]; then
   echo "FAIL: qemu2.log empty"
@@ -219,8 +248,10 @@ fi
 echo "=== 8. interactive: Ctrl-C kills foreground sh, respawn, halt ==="
 rm -f qemu3.log
 # NOTE: stdin is a pipe here (not a tty), so no QEMU silence issue.
-# Ctrl-C at ~15s hits sh blocked at prompt; respawned sh then reads halt.
-(sleep 15; printf '\003'; sleep 7; printf 'halt\n') | $TO qemu-system-riscv64 \
+# v2.0: Ctrl-C is sent ONLY after the sh prompt is up. A fixed 15s sleep
+# races slow-boot autorun (Ctrl-C then lands on an autorun child: killed
+# but no respawn, a test artifact not a kernel bug). Poll for `sh$ ` first.
+( for i in $(seq 1 240); do grep -q '^sh\$ ' qemu3.log 2>/dev/null && break; sleep 1; done; printf '\003'; sleep 7; printf 'halt\n' ) | $TO3 qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
   -bios default \
@@ -293,7 +324,10 @@ echo "=== 9. clean-halt reboot: halt again on the same image ==="
 rm -f qemu4.log
 # v0.12: prompt is up by ~18s (autorun grew); early input buffers in the
 # UART ring, so an 18s halt is safe even if the prompt is not ready yet.
-(sleep 18; printf 'halt\n') | $TO qemu-system-riscv64 \
+# v2.0: ...in theory. In practice autorun-phase console readers nibble early
+# input (observed: "crashwrite" -> "ashwrite"), and loaded hosts push the
+# prompt past any fixed sleep. Poll for the prompt like run3, then halt.
+( for i in $(seq 1 240); do grep -q '^sh\$ ' qemu4.log 2>/dev/null && break; sleep 1; done; printf 'halt\n' ) | $TO4 qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
   -bios default \
@@ -368,7 +402,7 @@ echo "=== 11. power loss: SIGKILL mid-write, journal must recover ==="
 # input gets nibbled by autorun's console readers (observed: grep/sh byte
 # reads ate "cr" off "crashwrite"), so polling for `sh$ ` is mandatory.
 rm -f qemu6.log
-( for i in $(seq 1 150); do grep -q '^sh\$ ' qemu6.log 2>/dev/null && break; sleep 1; done; printf 'crashwrite write &\n'; sleep 60 ) | qemu-system-riscv64 \
+( for i in $(seq 1 240); do grep -q '^sh\$ ' qemu6.log 2>/dev/null && break; sleep 1; done; printf 'crashwrite write &\n'; sleep 60 ) | qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
   -bios default \
@@ -379,7 +413,7 @@ rm -f qemu6.log
   -netdev user,id=n0,hostfwd=tcp::8080-:80 \
   > qemu6.log 2>&1 &
 QEMU6=$!
-for i in $(seq 1 180); do
+for i in $(seq 1 280); do
   if grep -q "crashwrite running" qemu6.log 2>/dev/null; then
     echo "writer up, accumulating versions"
     break
@@ -397,7 +431,7 @@ wait $QEMU6 2>/dev/null || true
 
 echo "=== 11b. reboot after power loss: replay + verify ==="
 rm -f qemu7.log
-( for i in $(seq 1 150); do grep -q '^sh\$ ' qemu7.log 2>/dev/null && break; sleep 1; done; printf 'crashwrite check\n'; sleep 30 ) | qemu-system-riscv64 \
+( for i in $(seq 1 240); do grep -q '^sh\$ ' qemu7.log 2>/dev/null && break; sleep 1; done; printf 'crashwrite check\n'; sleep 30 ) | qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
   -bios default \
@@ -408,7 +442,7 @@ rm -f qemu7.log
   -netdev user,id=n0,hostfwd=tcp::8080-:80 \
   > qemu7.log 2>&1 &
 QEMU7=$!
-for i in $(seq 1 180); do
+for i in $(seq 1 280); do
   if grep -q "crash PASS\|crash FAIL" qemu7.log 2>/dev/null; then
     echo "check done"
     break

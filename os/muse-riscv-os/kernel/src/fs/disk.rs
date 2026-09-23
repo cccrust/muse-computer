@@ -828,3 +828,8 @@ pub fn stat(path: &str) -> (u8, u32, u32) {
         _ => (0, 0, 0),
     }
 }
+
+/// v2.0: directory check for chroot validation.
+pub fn is_dir(path: &str) -> bool {
+    stat(path).0 == KIND_DIR
+}

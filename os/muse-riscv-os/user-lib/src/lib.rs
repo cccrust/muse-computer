@@ -139,6 +139,10 @@ pub fn link(old: *const u8, new: *const u8) -> isize {
 pub fn chdir(path: *const u8) -> isize {
     ecall(16, path as usize, 0, 0)
 }
+/// v2.0: chroot jail (SYS_CHROOT=45). 0 ok, -1 if missing/not-a-dir.
+pub fn chroot(path: *const u8) -> isize {
+    ecall(45, path as usize, 0, 0)
+}
 pub fn getcwd(buf: *mut u8, len: usize) -> isize {
     ecall(25, buf as usize, len, 0)
 }

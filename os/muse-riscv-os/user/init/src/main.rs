@@ -29,10 +29,22 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     user_lib::print("[USER] init: starting sh\n");
     let sh = b"/bin/sh\0";
+    // v2.0: respawned shells skip autorun (--quick): recovery should take
+    // seconds, not re-run the whole suite; also keeps test.sh run3 timing
+    // deterministic (prompt follows respawn promptly).
+    let mut quick = false;
     loop {
         let pid = user_lib::fork();
         if pid == 0 {
-            let r = user_lib::exec(sh.as_ptr(), 0);
+            if quick {
+                let a0 = b"sh\0";
+                let a1 = b"--quick\0";
+                let av: [*const u8; 3] =
+                    [a0.as_ptr(), a1.as_ptr(), core::ptr::null()];
+                let _ = user_lib::exec(sh.as_ptr(), av.as_ptr() as usize);
+            } else {
+                user_lib::exec(sh.as_ptr(), 0);
+            }
             user_lib::print("[USER] init: exec sh failed\n");
             user_lib::exit(-1);
         } else if pid > 0 {
@@ -54,6 +66,7 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
                 // reaped an orphaned child; keep waiting for sh
             }
             user_lib::print("[USER] init: sh exited, respawn\n");
+            quick = true;
         } else {
             user_lib::print("[USER] init: fork failed\n");
         }

@@ -51,6 +51,8 @@ pub const SYS_SEND: usize = 39;
 pub const SYS_RECV: usize = 40;
 // v1.8: monotonic ms since boot (no wall clock: virt has no RTC hw).
 pub const SYS_TIME: usize = 44;
+// v2.0: chroot jail (per-proc fs root; tightening only, see sys_chroot).
+pub const SYS_CHROOT: usize = 45;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -137,6 +139,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_RECV => sys_recv(a0 as i32, a1, a2) as isize,
         // v1.8: monotonic ms since boot (timer::ticks is 10ms units).
         SYS_TIME => (crate::timer::ticks() * 10) as isize,
+        SYS_CHROOT => sys_chroot(a0) as isize,
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,
@@ -871,6 +874,31 @@ fn sys_mkdir(path_ptr: usize) -> isize {
     }
 }
 
+/// v2.0: chroot jail. Resolves `path` under the CURRENT root (so the
+/// result is a descendant by construction -- tightening only, no
+/// prefix-string games), requires an existing directory, then jails.
+/// Already-open fds keep pointing outside (classic chroot limitation,
+/// documented in _doc/v2.0.md).
+fn sys_chroot(path_ptr: usize) -> isize {
+    unsafe {
+        match crate::fs::user_str(path_ptr) {
+            Some(raw) => {
+                let pid = crate::task::current_pid();
+                let p = crate::task::resolve_for(pid, &raw);
+                if !crate::fs::disk::is_dir(&p) {
+                    return -1;
+                }
+                if crate::task::set_root(pid, &p) {
+                    0
+                } else {
+                    -1
+                }
+            }
+            None => -1,
+        }
+    }
+}
+
 fn sys_chdir(path_ptr: usize) -> isize {
     unsafe {
         match crate::fs::user_str(path_ptr) {
@@ -885,7 +913,17 @@ fn sys_chdir(path_ptr: usize) -> isize {
                 if k != 2 {
                     return -1;
                 }
-                if crate::task::set_cwd(pid, &p) {
+                // v2.0: store the CONTAINER view (strip the jail prefix),
+                // so getcwd never leaks the real prefix and relative
+                // resolution never double-applies the root.
+                let root = crate::task::get_root(pid);
+                let tail = p.strip_prefix(&root).unwrap_or("/");
+                let view = if tail.is_empty() || !tail.starts_with('/') {
+                    alloc::format!("/{}", tail)
+                } else {
+                    alloc::string::String::from(tail)
+                };
+                if crate::task::set_cwd(pid, &view) {
                     0
                 } else {
                     -1

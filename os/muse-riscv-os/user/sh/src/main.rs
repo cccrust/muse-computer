@@ -1137,16 +1137,29 @@ fn spawn_one(path: &[u8]) -> isize {
 }
 
 #[no_mangle]
-pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
+pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     user_lib::print("[USER] sh: Unix-v6 like shell. try: ls, cat /README, echo hi | grep hi, usertests\n");
     user_lib::print("[USER] sh: builtins: cd pwd df jobs fg kill halt export unset env; quotes + $VAR + history\n");
     let mut jobs = [0isize; 8];
     let mut env = Env::new();
     let mut hist = Hist::new();
+    // v2.0: respawned shells (init passes "--quick") skip autorun:
+    // recovery must take seconds, and test.sh run3 needs the prompt
+    // promptly after respawn (else its halt input rots in the pipe).
+    let mut quick = false;
+    if argc >= 2 {
+        if let Some(a) = unsafe { user_lib::argv_str(argv, 1, argc) } {
+            if a.len() == 7 && a[0] == b'-' && a[1] == b'-' && a[2] == b'q' {
+                quick = true;
+            }
+        }
+    }
+    if !quick {
     // auto-run usertests + persist + argv coverage once for test.sh markers
     user_lib::print("[USER] sh: auto-run usertests\n");
     run_one(b"/bin/usertests\0", &mut jobs);
     run_one(b"/bin/smp_test\0", &mut jobs);
+    run_one(b"/bin/chroot_test\0", &mut jobs);
     run_one(b"/bin/reclaim_test\0", &mut jobs);
     run_one(b"/bin/stress\0", &mut jobs);
     // v1.5: webserver backgrounds (never exits by design); the test
@@ -1513,6 +1526,7 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
             }
         }
     }
+    } // end: if !quick (autorun skipped on respawn)
     // prompt runs as foreground for Ctrl-C
     user_lib::setfg(user_lib::getpid());
     user_lib::print("sh$ ");

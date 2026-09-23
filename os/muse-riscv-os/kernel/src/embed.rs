@@ -43,6 +43,10 @@ mod real {
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/wget");
     pub const CURL_ELF: &[u8] =
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/curl");
+    pub const CTR_ELF: &[u8] =
+        include_bytes!("../../target/riscv64gc-unknown-none-elf/release/ctr");
+    pub const CHROOTT_ELF: &[u8] =
+        include_bytes!("../../target/riscv64gc-unknown-none-elf/release/chroot_test");
     pub const PING_ELF: &[u8] =
         include_bytes!("../../target/riscv64gc-unknown-none-elf/release/ping");
 }
@@ -72,6 +76,8 @@ pub fn get_by_name(name: &str) -> Option<Vec<u8>> {
         "nslookup" => NSLOOKUP_ELF,
         "wget" => WGET_ELF,
         "curl" => CURL_ELF,
+        "ctr" => CTR_ELF,
+        "chroot_test" => CHROOTT_ELF,
         "ping" => PING_ELF,
         _ => return None,
     };
@@ -123,5 +129,9 @@ pub const NSLOOKUP_ELF: &[u8] = b"test";
 pub const WGET_ELF: &[u8] = b"test";
 #[cfg(test)]
 pub const CURL_ELF: &[u8] = b"test";
+#[cfg(test)]
+pub const CTR_ELF: &[u8] = b"test";
+#[cfg(test)]
+pub const CHROOTT_ELF: &[u8] = b"test";
 #[cfg(test)]
 pub const PING_ELF: &[u8] = b"test";

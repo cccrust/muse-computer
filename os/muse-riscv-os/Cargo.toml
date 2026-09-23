@@ -23,6 +23,8 @@ members = [
   "user/nslookup",
   "user/wget",
   "user/curl",
+  "user/ctr",
+  "user/chroot_test",
   "user/ping",
   "tools/mkfs",
   "host-tests",
