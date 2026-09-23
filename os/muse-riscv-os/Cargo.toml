@@ -25,6 +25,7 @@ members = [
   "user/curl",
   "user/ctr",
   "user/chroot_test",
+  "user/nstest",
   "user/ping",
   "tools/mkfs",
   "host-tests",

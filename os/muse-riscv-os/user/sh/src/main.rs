@@ -1139,7 +1139,7 @@ fn spawn_one(path: &[u8]) -> isize {
 #[no_mangle]
 pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     user_lib::print("[USER] sh: Unix-v6 like shell. try: ls, cat /README, echo hi | grep hi, usertests\n");
-    user_lib::print("[USER] sh: builtins: cd pwd df jobs fg kill halt export unset env; quotes + $VAR + history\n");
+    user_lib::print("[USER] sh: builtins: cd pwd df jobs fg kill halt export unset env chroot unshare; quotes + $VAR + history\n");
     let mut jobs = [0isize; 8];
     let mut env = Env::new();
     let mut hist = Hist::new();
@@ -1160,6 +1160,7 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     run_one(b"/bin/usertests\0", &mut jobs);
     run_one(b"/bin/smp_test\0", &mut jobs);
     run_one(b"/bin/chroot_test\0", &mut jobs);
+    run_one(b"/bin/nstest\0", &mut jobs);
     run_one(b"/bin/reclaim_test\0", &mut jobs);
     run_one(b"/bin/stress\0", &mut jobs);
     // v1.5: webserver backgrounds (never exits by design); the test
@@ -1581,6 +1582,46 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             let r = user_lib::chdir(pb.as_ptr());
             if r != 0 {
                 user_lib::print("sh: cd failed\n");
+            }
+            user_lib::print("sh$ ");
+            continue;
+        }
+        // v2.0/v2.1: chroot <dir> (chdir / to re-anchor), unshare (pid ns)
+        if t.len() > 7
+            && t[0] == b'c'
+            && t[1] == b'h'
+            && t[2] == b'r'
+            && t[3] == b'o'
+            && t[4] == b'o'
+            && t[5] == b't'
+            && t[6] == b' '
+        {
+            let arg = trim(&t[7..]);
+            let mut pb = [0u8; 128];
+            let m = arg.len().min(126);
+            pb[..m].copy_from_slice(&arg[..m]);
+            pb[m] = 0;
+            if user_lib::chroot(pb.as_ptr()) != 0 {
+                user_lib::print("sh: chroot failed\n");
+            } else {
+                let _ = user_lib::chdir(b"/\0".as_ptr());
+            }
+            user_lib::print("sh$ ");
+            continue;
+        }
+        if t.len() == 7
+            && t[0] == b'u'
+            && t[1] == b'n'
+            && t[2] == b's'
+            && t[3] == b'h'
+            && t[4] == b'a'
+            && t[5] == b'r'
+            && t[6] == b'e'
+        {
+            if user_lib::unshare(user_lib::CLONE_NEWPID) != 0 {
+                user_lib::print("sh: unshare failed\n");
+            } else {
+                user_lib::print("sh: next child starts a new pid ns\n");
             }
             user_lib::print("sh$ ");
             continue;

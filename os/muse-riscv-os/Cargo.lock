@@ -92,6 +92,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nstest"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
 name = "persist"
 version = "0.1.0"
 dependencies = [

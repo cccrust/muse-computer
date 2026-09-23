@@ -53,6 +53,8 @@ pub const SYS_RECV: usize = 40;
 pub const SYS_TIME: usize = 44;
 // v2.0: chroot jail (per-proc fs root; tightening only, see sys_chroot).
 pub const SYS_CHROOT: usize = 45;
+// v2.1: unshare (pid namespace only for now; other flags -> -1).
+pub const SYS_UNSHARE: usize = 46;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -87,11 +89,13 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_DUP => sys_dup(a0 as i32) as isize,
         SYS_PIPE => sys_pipe(a0) as isize,
         SYS_EXEC => sys_exec(a0, a1) as isize,
-        SYS_GETPID => crate::task::current_pid() as isize,
+        SYS_GETPID => crate::task::current_lpid() as isize,
         SYS_SBRK => sys_sbrk(a0 as i32) as isize,
         SYS_SLEEP => sys_sleep(a0) as isize,
         SYS_SETFG => {
-            crate::task::set_fg(a0);
+            // v2.1: sh passes its lpid; translate to global HERE (syscall
+            // context = sh's own ns) so the ISR-side kill_fg needs no ns.
+            crate::task::set_fg_global(a0);
             0
         }
         SYS_KILL => sys_kill(a0) as isize,
@@ -140,6 +144,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         // v1.8: monotonic ms since boot (timer::ticks is 10ms units).
         SYS_TIME => (crate::timer::ticks() * 10) as isize,
         SYS_CHROOT => sys_chroot(a0) as isize,
+        SYS_UNSHARE => sys_unshare(a0) as isize,
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,
@@ -818,11 +823,12 @@ fn sys_munmap(addr: usize, len: usize) -> isize {
 
 /// v0.9: ps(buf, len). Writes "pid ppid state brk cwd\n" lines; truncates
 /// at line boundary if short; returns bytes written.
+/// v2.1: pids are the caller's namespace view (see ps_snapshot).
 fn sys_ps(buf: usize, len: usize) -> isize {
     if buf == 0 || len == 0 {
         return -1;
     }
-    let snap = crate::task::ps_snapshot();
+    let snap = crate::task::ps_snapshot(crate::task::current_pid());
     let b = snap.as_bytes();
     // truncate to last full line that fits
     let mut n = b.len().min(len);
@@ -896,6 +902,16 @@ fn sys_chroot(path_ptr: usize) -> isize {
             }
             None => -1,
         }
+    }
+}
+
+/// v2.1: unshare (pid namespace only). Arms the next forked child to found
+/// a new ns; other flags rejected.
+fn sys_unshare(flags: usize) -> isize {
+    if crate::task::unshare(flags) {
+        0
+    } else {
+        -1
     }
 }
 

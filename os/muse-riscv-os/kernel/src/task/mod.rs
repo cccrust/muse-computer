@@ -67,6 +67,20 @@ pub struct Proc {
     pub mmap_base: usize, // v0.8: top-down anonymous mmap frontier
     pub brk_min: usize,   // v0.8: sbrk may not shrink below this
     pub traced: bool,     // v0.9: strace-lite prints this proc's syscalls
+    // v2.1: pid namespace. `ns` indexes Sched.ns (0 = root/init ns);
+    // `lpid` is the in-namespace pid (root ns: == global pid, identity).
+    // `pending_ns` = unshare() armed: next forked child founds a new ns.
+    pub ns: usize,
+    pub lpid: usize,
+    pub pending_ns: bool,
+}
+
+/// v2.1: pid namespace descriptor. `parent` is recorded, not traversed
+/// (no multi-level visibility -- single-level isolation only).
+/// `next` hands out lpids from 1 (root ns never uses it: lpid==global).
+pub struct Ns {
+    pub parent: usize,
+    pub next: usize,
 }
 
 struct Sched {
@@ -81,6 +95,9 @@ struct Sched {
     // v1.1: true while the hart sleeps in the idle loop (wfi, SIE=1) --
     // an IPI then wakes it promptly (see kick_idle).
     idle: [bool; crate::MAX_HART],
+    // v2.1: pid namespaces (under the big lock -- no new lock, no new order).
+    // ns[0] is the root namespace, pre-created at init.
+    ns: Vec<Ns>,
 }
 
 // v1.1: successful cross-hart steals (informational; printed at halt).
@@ -177,6 +194,38 @@ pub fn take_yield_flag() -> bool {
 
 pub fn current_pid() -> usize {
     sched_lock().current[hartid() % crate::MAX_HART]
+}
+
+/// v2.1: in-namespace pid of current (what getpid/ps show). Root ns is
+/// identity, so old behavior is bit-for-bit there.
+pub fn current_lpid() -> usize {
+    let s = sched_lock();
+    let cur = s.current[hartid() % crate::MAX_HART];
+    s.procs
+        .get(cur)
+        .and_then(|o| o.as_ref())
+        .map(|p| p.lpid)
+        .unwrap_or(cur)
+}
+
+/// v2.1: arm one-shot namespace creation for the next forked child.
+/// Returns false for bogus flags (only pid-ns exists for now).
+pub fn unshare(flags: usize) -> bool {
+    // Linux CLONE_NEWPID value, accepted for familiarity; anything else
+    // (including 0) is rejected -- this syscall does exactly one thing.
+    const CLONE_NEWPID: usize = 0x20000000;
+    if flags != CLONE_NEWPID {
+        return false;
+    }
+    let mut s = sched_lock();
+    let cur = s.current[hartid() % crate::MAX_HART];
+    match s.procs.get_mut(cur).and_then(|o| o.as_mut()) {
+        Some(p) => {
+            p.pending_ns = true;
+            true
+        }
+        None => false,
+    }
 }
 
 /// v1.1: enqueue pid on hart hq's runqueue. Caller holds the sched lock.
@@ -292,6 +341,8 @@ pub fn init() {
             next_pid: 1,
             yield_flag: [false; crate::MAX_HART],
             idle: [false; crate::MAX_HART],
+            // v2.1: root pid namespace pre-created (id 0).
+            ns: alloc::vec![Ns { parent: 0, next: 1 }],
         }));
     }
     // create init from embedded ELF
@@ -420,6 +471,11 @@ fn finish_spawn(
         mmap_base: USER_STACK_TOP - USER_STACK_PAGES * 4096,
         brk_min: brk,
         traced: false,
+        // v2.1: spawn (init only, parent==0) lives in the root ns with
+        // identity lpid. fork() below handles ns inheritance/creation.
+        ns: 0,
+        lpid: pid,
+        pending_ns: false,
     };
     s.procs[pid] = Some(proc);
     if parent != 0 {
@@ -594,6 +650,33 @@ pub fn fork(parent_pid: usize) -> usize {
     // user stack already cloned via clone_user; ensure stack mapping exists
     // brk etc
     let mut s = sched_lock();
+    // v2.1: namespace placement for the child (one-shot unshare: a set
+    // flag founds a new ns for THIS child, then clears). Reads are copies
+    // (borrow ends before any mutation below).
+    let (pns, pending) = match s.procs.get(parent_pid).and_then(|o| o.as_ref()) {
+        Some(p) => (p.ns, p.pending_ns),
+        None => {
+            // parent vanished mid-fork (killed+reaped? only zombies reap,
+            // and zombies don't fork -- unreachable, but never panic).
+            drop(s);
+            return 0;
+        }
+    };
+    let (cns, clpid) = if pending {
+        if let Some(Some(pp)) = s.procs.get_mut(parent_pid) {
+            pp.pending_ns = false;
+        }
+        let id = s.ns.len();
+        s.ns.push(Ns { parent: pns, next: 2 });
+        (id, 1)
+    } else if pns == 0 {
+        // root ns: identity (lpid == global pid, old behavior bit-for-bit)
+        (0, child)
+    } else {
+        let lp = s.ns[pns].next;
+        s.ns[pns].next += 1;
+        (pns, lp)
+    };
     // re-fetch name
     let mut nb = [0u8; 32];
     nb.copy_from_slice(&pname);
@@ -627,6 +710,10 @@ pub fn fork(parent_pid: usize) -> usize {
         brk_min: p_brk_min,
         // v0.9: never inherit trace (avoid log explosion)
         traced: false,
+        // v2.1: namespace placement computed above
+        ns: cns,
+        lpid: clpid,
+        pending_ns: false,
     };
     s.procs[child] = Some(proc);
     if let Some(Some(pp)) = s.procs.get_mut(parent_pid) {
@@ -872,8 +959,31 @@ pub fn yield_now() {
 }
 
 /// Mark target as killed; it exits on next trap entry. Wakes if blocked.
+/// v2.1: `pid` is resolved in the CALLER's namespace first (lpid match),
+/// falling back to the global pid (root ns: both identical, old behavior
+/// bit-for-bit). Prevents cross-namespace kills by small numbers.
 pub fn kill(pid: usize) -> bool {
-    kill_with(pid, -9)
+    kill_with(resolve_kill_target(pid), -9)
+}
+
+/// v2.1: resolve a kill target to a global pid: prefer the caller's own
+/// namespace (lpid), else try the raw global pid.
+fn resolve_kill_target(pid: usize) -> usize {
+    let s = sched_lock();
+    let caller_ns = s
+        .procs
+        .get(s.current[hartid() % crate::MAX_HART])
+        .and_then(|o| o.as_ref())
+        .map(|p| p.ns)
+        .unwrap_or(0);
+    for (i, slot) in s.procs.iter().enumerate() {
+        if let Some(p) = slot {
+            if p.ns == caller_ns && p.lpid == pid {
+                return i;
+            }
+        }
+    }
+    pid
 }
 
 fn kill_with(pid: usize, code: i32) -> bool {
@@ -936,8 +1046,10 @@ pub fn kill_code(pid: usize) -> i32 {
 // ---- foreground pid for Ctrl-C (v1.0: atomic, shared by all harts) ----
 static FG_PID: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-pub fn set_fg(pid: usize) {
-    FG_PID.store(pid, core::sync::atomic::Ordering::SeqCst);
+/// v2.1: set foreground by LPID (translates to global in the caller's ns;
+/// the ISR-side kill_fg then needs no namespace context).
+pub fn set_fg_global(lpid: usize) {
+    FG_PID.store(resolve_kill_target(lpid), core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Ctrl-C target: kill foreground (exit 130). Returns false if none.
@@ -1590,6 +1702,23 @@ impl CloneInfo for Proc {
     }
 }
 
+/// v2.1: waitpid target matching -- by global pid, or by lpid within the
+/// waiter's namespace. (Fork returns global pids and existing tests compare
+/// against waitpid's return, so the return stays global; lpid is only an
+/// alternate way to NAME the target.)
+fn child_matches(s: &Sched, wns: usize, target: isize, c: usize) -> bool {
+    if target <= 0 {
+        return true;
+    }
+    if c as isize == target {
+        return true;
+    }
+    matches!(
+        s.procs.get(c).and_then(|o| o.as_ref()),
+        Some(p) if p.ns == wns && p.lpid as isize == target
+    )
+}
+
 pub fn wait(pid: usize) -> (i32, usize) {
     waitpid(pid, -1, 0)
 }
@@ -1609,9 +1738,16 @@ pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
             Some(p) => p.children.clone(),
             None => return (-1, 0),
         };
+        // v2.1: the waiter's namespace, for lpid-aware target matching.
+        let wns = s
+            .procs
+            .get(pid)
+            .and_then(|o| o.as_ref())
+            .map(|p| p.ns)
+            .unwrap_or(0);
         let mut found: Option<(usize, i32)> = None;
         for c in &children {
-            if target > 0 && *c as isize != target {
+            if target > 0 && !child_matches(&s, wns, target, *c) {
                 continue;
             }
             if let Some(Some(p)) = s.procs.get(*c) {
@@ -1649,7 +1785,7 @@ pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
             // any live (non-zombie, slot present) matching children?
             let mut any = false;
             for c in &children {
-                if target > 0 && *c as isize != target {
+                if target > 0 && !child_matches(&s, wns, target, *c) {
                     continue;
                 }
                 if s.procs.get(*c).and_then(|o| o.as_ref()).is_some() {
@@ -1845,12 +1981,27 @@ pub fn is_traced(pid: usize) -> bool {
     matches!(s.procs.get(pid), Some(Some(p)) if p.traced)
 }
 
-/// One line per live proc: "pid ppid state brk cwd\n". state: R/B/Z.
-pub fn ps_snapshot() -> alloc::string::String {
+/// One line per live proc visible to the caller: "lpid ppid state brk cwd".
+/// v2.1: scoped to the caller's namespace, pids shown are lpids (root ns:
+/// lpid==global, output bit-for-bit identical to before). state: R/B/Z.
+pub fn ps_snapshot(caller: usize) -> alloc::string::String {
     let s = sched_lock();
+    let cns = s
+        .procs
+        .get(caller)
+        .and_then(|o| o.as_ref())
+        .map(|p| p.ns)
+        .unwrap_or(0);
+    // parent pid is shown in the CALLER's view too (lpid if same ns,
+    // else the raw global id -- namespaces are single-level, so a visible
+    // task's parent is either same-ns or the ns founder path; keep it simple
+    // and truthful: lpid when same ns, global otherwise).
     let mut out = alloc::string::String::new();
     for slot in s.procs.iter() {
         if let Some(p) = slot {
+            if p.ns != cns {
+                continue;
+            }
             let st = match p.state {
                 State::Running | State::Runnable => "R",
                 State::Blocked => "B",
@@ -1858,9 +2009,13 @@ pub fn ps_snapshot() -> alloc::string::String {
             };
             let n = p.cwd_len.min(128);
             let cwd = alloc::string::String::from_utf8_lossy(&p.cwd[..n]);
+            let ppid = match s.procs.get(p.parent).and_then(|o| o.as_ref()) {
+                Some(pp) if pp.ns == cns => pp.lpid,
+                _ => p.parent,
+            };
             out.push_str(&alloc::format!(
                 "{} {} {} {} {}\n",
-                p.pid, p.parent, st, p.brk, cwd
+                p.lpid, ppid, st, p.brk, cwd
             ));
         }
     }

@@ -143,6 +143,14 @@ pub fn chdir(path: *const u8) -> isize {
 pub fn chroot(path: *const u8) -> isize {
     ecall(45, path as usize, 0, 0)
 }
+/// v2.1: unshare (SYS_UNSHARE=46). Only CLONE_NEWPID (0x20000000) is
+/// accepted: arms the next forked child to found a new pid namespace.
+/// Returns 0 or -1.
+pub fn unshare(flags: usize) -> isize {
+    ecall(46, flags, 0, 0)
+}
+/// Linux CLONE_NEWPID value (accepted by unshare()).
+pub const CLONE_NEWPID: usize = 0x20000000;
 pub fn getcwd(buf: *mut u8, len: usize) -> isize {
     ecall(25, buf as usize, len, 0)
 }
