@@ -1209,7 +1209,7 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     );
     run_args(
         b"/bin/ctr\0",
-        &[b"ctr", b"run", b"-d", b"life", b"/bin/sleeper", b"30"],
+        &[b"ctr", b"run", b"-d", b"life", b"/bin/linger", b"30"],
         &mut jobs,
     );
     run_args(

@@ -65,6 +65,8 @@ pub const SYS_CGSETCPU: usize = 50;
 pub const SYS_PIDINFO: usize = 51;
 // v2.5: exit code of a reaped pid (ctr ps code display).
 pub const SYS_REAPSTAT: usize = 52;
+// v2.6: kill all live tasks in a cgroup (ctr stop fate-sharing).
+pub const SYS_CGKILL: usize = 53;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -161,6 +163,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_CGSETCPU => sys_cgsetcpu(a0, a1 as u64) as isize,
         SYS_PIDINFO => crate::task::pidinfo(a0) as isize,
         SYS_REAPSTAT => crate::task::reapstat(a0) as isize,
+        SYS_CGKILL => crate::task::cg_kill(a0) as isize,
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,

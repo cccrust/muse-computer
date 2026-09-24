@@ -1352,6 +1352,45 @@ pub fn yield_now() {
     set_yield_flag();
 }
 
+/// v2.6: kill every live task in cgroup `cg` (container fate-sharing).
+/// Returns the number marked, or -1 for cg 0 (root: killing the world is
+/// not stop's job) and out-of-range ids. Skips zombies (already dead)
+/// and the caller (self-kill would be suicide, not shutdown).
+/// Idempotent: an empty group returns 0, doubling as an "is empty" probe
+/// for `ctr stop`'s poll loop. Collect-then-act (kill_with takes the lock
+/// itself; never nested).
+pub fn cg_kill(cg: usize) -> isize {
+    if cg == 0 || cg >= 256 {
+        return -1;
+    }
+    let me = current_pid();
+    let targets: Vec<usize> = {
+        let s = sched_lock();
+        if cg >= s.cg.len() {
+            return -1;
+        }
+        s.procs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| match slot {
+                Some(p)
+                    if p.cg == cg && p.state != State::Zombie && i != me =>
+                {
+                    Some(i)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let mut n = 0isize;
+    for pid in targets {
+        if kill_with(pid, -9) {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Mark target as killed; it exits on next trap entry. Wakes if blocked.
 /// v2.1: `pid` is resolved in the CALLER's namespace first (lpid match),
 /// falling back to the global pid (root ns: both identical, old behavior

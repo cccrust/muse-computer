@@ -25,6 +25,7 @@ members = [
   "user/curl",
     "user/ctr",
     "user/sleeper",
+    "user/linger",
   "user/chroot_test",
   "user/nstest",
   "user/cgtest",

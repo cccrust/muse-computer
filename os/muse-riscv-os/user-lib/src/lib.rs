@@ -187,6 +187,12 @@ pub fn pidinfo(pid: isize) -> isize {
 pub fn reapstat(pid: isize) -> isize {
     ecall(52, pid as usize, 0, 0)
 }
+/// v2.6: kill all live tasks in cgroup `cg` (SYS_CGKILL=53). Returns the
+/// number marked, or -1 for cg 0 / out-of-range ids. Empty group returns
+/// 0 (idempotent; doubles as an emptiness probe).
+pub fn cgkill(cg: isize) -> isize {
+    ecall(53, cg as usize, 0, 0)
+}
 pub fn getcwd(buf: *mut u8, len: usize) -> isize {
     ecall(25, buf as usize, len, 0)
 }

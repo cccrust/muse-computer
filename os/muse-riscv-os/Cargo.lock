@@ -81,6 +81,13 @@ name = "kernel"
 version = "0.1.0"
 
 [[package]]
+name = "linger"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
 name = "ls"
 version = "0.1.0"
 dependencies = [

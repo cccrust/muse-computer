@@ -204,6 +204,16 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool) {
         av[i] = toks[i].as_ptr();
         i += 1;
     }
+    // v2.6: private cgroup for fate-sharing (see _doc/v2.6.md §1).
+    // Created before fork so the child enters it as its first act;
+    // limit 0 = unlimited (quota is v2.7+, this is identity only).
+    // One slot per run (256/boot bound, documented); failure is loud.
+    let ccg = user_lib::cgcreate(0);
+    if ccg < 0 {
+        user_lib::print("ctr: cgcreate failed\n");
+        user_lib::exit(1);
+    }
+    let ccg = ccg as usize;
     // new pid namespace (child becomes pid 1 there, v2.1 semantics),
     // then fork: child jails itself, parent reaps + forwards the code.
     if user_lib::unshare(user_lib::CLONE_NEWPID) != 0 {
@@ -212,6 +222,10 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool) {
     }
     let pid = user_lib::fork();
     if pid == 0 {
+        if user_lib::cgenter(ccg as isize) != 0 {
+            user_lib::print("ctr: cgenter failed\n");
+            user_lib::exit(127);
+        }
         if user_lib::chroot(root.as_ptr()) != 0 {
             user_lib::print("ctr: chroot failed\n");
             user_lib::exit(127);
@@ -234,7 +248,7 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool) {
                 user_lib::exit(1);
             }
             let start = (info - 2) as usize;
-            if !write_state(name, pid as usize, start) {
+            if !write_state(name, pid as usize, start, ccg) {
                 // hygiene: never leave an orphan we cannot track.
                 user_lib::kill(pid);
                 user_lib::print("ctr: detached state failed\n");
@@ -704,8 +718,8 @@ fn state_path(name: &[u8], out: &mut [u8; 64]) -> usize {
     n
 }
 
-/// write `<pid> <start> <name>\n` state; false on any I/O error.
-fn write_state(name: &[u8], pid: usize, start: usize) -> bool {
+/// write `<pid> <start> <cg> <name>\n` state; false on any I/O error.
+fn write_state(name: &[u8], pid: usize, start: usize, cg: usize) -> bool {
     let mut sp = [0u8; 64];
     state_path(name, &mut sp);
     let f = user_lib::open(sp.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
@@ -714,16 +728,23 @@ fn write_state(name: &[u8], pid: usize, start: usize) -> bool {
     }
     let mut b = [0u8; 64];
     let mut n = push_dec(&mut b, 0, pid);
-    // (pids/starts are small in practice, but push_dec saturates: never
-    // index past the end on absurd values -- fail the state write instead,
+    // (ids are small in practice, but push_dec saturates: never index
+    // past the end on absurd values -- fail the state write instead,
     // and the caller kills the untrackable child.)
-    if n + 30 > b.len() {
+    if n + 40 > b.len() {
         user_lib::close(f);
         return false;
     }
     b[n] = b' ';
     n += 1;
     n = push_dec(&mut b, n, start);
+    if n + 36 > b.len() {
+        user_lib::close(f);
+        return false;
+    }
+    b[n] = b' ';
+    n += 1;
+    n = push_dec(&mut b, n, cg);
     if n + 26 > b.len() {
         user_lib::close(f);
         return false;
@@ -748,8 +769,9 @@ fn write_state(name: &[u8], pid: usize, start: usize) -> bool {
     true
 }
 
-/// read state into (pid, start); None if missing/unparseable.
-fn read_state(name: &[u8]) -> Option<(usize, usize)> {
+/// read state into (pid, start, cg); None if missing/unparseable.
+/// Tolerates the v2.4 two-field format (`<pid> <start> ...`, cg = 0).
+fn read_state(name: &[u8]) -> Option<(usize, usize, usize)> {
     let mut sp = [0u8; 64];
     state_path(name, &mut sp);
     let f = user_lib::open(sp.as_ptr(), 0);
@@ -769,17 +791,52 @@ fn read_state(name: &[u8]) -> Option<(usize, usize)> {
         n += r as usize;
     }
     user_lib::close(f);
-    let mut i = 0;
-    while i < n && b[i] != b' ' {
+    // fields: <pid> <start> [<cg>] <name...>. The first two are required;
+    // the third is numeric only in the v2.6+ format (v2.4 wrote the name
+    // third -- a non-numeric third field means legacy, cg = 0).
+    let mut i = 0usize;
+    while i < n && b[i] == b' ' {
         i += 1;
     }
-    let pid = parse_dec(&b[..i])?;
-    let mut j = i + 1;
+    let mut j = i;
     while j < n && b[j] != b' ' && b[j] != b'\n' {
         j += 1;
     }
-    let start = parse_dec(&b[i + 1..j])?;
-    Some((pid, start))
+    let pid = parse_dec(&b[i..j])?;
+    let mut k = if j < n { j + 1 } else { n };
+    while k < n && b[k] == b' ' {
+        k += 1;
+    }
+    let mut l = k;
+    while l < n && b[l] != b' ' && b[l] != b'\n' {
+        l += 1;
+    }
+    let start = parse_dec(&b[k..l])?;
+    let mut cg = 0usize;
+    let mut m = if l < n { l + 1 } else { n };
+    while m < n && b[m] == b' ' {
+        m += 1;
+    }
+    if m < n && b[m] != b'\n' {
+        let mut e = m;
+        while e < n && b[e] != b' ' && b[e] != b'\n' {
+            e += 1;
+        }
+        // v2.6 format has FOUR fields (pid start cg name); v2.4 has three
+        // (pid start name). A numeric third field counts as cg only with
+        // a fourth field behind it -- otherwise a digit-leading v2.4 name
+        // ("123") would misroute stop at a wrong group.
+        if let Some(v) = parse_dec(&b[m..e]) {
+            let mut f2 = if e < n { e + 1 } else { n };
+            while f2 < n && b[f2] == b' ' {
+                f2 += 1;
+            }
+            if f2 < n && b[f2] != b'\n' {
+                cg = v;
+            }
+        }
+    }
+    Some((pid, start, cg))
 }
 
 /// pidinfo decode: (alive, start-matches-state). Zombie counts as NOT
@@ -837,7 +894,7 @@ fn cmd_ps() {
             let f = user_lib::open(sp.as_ptr(), 0);
             if f >= 0 {
                 user_lib::close(f);
-                if let Some((pid, start)) = read_state(entry) {
+                if let Some((pid, start, _cg)) = read_state(entry) {
                     user_lib::print("CTRPS ");
                     let _ = user_lib::write(1, entry.as_ptr(), len);
                     user_lib::print(" ");
@@ -880,36 +937,55 @@ fn cmd_ps() {
 }
 
 fn cmd_stop(name: &[u8]) {
-    let (pid, start) = match read_state(name) {
+    let (pid, start, cg) = match read_state(name) {
         Some(t) => t,
         None => {
             user_lib::print("ctr: no such container\n");
             user_lib::exit(1);
         }
     };
-    if !state_alive(pid, start) {
-        user_lib::print("stopped ");
-        let _ = user_lib::write(1, name.as_ptr(), name.len());
-        user_lib::print(" (already exited)\n");
-        user_lib::exit(0);
+    // v2.6: kill by cgroup when recorded (fate-sharing: children die
+    // with pid1 instead of escaping to init). Legacy cg==0 (v2.4 state
+    // files) keeps the old kill-pid1 path.
+    let mut killed: isize;
+    let grouped = cg > 0;
+    if grouped {
+        if !state_alive(pid, start) {
+            stopped_msg(name);
+        }
+        killed = user_lib::cgkill(cg as isize);
+        if killed < 0 {
+            // stale group id (reboot): the liveness check above already
+            // passed on (pid,start)... unreachable same-boot (groups are
+            // never deleted), but never kill blind -- fall back to pid1.
+            if user_lib::kill(pid as isize) != 0 {
+                stopped_msg(name);
+            }
+            killed = 1;
+        }
+    } else {
+        if !state_alive(pid, start) {
+            stopped_msg(name);
+        }
+        if user_lib::kill(pid as isize) != 0 {
+            // lost a race with exit/reap: same terminal state, same code.
+            stopped_msg(name);
+        }
+        killed = 1;
     }
-    if user_lib::kill(pid as isize) != 0 {
-        // lost a race with exit/reap: same terminal state, same code.
-        user_lib::print("stopped ");
-        let _ = user_lib::write(1, name.as_ptr(), name.len());
-        user_lib::print(" (already exited)\n");
-        user_lib::exit(0);
-    }
-    // poll until the slot is GONE (reaped), not merely dead: init reaps
-    // within ticks, and only a reaped death guarantees the exit code is
-    // in the kernel ring for the suite's `ps` code assertion (a lingering
-    // zombie would print plain `Exited`). 10s budget, then loud FAIL.
+    // poll until pid1 is GONE (reaped) and -- grouped only -- the group
+    // is empty (cgkill doubles as probe, returns 0). Gone guarantees the
+    // exit code reached the ring for the suite's ps assertion.
     let mut i = 0;
     while i < 10 {
-        if user_lib::pidinfo(pid as isize) == -1 {
+        let gone = user_lib::pidinfo(pid as isize) == -1;
+        let empty = !grouped || user_lib::cgkill(cg as isize) == 0;
+        if gone && empty {
             user_lib::print("stopped ");
             let _ = user_lib::write(1, name.as_ptr(), name.len());
-            user_lib::print("\n");
+            user_lib::print(" (killed ");
+            dbg_num(killed as usize);
+            user_lib::print(")\n");
             user_lib::exit(0);
         }
         user_lib::sleep(100); // 1s (sleep takes 10ms ticks)
@@ -917,6 +993,14 @@ fn cmd_stop(name: &[u8]) {
     }
     user_lib::print("ctr: stop timeout\n");
     user_lib::exit(1);
+}
+
+/// shared `(already exited)` terminal print (idempotent reruns).
+fn stopped_msg(name: &[u8]) -> ! {
+    user_lib::print("stopped ");
+    let _ = user_lib::write(1, name.as_ptr(), name.len());
+    user_lib::print(" (already exited)\n");
+    user_lib::exit(0);
 }
 
 /// delete path and everything under it. Files and dirs share one path:
@@ -975,7 +1059,7 @@ fn rm_all(path: &[u8; 64]) -> bool {
 fn cmd_rm(name: &[u8]) {
     // refuse to delete a live container (stop first, docker-style).
     // A stale state (reboot, start mismatch) is NOT live: falls through.
-    if let Some((pid, start)) = read_state(name) {
+    if let Some((pid, start, _cg)) = read_state(name) {
         if state_alive(pid, start) {
             user_lib::print("ctr: running (stop first)\n");
             user_lib::exit(1);
