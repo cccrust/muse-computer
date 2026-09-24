@@ -120,6 +120,13 @@ pub struct Cg {
 // v1.1: successful cross-hart steals (informational; printed at halt).
 static STEALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// v2.5: reaped exit codes, newest-last ring. (pid, code) pairs; pid-only
+// matching is safe (pids never repeat within a boot; ring dies at reboot).
+// 32 deep: suite paths hold a handful of exits; evicted entries degrade
+// to plain `Exited` (documented best-effort). Under sched_lock only.
+static mut REAPLOG: [(usize, i32); 32] = [(0, 0); 32];
+static mut REAPIDX: usize = 0;
+
 // v2.3: CPU accounting + caps (atomics only -- the timer tick path must
 // not take new locks; the sched lock is already hot there).
 // CG_CPU[cg] = cumulative ticks charged. CG_CAP[cg] = cap percent + 1
@@ -342,6 +349,27 @@ pub fn pidinfo(pid: usize) -> isize {
         }
         None => -1,
     }
+}
+
+/// v2.5: exit code of a reaped pid (see REAPLOG). Returns
+/// `code + 0x10000`, or -1 if no record. The bias is load-bearing: codes
+/// can be negative (killed = -9, panic = -1) while -1 also means
+/// "unknown". Codes are small (|code| << 0x10000) by construction
+/// (exit/kill codes); i64 transit avoids overflow paranoia.
+pub fn reapstat(pid: usize) -> isize {
+    // Serialize with ring appends (which happen under sched_lock).
+    let _guard = sched_lock();
+    unsafe {
+        let n = REAPIDX.min(REAPLOG.len());
+        // newest first (pids never repeat, so at most one hit).
+        for k in 0..n {
+            let (p, code) = REAPLOG[(REAPIDX + REAPLOG.len() - 1 - k) % REAPLOG.len()];
+            if p == pid && pid != 0 {
+                return (code as i64 + 0x10000) as isize;
+            }
+        }
+    }
+    -1
 }
 
 /// v2.2: create a child cgroup of the caller's, with a frame limit
@@ -2133,6 +2161,13 @@ pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
                 Some(p) => Some((p.root, p.tf_pa)),
                 None => None,
             };
+            // v2.5: retain the exit code (pid-only key: pids never repeat
+            // within a boot and the ring is memory-only, so no stale or
+            // cross-boot aliasing). Touched only under sched_lock.
+            unsafe {
+                REAPLOG[REAPIDX % REAPLOG.len()] = (c, code);
+                REAPIDX += 1;
+            }
             // v1.1: purge stale entries from ALL runqueues (pick paths
             // filter strays, but keep the queues clean anyway).
             for q in s.queues.iter_mut() {

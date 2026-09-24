@@ -852,7 +852,23 @@ fn cmd_ps() {
                         dbg_num(up);
                         user_lib::print("s");
                     } else {
-                        user_lib::print(" Exited");
+                        // v2.5: dead with a retained code?
+                        // reapstat returns code+0x10000, or -1 (alive-but-
+                        // unreaped zombie, evicted, or never existed).
+                        let rs = user_lib::reapstat(pid as isize);
+                        if rs != -1 {
+                            user_lib::print(" Exited (code ");
+                            let code = rs - 0x10000;
+                            if code < 0 {
+                                user_lib::print("-");
+                                dbg_num((0 - code) as usize);
+                            } else {
+                                dbg_num(code as usize);
+                            }
+                            user_lib::print(")");
+                        } else {
+                            user_lib::print(" Exited");
+                        }
                     }
                     user_lib::print("\n");
                 }
@@ -884,11 +900,13 @@ fn cmd_stop(name: &[u8]) {
         user_lib::print(" (already exited)\n");
         user_lib::exit(0);
     }
-    // poll for the death (!alive covers zombie-or-gone-or-stale: init
-    // reaps within ticks, and a lingering zombie is already dead here).
+    // poll until the slot is GONE (reaped), not merely dead: init reaps
+    // within ticks, and only a reaped death guarantees the exit code is
+    // in the kernel ring for the suite's `ps` code assertion (a lingering
+    // zombie would print plain `Exited`). 10s budget, then loud FAIL.
     let mut i = 0;
     while i < 10 {
-        if !state_alive(pid, start) {
+        if user_lib::pidinfo(pid as isize) == -1 {
             user_lib::print("stopped ");
             let _ = user_lib::write(1, name.as_ptr(), name.len());
             user_lib::print("\n");

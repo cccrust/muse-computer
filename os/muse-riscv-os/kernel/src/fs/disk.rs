@@ -5,7 +5,8 @@
 //         data_lba u32 root_ino u32
 //         [v1.6] journal_lba u32@52 journal_blocks u32@56 (both zero = none)
 //   bitmap: 1 bit/block. inodes: 64B (kind u8, pad[3], size u32,
-//         direct[8] u32, indirect u32, rsv). dirent: name[28] + ino u32.
+//         direct[8] u32, indirect u32, nlink u32 [v2+], dind u32 [v2.5+]).
+//         dirent: name[28] + ino u32.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -150,7 +151,9 @@ fn rebuild_bitmap() {
             k += 1;
         }
     }
-    // all inode data blocks
+    // all inode data blocks (v2.5: must cover the dind tree too --
+    // unmarked dind blocks get re-balloc'd on first write and clobber
+    // big files; observed as "cannot open /bin/sh" right after pull).
     let mut ino = 1u32;
     while ino <= ninodes() {
         if let Some(rec) = get_ino_raw(ino) {
@@ -168,6 +171,29 @@ fn rebuild_bitmap() {
                     let db = r32(&ib, k * 4);
                     if db != 0 {
                         mark(db);
+                    }
+                    k += 1;
+                }
+            }
+            if rec.dind != 0 {
+                mark(rec.dind);
+                let mut lb = [0u8; 512];
+                crate::fs::blk::read(rec.dind, &mut lb);
+                let mut k = 0;
+                while k < BLOCK / 4 {
+                    let l1b = r32(&lb, k * 4);
+                    if l1b != 0 {
+                        mark(l1b);
+                        let mut l2b = [0u8; 512];
+                        crate::fs::blk::read(l1b, &mut l2b);
+                        let mut j = 0;
+                        while j < BLOCK / 4 {
+                            let db = r32(&l2b, j * 4);
+                            if db != 0 {
+                                mark(db);
+                            }
+                            j += 1;
+                        }
                     }
                     k += 1;
                 }
@@ -199,6 +225,7 @@ fn get_ino_raw(ino: u32) -> Option<Ino> {
         direct,
         indirect: r32(&b, off + 40),
         nlink: if nl == 0 { 1 } else { nl },
+        dind: r32(&b, off + 48),
     })
 }
 
@@ -264,6 +291,9 @@ struct Ino {
     direct: [u32; 8],
     indirect: u32,
     nlink: u32,
+    // v2.5: double-indirect root (on-disk +48, was spare; 0 = none).
+    // Old images read 0 here (single-indirect behavior, bit-for-bit).
+    dind: u32,
 }
 
 fn ino_pos(ino: u32) -> (u32, usize) {
@@ -285,7 +315,8 @@ fn get_ino(ino: u32) -> Option<Ino> {
     for i in 0..8 {
         direct[i] = r32(&b, off + 8 + i * 4);
     }
-    // nlink at +44 (v2+); old images read 0 -> treat as 1
+    // nlink at +44 (v2+); old images read 0 -> treat as 1.
+    // dind at +48 (v2.5+); old images read 0 -> no second level.
     let nl = r32(&b, off + 44);
     Some(Ino {
         kind,
@@ -293,6 +324,7 @@ fn get_ino(ino: u32) -> Option<Ino> {
         direct,
         indirect: r32(&b, off + 40),
         nlink: if nl == 0 { 1 } else { nl },
+        dind: r32(&b, off + 48),
     })
 }
 
@@ -308,6 +340,7 @@ fn put_ino(ino: u32, rec: &Ino) {
     }
     w32(&mut b, off + 40, rec.indirect);
     w32(&mut b, off + 44, rec.nlink);
+    w32(&mut b, off + 48, rec.dind);
     crate::fs::blk::write(lba, &b);
 }
 
@@ -326,32 +359,71 @@ fn data_block(rec: &mut Ino, ino: u32, idx: u32, alloc: bool) -> Option<u32> {
         Some(b)
     } else {
         let ii = idx - 8;
-        if ii as usize * 4 >= BLOCK {
-            return None;
-        }
-        if rec.indirect == 0 {
-            if !alloc {
+        if (ii as usize) < BLOCK / 4 {
+            if rec.indirect == 0 {
+                if !alloc {
+                    return None;
+                }
+                let b = balloc()?;
+                rec.indirect = b;
+                // zero new indirect block (balloc zeroes? device blocks may hold
+                // stale data from previous image use: explicitly zero)
+                crate::fs::blk::write(b, &[0u8; 512]);
+                put_ino(ino, rec);
+            }
+            let mut ib = [0u8; 512];
+            crate::fs::blk::read(rec.indirect, &mut ib);
+            let mut b = r32(&ib, ii as usize * 4);
+            if b == 0 {
+                if !alloc {
+                    return None;
+                }
+                b = balloc()?;
+                w32(&mut ib, ii as usize * 4, b);
+                crate::fs::blk::write(rec.indirect, &ib);
+            }
+            Some(b)
+        } else {
+            // v2.5: double-indirect. ii2 < 128*128 (bigger than the disk).
+            let ii2 = ii - (BLOCK / 4) as u32;
+            if ii2 as usize >= (BLOCK / 4) * (BLOCK / 4) {
                 return None;
             }
-            let b = balloc()?;
-            rec.indirect = b;
-            // zero new indirect block (balloc zeroes? device blocks may hold
-            // stale data from previous image use: explicitly zero)
-            crate::fs::blk::write(b, &[0u8; 512]);
-            put_ino(ino, rec);
-        }
-        let mut ib = [0u8; 512];
-        crate::fs::blk::read(rec.indirect, &mut ib);
-        let mut b = r32(&ib, ii as usize * 4);
-        if b == 0 {
-            if !alloc {
-                return None;
+            let l1 = (ii2 as usize) / (BLOCK / 4);
+            let l2 = (ii2 as usize) % (BLOCK / 4);
+            if rec.dind == 0 {
+                if !alloc {
+                    return None;
+                }
+                let b = balloc()?;
+                rec.dind = b;
+                crate::fs::blk::write(b, &[0u8; 512]);
+                put_ino(ino, rec);
             }
-            b = balloc()?;
-            w32(&mut ib, ii as usize * 4, b);
-            crate::fs::blk::write(rec.indirect, &ib);
+            let mut lb = [0u8; 512];
+            crate::fs::blk::read(rec.dind, &mut lb);
+            let mut l1b = r32(&lb, l1 * 4);
+            if l1b == 0 {
+                if !alloc {
+                    return None;
+                }
+                l1b = balloc()?;
+                w32(&mut lb, l1 * 4, l1b);
+                crate::fs::blk::write(rec.dind, &lb);
+            }
+            let mut l2b = [0u8; 512];
+            crate::fs::blk::read(l1b, &mut l2b);
+            let mut b = r32(&l2b, l2 * 4);
+            if b == 0 {
+                if !alloc {
+                    return None;
+                }
+                b = balloc()?;
+                w32(&mut l2b, l2 * 4, b);
+                crate::fs::blk::write(l1b, &l2b);
+            }
+            Some(b)
         }
-        Some(b)
     }
 }
 
@@ -405,6 +477,27 @@ fn free_ino_blocks(rec: &Ino) {
         }
         bfree(rec.indirect);
     }
+    // v2.5: free the double-indirect tree (leaves, then l1 blocks,
+    // then the root). Zero entries are skipped, like above.
+    if rec.dind != 0 {
+        let mut lb = [0u8; 512];
+        crate::fs::blk::read(rec.dind, &mut lb);
+        for i in 0..BLOCK / 4 {
+            let l1b = r32(&lb, i * 4);
+            if l1b != 0 {
+                let mut l2b = [0u8; 512];
+                crate::fs::blk::read(l1b, &mut l2b);
+                for j in 0..BLOCK / 4 {
+                    let b = r32(&l2b, j * 4);
+                    if b != 0 {
+                        bfree(b);
+                    }
+                }
+                bfree(l1b);
+            }
+        }
+        bfree(rec.dind);
+    }
 }
 
 /// Truncate file to zero length (keep inode).
@@ -424,6 +517,7 @@ pub fn truncate_path(path: &str) -> bool {
     rec.size = 0;
     rec.direct = [0; 8];
     rec.indirect = 0;
+    rec.dind = 0;
     put_ino(ino, &rec);
     true
 }
@@ -599,6 +693,8 @@ pub fn create_empty(path: &str) -> bool {
             }
             w32(&mut b, off + 40, 0); // indirect
             w32(&mut b, off + 44, 1); // nlink
+            w32(&mut b, off + 48, 0); // dind (v2.5: stale 2nd-level root
+                                      // would alias like v2.3's indirect)
             crate::fs::blk::write(lba, &b);
             new_ino = i;
             break;
@@ -716,6 +812,7 @@ pub fn mkdir(path: &str) -> bool {
             }
             w32(&mut b, off + 40, 0); // indirect
             w32(&mut b, off + 44, 1); // nlink
+            w32(&mut b, off + 48, 0); // dind (v2.5, same reason)
             crate::fs::blk::write(lba, &b);
             new_ino = i;
             break;

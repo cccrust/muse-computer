@@ -141,11 +141,16 @@ impl Image {
         panic!("mkfs: out of inodes");
     }
     fn inode_grow(&mut self, ino: u32, data: &[u8]) {
-        // allocate blocks, fill direct[0..8] then indirect
+        // allocate blocks: direct[0..8], then single-indirect (128),
+        // then double-indirect (128x128). v2.5: the old code wrote past
+        // the single indirect block for files > 69632B, clobbering
+        // whatever followed it in the image (sh/ctr/wget did).
         let mut off = 0usize;
         let mut di = 0usize;
         let mut indirect_lba = 0u32;
         let mut indirect_used = 0usize;
+        let mut dind_lba = 0u32;
+        let mut dind_n = 0usize; // data blocks placed via dind so far
         while off < data.len() {
             let b = self.balloc();
             let n = core::cmp::min(BLOCK, data.len() - off);
@@ -155,7 +160,7 @@ impl Image {
             if di < 8 {
                 w32(&mut self.data, io + 8 + di * 4, b);
                 di += 1;
-            } else {
+            } else if indirect_used < 128 {
                 if indirect_lba == 0 {
                     indirect_lba = self.balloc();
                     w32(&mut self.data, io + 40, indirect_lba);
@@ -163,6 +168,23 @@ impl Image {
                 let o = indirect_lba as usize * BLOCK + indirect_used * 4;
                 w32(&mut self.data, o, b);
                 indirect_used += 1;
+            } else {
+                // double-indirect: l1 = dind_n / 128, l2 = dind_n % 128.
+                if dind_lba == 0 {
+                    dind_lba = self.balloc();
+                    w32(&mut self.data, io + 48, dind_lba);
+                }
+                let l1 = dind_n / 128;
+                let l2 = dind_n % 128;
+                assert!(l1 < 128, "mkfs: file too big for dind");
+                let o = dind_lba as usize * BLOCK + l1 * 4;
+                let mut l1b = r32(&self.data, o);
+                if l1b == 0 {
+                    l1b = self.balloc();
+                    w32(&mut self.data, o, l1b);
+                }
+                w32(&mut self.data, l1b as usize * BLOCK + l2 * 4, b);
+                dind_n += 1;
             }
             off += n;
         }
@@ -231,7 +253,7 @@ impl Image {
         }
         let ind = r32(&self.data, io + 40);
         let mut ii = 0usize;
-        while got < size && ind != 0 {
+        while got < size && ind != 0 && ii < 128 {
             let b = r32(&self.data, ind as usize * BLOCK + ii * 4);
             if b == 0 {
                 break;
@@ -240,6 +262,23 @@ impl Image {
             out.extend_from_slice(&self.data[b as usize * BLOCK..][..n]);
             got += n;
             ii += 1;
+        }
+        // v2.5: double-indirect (mirrors kernel data_block order).
+        let dind = r32(&self.data, io + 48);
+        let mut di = 0usize;
+        while got < size && dind != 0 {
+            let l1b = r32(&self.data, dind as usize * BLOCK + (di / 128) * 4);
+            if l1b == 0 {
+                break;
+            }
+            let b = r32(&self.data, l1b as usize * BLOCK + (di % 128) * 4);
+            if b == 0 {
+                break;
+            }
+            let n = core::cmp::min(BLOCK, size - got);
+            out.extend_from_slice(&self.data[b as usize * BLOCK..][..n]);
+            got += n;
+            di += 1;
         }
         Some(out)
     }

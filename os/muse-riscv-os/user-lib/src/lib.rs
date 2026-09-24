@@ -181,6 +181,12 @@ pub fn cgsetcpu(id: isize, pct: usize) -> isize {
 pub fn pidinfo(pid: isize) -> isize {
     ecall(51, pid as usize, 0, 0)
 }
+/// v2.5: exit code of a reaped pid (SYS_REAPSTAT=52). Returns
+/// `code + 0x10000`, or -1 if no record (still alive/zombie, or evicted
+/// from the 32-deep ring, or never existed).
+pub fn reapstat(pid: isize) -> isize {
+    ecall(52, pid as usize, 0, 0)
+}
 pub fn getcwd(buf: *mut u8, len: usize) -> isize {
     ecall(25, buf as usize, len, 0)
 }
