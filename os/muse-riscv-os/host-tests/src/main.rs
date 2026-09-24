@@ -105,4 +105,52 @@ mod tests {
         const CAP: usize = 1024;
         assert!(CAP >= 256);
     }
+    // v2.7: vruntime math mirror (source of truth:
+    // kernel/src/task/mod.rs cg_vruntime + best-pick in pop_valid_locked).
+    // Exact integer arithmetic, no timing -- pins the formula and the
+    // min-direction. Guest order-racing is deliberately NOT asserted
+    // anywhere (per-hart queue pinning, see _doc/v2.7.md §4).
+    fn vruntime(win_use: u64, share: u64) -> u64 {
+        let w = if share == 0 { 1 } else { share };
+        win_use.saturating_mul(1024) / w
+    }
+    fn best_pick(cands: &[(usize, u64, u64)]) -> Option<usize> {
+        // (pid, cg-use, cg-share) -> pid with min vruntime, ties FIFO.
+        let mut best: Option<(usize, u64)> = None;
+        for (pid, use_, share) in cands {
+            let vr = vruntime(*use_, *share);
+            let wins = match best {
+                None => true,
+                Some((_, b)) => vr < b,
+            };
+            if wins {
+                best = Some((*pid, vr));
+            }
+        }
+        best.map(|(p, _)| p)
+    }
+    #[test]
+    fn vruntime_ratio_8_to_1() {
+        // equal service: weight-8 virtual time is exactly 1/8 of weight-1.
+        assert_eq!(vruntime(800, 8), 800 * 1024 / 8);
+        assert_eq!(vruntime(800, 1), 800 * 1024);
+        assert_eq!(vruntime(800, 1) / vruntime(800, 8), 8);
+    }
+    #[test]
+    fn vruntime_default_share_is_one() {
+        // unset share (0 slot) behaves as weight 1.
+        assert_eq!(vruntime(100, 0), vruntime(100, 1));
+    }
+    #[test]
+    fn vruntime_min_direction() {
+        // least-served-relative-to-weight wins; ties keep FIFO.
+        assert_eq!(best_pick(&[(1, 800, 1), (2, 100, 8)]), Some(2));
+        assert_eq!(best_pick(&[(1, 0, 1), (2, 0, 8)]), Some(1));
+        assert_eq!(best_pick(&[(1, 800, 8), (2, 800, 8)]), Some(1));
+    }
+    #[test]
+    fn vruntime_starvation_free_shape() {
+        // a starved task (use 0) beats any served task at any weight.
+        assert_eq!(best_pick(&[(1, 100000, 1000), (2, 0, 1)]), Some(2));
+    }
 }

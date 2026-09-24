@@ -138,6 +138,9 @@ static CG_CPU: [core::sync::atomic::AtomicU64; 256] = unsafe { core::mem::zeroed
 static CG_CAP: [core::sync::atomic::AtomicU64; 256] = unsafe { core::mem::zeroed() };
 static CG_WIN: [core::sync::atomic::AtomicU64; 256] = unsafe { core::mem::zeroed() };
 static CG_WIN_USE: [core::sync::atomic::AtomicU64; 256] = unsafe { core::mem::zeroed() };
+// v2.7: CPU shares (weight per cgroup; 0 = default 1, so zeroed statics
+// are correct by construction like CG_CAP).
+static CG_SHARE: [core::sync::atomic::AtomicU64; 256] = unsafe { core::mem::zeroed() };
 
 /// v2.3: charge one timer tick to the running task's cgroup. Called from
 /// the timer ISR (lock discipline: brief sched_lock like the neighboring
@@ -202,6 +205,43 @@ pub fn cg_set_cpu(id: usize, pct: u64) -> bool {
     }
     CG_CAP[id].store(pct.min(100) + 1, SeqCst);
     true
+}
+
+/// v2.7: set CPU share weight (1-1000; higher = more CPU under contention).
+/// Returns false for bogus ids or weights. Default (never set) behaves as
+/// weight 1, so pre-v2.7 worlds are unchanged.
+pub fn cg_set_share(id: usize, weight: u64) -> bool {
+    use core::sync::atomic::Ordering::SeqCst;
+    if id >= 256 || weight == 0 || weight > 1000 {
+        return false;
+    }
+    {
+        let s = sched_lock();
+        if id >= s.cg.len() {
+            return false;
+        }
+    }
+    CG_SHARE[id].store(weight, SeqCst);
+    true
+}
+
+/// v2.7: windowed vruntime of a cgroup: `win_use * 1024 / eff_weight`
+/// (unset weight reads as 1). Stale-window reads as 0 (no debt yet).
+/// Racy-relaxed like the ceiling counters: worst case a slightly-off
+/// pick for one window, never starvation (a starved task's vruntime
+/// stays low, so it becomes the minimum).
+pub fn cg_vruntime(cg: usize) -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    if cg >= 256 {
+        return 0;
+    }
+    let w = CG_SHARE[cg].load(Relaxed);
+    let w = if w == 0 { 1 } else { w };
+    let now = crate::timer::ticks() as u64;
+    if CG_WIN[cg].load(Relaxed) != now / 100 {
+        return 0;
+    }
+    CG_WIN_USE[cg].load(Relaxed).saturating_mul(1024) / w
 }
 
 /// v1.1: scheduler balance stats line (called on the halt path).
@@ -480,8 +520,24 @@ fn pop_valid_locked(s: &mut Sched, h: usize, v: usize, skip_quota: bool) -> Opti
     // v2.3: over-quota picks are stashed (NOT dropped) and re-queued in
     // order when nothing better is found. Moving them to the back is fair:
     // throttled tasks wait longer, live ones are never lost.
+    // v2.7: pass 1 (skip_quota) returns the min-vruntime eligible task
+    // instead of the first: non-winners stash like over-quota tasks and
+    // go back in encounter order. Ties keep FIFO (first encountered wins).
     let mut stashed: [usize; 32] = [0; 32];
     let mut nstash = 0usize;
+    // stash-or-requeue helper, inline (borrow rules): stash while room,
+    // else push straight back (order disturbs slightly, never loses).
+    macro_rules! park {
+        ($pid:expr) => {
+            if nstash < 32 {
+                stashed[nstash] = $pid;
+                nstash += 1;
+            } else {
+                s.queues[v].push_back($pid);
+            }
+        };
+    }
+    let mut best: Option<(usize, u64)> = None;
     for _ in 0..n {
         let pid = match s.queues[v].pop_front() {
             Some(p) => p,
@@ -505,16 +561,29 @@ fn pop_valid_locked(s: &mut Sched, h: usize, v: usize, skip_quota: bool) -> Opti
         if !live {
             continue; // drop stale entry
         }
-        if skip_quota && nstash < 32 {
+        if skip_quota {
             let cg = match s.procs.get(pid).and_then(|o| o.as_ref()) {
                 Some(p) => p.cg,
                 None => 0,
             };
             if cg_over_quota(cg) {
-                stashed[nstash] = pid;
-                nstash += 1;
+                park!(pid);
                 continue;
             }
+            let vr = cg_vruntime(cg);
+            let wins = match best {
+                None => true,
+                Some((_, b)) => vr < b,
+            };
+            if wins {
+                if let Some((bp, _)) = best.take() {
+                    park!(bp);
+                }
+                best = Some((pid, vr));
+            } else {
+                park!(pid);
+            }
+            continue;
         }
         for k in 0..nstash {
             s.queues[v].push_back(stashed[k]);
@@ -523,6 +592,9 @@ fn pop_valid_locked(s: &mut Sched, h: usize, v: usize, skip_quota: bool) -> Opti
     }
     for k in 0..nstash {
         s.queues[v].push_back(stashed[k]);
+    }
+    if let Some((bp, _)) = best {
+        return Some(bp);
     }
     None
 }
@@ -1293,8 +1365,12 @@ fn find_next(s: &mut Sched, exclude: usize) -> Option<usize> {
 fn find_next_pass(s: &mut Sched, exclude: usize, skip_quota: bool) -> Option<usize> {
     let h = hartid() % crate::MAX_HART;
     // (queue, pid) stash for pass-1 over-quota tasks; pushed back below.
+    // v2.7: pass 1 also tracks the min-vruntime winner across all queues
+    // (best_off remembers where it came from for the steal counter).
     let mut stashed = [(0usize, 0usize); 64];
     let mut nstash = 0usize;
+    let mut best: Option<(usize, usize, u64)> = None; // (queue, pid, vruntime)
+    let mut best_off = 0usize;
     for off in 0..crate::MAX_HART {
         let v = (h + off) % crate::MAX_HART;
         let n = s.queues[v].len();
@@ -1318,8 +1394,33 @@ fn find_next_pass(s: &mut Sched, exclude: usize, skip_quota: bool) -> Option<usi
             }
             if let Some(Some(p)) = s.procs.get(pid) {
                 if p.state == State::Runnable || p.state == State::Running {
-                    if skip_quota && cg_over_quota(p.cg) {
-                        if nstash < stashed.len() {
+                    if skip_quota {
+                        if cg_over_quota(p.cg) {
+                            if nstash < stashed.len() {
+                                stashed[nstash] = (v, pid);
+                                nstash += 1;
+                            } else {
+                                s.queues[v].push_back(pid);
+                            }
+                            continue;
+                        }
+                        let vr = cg_vruntime(p.cg);
+                        let wins = match best {
+                            None => true,
+                            Some((_, _, b)) => vr < b,
+                        };
+                        if wins {
+                            if let Some((bq, bp, _)) = best.take() {
+                                if nstash < stashed.len() {
+                                    stashed[nstash] = (bq, bp);
+                                    nstash += 1;
+                                } else {
+                                    s.queues[bq].push_back(bp);
+                                }
+                            }
+                            best = Some((v, pid, vr));
+                            best_off = off;
+                        } else if nstash < stashed.len() {
                             stashed[nstash] = (v, pid);
                             nstash += 1;
                         } else {
@@ -1342,6 +1443,13 @@ fn find_next_pass(s: &mut Sched, exclude: usize, skip_quota: bool) -> Option<usi
     }
     for k in 0..nstash {
         s.queues[stashed[k].0].push_back(stashed[k].1);
+    }
+    // do NOT push back: becomes current
+    if let Some((_, bp, _)) = best {
+        if best_off > 0 {
+            STEALS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+        return Some(bp);
     }
     None
 }

@@ -193,6 +193,12 @@ pub fn reapstat(pid: isize) -> isize {
 pub fn cgkill(cg: isize) -> isize {
     ecall(53, cg as usize, 0, 0)
 }
+/// v2.7: CPU share weight (SYS_CGSETSHARE=54). cgsetshare(id, w) sets the
+/// vruntime weight (1-1000; higher = more CPU under contention). Default
+/// (never set) behaves as 1. Returns 0 or -1 for bogus ids/weights.
+pub fn cgsetshare(id: isize, weight: usize) -> isize {
+    ecall(54, id as usize, weight, 0)
+}
 pub fn getcwd(buf: *mut u8, len: usize) -> isize {
     ecall(25, buf as usize, len, 0)
 }

@@ -67,6 +67,8 @@ pub const SYS_PIDINFO: usize = 51;
 pub const SYS_REAPSTAT: usize = 52;
 // v2.6: kill all live tasks in a cgroup (ctr stop fate-sharing).
 pub const SYS_CGKILL: usize = 53;
+// v2.7: CPU share weight for a cgroup (vruntime fairness).
+pub const SYS_CGSETSHARE: usize = 54;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -164,6 +166,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_PIDINFO => crate::task::pidinfo(a0) as isize,
         SYS_REAPSTAT => crate::task::reapstat(a0) as isize,
         SYS_CGKILL => crate::task::cg_kill(a0) as isize,
+        SYS_CGSETSHARE => sys_cgsetshare(a0, a1 as u64) as isize,
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,
@@ -984,6 +987,15 @@ fn sys_cglimit(id: usize, limit: u64) -> isize {
 /// v2.3: set the CPU cap percent of cgroup id (0-100).
 fn sys_cgsetcpu(id: usize, pct: u64) -> isize {
     if crate::task::cg_set_cpu(id, pct) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// v2.7: set the CPU share weight of cgroup id (1-1000).
+fn sys_cgsetshare(id: usize, weight: u64) -> isize {
+    if crate::task::cg_set_share(id, weight) {
         0
     } else {
         -1

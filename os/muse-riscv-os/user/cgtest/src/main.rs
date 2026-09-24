@@ -153,6 +153,136 @@ fn cpu_phase() {
     }
 }
 
+// v2.7 share race: NHOG_HI hogs in a weight-8 group vs NHOG_LO hogs in
+// a weight-1 group, identical work, all uncapped (ceiling sits out --
+// pure weight contest). Hogs outnumber harts so every pick has
+// alternatives (same oversubscription discipline as cpu_phase).
+//
+// WHAT IS (AND IS NOT) ASSERTED -- read _doc/v2.7.md §4 first:
+// order is deliberately NOT asserted. On this scheduler each hart pins
+// its local queue (steals only happen on empty queues), so a lo hog
+// with a dedicated hart finishes at full speed no matter the weights --
+// first-finish would test queue luck, not shares. What IS asserted:
+// (a) API edges (bad id/weight), (b) COMPLETION: every hog finishes,
+// with the right codes and counts, inside 15s. Completion catches the
+// dangerous direction bug (pick-MAX instead of pick-min starves the
+// minimum forever -> timeout) and any hang/crash in the rewritten pick
+// paths; it cannot see weights (first-fit passes too -- documented).
+// The weights formula itself is pinned by host-tests (exact arithmetic).
+//
+// Hog discipline DIFFERS from cpu_phase on purpose (no yields here):
+// yields would schedule at ~MHz while vruntime charges land at 100Hz,
+// so the signal would sit frozen between ticks and the same task would
+// win every pick within a 10ms slice (pinning). Pure spin aligns picks
+// to timer ticks (fresh counters every pick). See _doc/v2.7.md.
+const NHOG_HI: usize = 4;
+const NHOG_LO: usize = 4;
+const HI_CODE: i32 = 55;
+const SPIN_N: u64 = 60_000_000;
+
+fn spinkes(n: u64) {
+    let mut k = 0u64;
+    while k < n {
+        k = k.wrapping_add(1);
+        // optimization barrier (DCE would otherwise delete a side-
+        // effect-free spin): fences cannot be proven dead, so the loop
+        // survives; cadence matches hog()'s yield rhythm, cost ~nil.
+        // No yield_: preemption comes from timer ticks only.
+        if k & 0x3ff == 0 {
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+fn share_phase() {
+    if user_lib::cgsetshare(9999, 8) != -1 {
+        fail("share-badid");
+    }
+    let ghi = user_lib::cgcreate(0);
+    if ghi < 0 {
+        fail("share-create-hi");
+    }
+    let glo = user_lib::cgcreate(0);
+    if glo < 0 {
+        fail("share-create-lo");
+    }
+    // 0 weight rejected, >1000 rejected (API edges, no timing).
+    if user_lib::cgsetshare(ghi, 0) != -1 {
+        fail("share-badw0");
+    }
+    if user_lib::cgsetshare(ghi, 1001) != -1 {
+        fail("share-badwbig");
+    }
+    if user_lib::cgsetshare(ghi, 8) != 0 {
+        fail("share-sethi");
+    }
+    if user_lib::cgsetshare(glo, 1) != 0 {
+        fail("share-setlo");
+    }
+    // lo hogs fork first (head start to the light side, mirroring the
+    // cpu_phase anti-flake discipline: a false PASS on broken shares
+    // must be ~impossible).
+    let mut i = 0;
+    while i < NHOG_LO {
+        let pid = user_lib::fork();
+        if pid == 0 {
+            if user_lib::cgenter(glo) != 0 {
+                fail("share-enter-lo");
+            }
+            spinkes(SPIN_N);
+            user_lib::exit(30 + i as i32);
+        } else if pid < 0 {
+            fail("share-fork-lo");
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j < NHOG_HI {
+        let pid = user_lib::fork();
+        if pid == 0 {
+            if user_lib::cgenter(ghi) != 0 {
+                fail("share-enter-hi");
+            }
+            spinkes(SPIN_N);
+            user_lib::exit(HI_CODE);
+        } else if pid < 0 {
+            fail("share-fork-hi");
+        }
+        j += 1;
+    }
+    let total = NHOG_HI + NHOG_LO;
+    let t0 = user_lib::time();
+    let mut code: i32 = -1;
+    let mut n = 0;
+    let mut seen_hi = 0;
+    let mut seen_lo = 0;
+    while n < total {
+        if user_lib::time() - t0 > 15000 {
+            fail("share-timeout");
+        }
+        let w = user_lib::waitpid(-1, &mut code as *mut i32, 0);
+        if w == -2 {
+            user_lib::yield_();
+            continue;
+        }
+        if w < 0 {
+            fail("share-reap");
+        }
+        // completion only (no order assertion -- see header comment).
+        if code == HI_CODE {
+            seen_hi += 1;
+        } else if code >= 30 && code < 30 + NHOG_LO as i32 {
+            seen_lo += 1;
+        } else {
+            fail("share-code");
+        }
+        n += 1;
+    }
+    if seen_hi != NHOG_HI || seen_lo != NHOG_LO {
+        fail("share-count");
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     // bad ids rejected
@@ -238,6 +368,9 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
         }
         // v2.3: CPU cap ordering (cap-as-ceiling, order assertion only).
         cpu_phase();
+        // v2.7: CPU share ordering (vruntime fairness, order assertion
+        // only -- ratios are never asserted, see _doc/v2.7.md §4).
+        share_phase();
         user_lib::print("[TEST] cg PASS\n");
         user_lib::exit(0);
     } else {
