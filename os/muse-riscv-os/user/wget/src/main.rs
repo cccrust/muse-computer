@@ -131,12 +131,23 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         user_lib::print("[TEST] wget FAIL (send)\n");
         user_lib::exit(1);
     }
-    // receive until EOF (server closes) or cap; find header first
+    // v2.3: stream the body to the output file (bodies of any size;
+    // the 4KB buffer only stages headers + transfer chunks). Phase 1
+    // reads until end-of-header; phase 2 writes body bytes while
+    // counting against Content-Length (exact match required, as before).
     let mut resp = [0u8; 4096];
     let mut n = 0usize;
     let mut spins = 0;
-    let mut eof = false;
-    while n < resp.len() {
+    loop {
+        let (code, _) = user_lib::http_split(&resp[..n]);
+        if code != 0 {
+            break;
+        }
+        if n >= resp.len() {
+            user_lib::close(fd);
+            user_lib::print("[TEST] wget FAIL (header)\n");
+            user_lib::exit(1);
+        }
         let r = user_lib::recv(fd, unsafe { resp.as_mut_ptr().add(n) }, resp.len() - n);
         if r > 0 {
             n += r as usize;
@@ -144,8 +155,77 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             continue;
         }
         if r == 0 {
-            eof = true;
-            break;
+            break; // EOF before header end: split below reports status 0
+        }
+        if r == -2 {
+            user_lib::sleep(1);
+            spins += 1;
+            if spins > 1000 {
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    let (code, off) = user_lib::http_split(&resp[..n]);
+    if code != 200 {
+        user_lib::close(fd);
+        user_lib::print("[TEST] wget FAIL (status)\n");
+        user_lib::exit(1);
+    }
+    let want = content_length(&resp[..off]);
+    if want == 0 {
+        user_lib::close(fd);
+        user_lib::print("[TEST] wget FAIL (length)\n");
+        user_lib::exit(1);
+    }
+    // save to file
+    let mut pb = [0u8; 128];
+    let k = outpath.len().min(127);
+    pb[..k].copy_from_slice(&outpath[..k]);
+    pb[k] = 0;
+    let f = user_lib::open(pb.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
+    if f < 0 {
+        user_lib::close(fd);
+        user_lib::print("[TEST] wget FAIL (open)\n");
+        user_lib::exit(1);
+    }
+    let mut got = 0usize;
+    // body bytes already staged behind the header
+    let mut w = off;
+    while w < n {
+        let r = user_lib::write(f, unsafe { resp.as_ptr().add(w) }, n - w);
+        if r <= 0 {
+            user_lib::close(fd);
+            user_lib::close(f);
+            user_lib::print("[TEST] wget FAIL (write)\n");
+            user_lib::exit(1);
+        }
+        w += r as usize;
+        got += r as usize;
+    }
+    // stream the rest (resp reused as chunk buffer)
+    spins = 0;
+    while got < want {
+        let r = user_lib::recv(fd, resp.as_mut_ptr(), resp.len());
+        if r > 0 {
+            spins = 0;
+            let mut o = 0;
+            while o < r as usize {
+                let q = user_lib::write(f, unsafe { resp.as_ptr().add(o) }, r as usize - o);
+                if q <= 0 {
+                    user_lib::close(fd);
+                    user_lib::close(f);
+                    user_lib::print("[TEST] wget FAIL (write)\n");
+                    user_lib::exit(1);
+                }
+                o += q as usize;
+                got += q as usize;
+            }
+            continue;
+        }
+        if r == 0 {
+            break; // server closed: got<want below reports it
         }
         if r == -2 {
             user_lib::sleep(1);
@@ -158,39 +238,11 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         break;
     }
     user_lib::close(fd);
-    let (code, off) = user_lib::http_split(&resp[..n]);
-    if code != 200 || !eof {
-        user_lib::print("[TEST] wget FAIL (status)\n");
-        user_lib::exit(1);
-    }
-    // verify Content-Length matches received body bytes
-    let want = content_length(&resp[..off]);
-    if want == 0 || n - off != want {
+    user_lib::close(f);
+    if got != want {
         user_lib::print("[TEST] wget FAIL (length)\n");
         user_lib::exit(1);
     }
-    // save to file
-    let mut pb = [0u8; 128];
-    let k = outpath.len().min(127);
-    pb[..k].copy_from_slice(&outpath[..k]);
-    pb[k] = 0;
-    let f = user_lib::open(pb.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
-    if f < 0 {
-        user_lib::print("[TEST] wget FAIL (open)\n");
-        user_lib::exit(1);
-    }
-    let body = &resp[off..n];
-    let mut w = 0;
-    while w < body.len() {
-        let r = user_lib::write(f, unsafe { body.as_ptr().add(w) }, body.len() - w);
-        if r <= 0 {
-            user_lib::close(f);
-            user_lib::print("[TEST] wget FAIL (write)\n");
-            user_lib::exit(1);
-        }
-        w += r as usize;
-    }
-    user_lib::close(f);
     user_lib::print("[TEST] wget PASS\n");
     user_lib::exit(0);
 }

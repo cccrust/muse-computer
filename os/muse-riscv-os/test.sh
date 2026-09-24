@@ -70,6 +70,9 @@ python3 tools/http_server.py > /tmp/muse-http.log 2>&1 &
 HTTP_PID=$!
 python3 tools/dns_stub.py > /tmp/muse-dns.log 2>&1 &
 DNS_PID=$!
+# v2.3: image registry stub for `ctr pull` (background, killed after §6).
+python3 tools/img_registry.py > /tmp/muse-img.log 2>&1 &
+IMG_PID=$!
 sleep 1
 # v1.5: run1 keeps QEMU alive in background so the host web client can
 # fetch from the guest webserver mid-run (a timeout-killed QEMU can't be
@@ -153,6 +156,8 @@ check "time PASS"
 check "nslookup PASS"
 check "wget PASS"
 check "curl PASS"
+check "img PASS"
+check "hello-from-image"
 check "ipi PASS"
 check "hart0 up"
 check "hart1 up"
@@ -194,10 +199,11 @@ if grep -q "PANIC" qemu.log; then
 else
   echo "OK: no PANIC"
 fi
-# v1.3/v1.7: stop the stub servers (run1 only)
+# v1.3/v1.7/v2.3: stop the stub servers (run1 only)
 kill $ECHO_PID 2>/dev/null || true
 kill $HTTP_PID 2>/dev/null || true
 kill $DNS_PID 2>/dev/null || true
+kill $IMG_PID 2>/dev/null || true
 
 echo "=== 7. persistence: second boot on SAME fs.img (no rebuild) ==="
 # v1.4: persist READ needs deep autorun (past stress), which loaded hosts
@@ -305,6 +311,13 @@ else
     echo "OK: contention line (run3)"
   else
     echo "FAIL: missing [contention sched=] in qemu3.log";
+    PASS=0
+  fi
+  # v2.3: cgroup count on clean shutdown (numbers vary; presence only)
+  if grep -q "CG] groups=" qemu3.log; then
+    echo "OK: cgroup line (run3)"
+  else
+    echo "FAIL: missing CG groups line in qemu3.log";
     PASS=0
   fi
   # v0.6: THRE delivery is only observable when an external trap claims it;

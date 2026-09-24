@@ -587,7 +587,17 @@ pub fn create_empty(path: &str) -> bool {
         let mut b = [0u8; 512];
         crate::fs::blk::read(lba, &mut b);
         if b[off] == 0 {
+            // v2.3: reset the whole record, not just kind/nlink. unlink
+            // frees data blocks but leaves stale size/direct/indirect;
+            // reusing them would alias blocks across files (observed:
+            // `ctr pull` unlinks a 60KB tar, the next create inherited
+            // its size + freed blocks). Fresh inodes must be empty.
             b[off] = KIND_FILE;
+            w32(&mut b, off + 4, 0); // size
+            for k in 0..8 {
+                w32(&mut b, off + 8 + k * 4, 0); // direct
+            }
+            w32(&mut b, off + 40, 0); // indirect
             w32(&mut b, off + 44, 1); // nlink
             crate::fs::blk::write(lba, &b);
             new_ino = i;
@@ -697,7 +707,14 @@ pub fn mkdir(path: &str) -> bool {
         let mut b = [0u8; 512];
         crate::fs::blk::read(lba, &mut b);
         if b[off] == 0 {
+            // v2.3: full reset like create_empty (stale size/blocks on
+            // reuse alias data blocks across files).
             b[off] = KIND_DIR;
+            w32(&mut b, off + 4, 0); // size
+            for k in 0..8 {
+                w32(&mut b, off + 8 + k * 4, 0); // direct
+            }
+            w32(&mut b, off + 40, 0); // indirect
             w32(&mut b, off + 44, 1); // nlink
             crate::fs::blk::write(lba, &b);
             new_ino = i;

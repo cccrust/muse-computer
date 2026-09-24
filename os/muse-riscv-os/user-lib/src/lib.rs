@@ -107,6 +107,10 @@ pub fn sbrk(inc: i32) -> isize {
 pub fn sleep(n: usize) -> isize {
     ecall(14, n, 0, 0)
 }
+/// v1.8: monotonic ms since boot (SYS_TIME=44; virt has no RTC).
+pub fn time() -> isize {
+    ecall(44, 0, 0, 0)
+}
 pub fn mkdir(path: *const u8) -> isize {
     ecall(17, path as usize, 0, 0)
 }
@@ -163,6 +167,12 @@ pub fn cgenter(id: isize) -> isize {
 }
 pub fn cglimit(id: isize, limit_frames: usize) -> isize {
     ecall(49, id as usize, limit_frames, 0)
+}
+/// v2.3: CPU cap (SYS_CGSETCPU=50). cgsetcpu(id, pct) caps the cgroup at
+/// pct percent of a 100-tick window (0 = run only when nothing else wants
+/// the hart). Returns 0 or -1 for bogus ids.
+pub fn cgsetcpu(id: isize, pct: usize) -> isize {
+    ecall(50, id as usize, pct, 0)
 }
 pub fn getcwd(buf: *mut u8, len: usize) -> isize {
     ecall(25, buf as usize, len, 0)

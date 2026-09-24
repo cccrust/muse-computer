@@ -40,6 +40,119 @@ fn fail(msg: &str) -> ! {
     user_lib::exit(1);
 }
 
+// v2.3 CPU cap race: NHOG_FREE uncapped hogs vs NHOG_CAP hogs sharing
+// one 5%-capped cgroup, identical work. Every pick system-wide prefers
+// uncapped tasks (capped run only via the work-conserving second pass).
+// Hogs far outnumber harts (4x oversubscribed) so every hart always has
+// queued alternatives -- without this, a capped hog alone on an idle
+// hart runs full speed via the pass-2 fallback and the order is a coin
+// flip (observed: 2+6 fails as cpu-order). Capped fork first (head start
+// to the throttled side: a false PASS on broken quota code is ~impossible).
+// The FIRST reaped child must be uncapped. 15s budget; timeout or wrong
+// order (or any wrong exit code) is FAIL. Tests ceiling, not floor.
+const NHOG_CAP: usize = 12;
+const NHOG_FREE: usize = 4;
+const HOG_N: u64 = 6_000_000;
+const FREE_CODE: i32 = 77;
+
+fn hog(n: u64) {
+    let mut k = 0u64;
+    loop {
+        k = k.wrapping_add(1);
+        if k >= n {
+            break;
+        }
+        // yield often: keeps the hogs queued (not just running) so the
+        // quota preference actually steers picks instead of pass-2 fallback.
+        if k & 0x3ff == 0 {
+            user_lib::yield_();
+        }
+    }
+}
+
+fn cpu_phase() {
+    if user_lib::cgsetcpu(9999, 5) != -1 {
+        fail("badcpu");
+    }
+    let gcap = user_lib::cgcreate(8000);
+    if gcap < 0 {
+        fail("cpu-create-cap");
+    }
+    let gfree = user_lib::cgcreate(8000);
+    if gfree < 0 {
+        fail("cpu-create-free");
+    }
+    if user_lib::cgsetcpu(gcap, 5) != 0 {
+        fail("cpu-setcap");
+    }
+    // gfree stays uncapped (default 100%).
+    let mut i = 0;
+    while i < NHOG_CAP {
+        let pid = user_lib::fork();
+        if pid == 0 {
+            if user_lib::cgenter(gcap) != 0 {
+                fail("cpu-enter-cap");
+            }
+            hog(HOG_N);
+            user_lib::exit(10 + i as i32);
+        } else if pid < 0 {
+            fail("cpu-fork-cap");
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while j < NHOG_FREE {
+        let pid = user_lib::fork();
+        if pid == 0 {
+            if user_lib::cgenter(gfree) != 0 {
+                fail("cpu-enter-free");
+            }
+            hog(HOG_N);
+            user_lib::exit(FREE_CODE);
+        } else if pid < 0 {
+            fail("cpu-fork-free");
+        }
+        j += 1;
+    }
+    let total = NHOG_CAP + NHOG_FREE;
+    let t0 = user_lib::time();
+    let mut code: i32 = -1;
+    let mut first = true;
+    let mut n = 0;
+    let mut seen_free = 0;
+    let mut seen_cap = 0;
+    while n < total {
+        if user_lib::time() - t0 > 15000 {
+            fail("cpu-timeout");
+        }
+        let w = user_lib::waitpid(-1, &mut code as *mut i32, 0);
+        if w == -2 {
+            user_lib::yield_();
+            continue;
+        }
+        if w < 0 {
+            fail("cpu-reap");
+        }
+        if first {
+            first = false;
+            if code != FREE_CODE {
+                fail("cpu-order");
+            }
+            seen_free += 1;
+        } else if code == FREE_CODE {
+            seen_free += 1;
+        } else if code >= 10 && code < 10 + NHOG_CAP as i32 {
+            seen_cap += 1;
+        } else {
+            fail("cpu-code");
+        }
+        n += 1;
+    }
+    if seen_free != NHOG_FREE || seen_cap != NHOG_CAP {
+        fail("cpu-count");
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     // bad ids rejected
@@ -123,6 +236,8 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
         if loss > 1500 {
             fail("leak");
         }
+        // v2.3: CPU cap ordering (cap-as-ceiling, order assertion only).
+        cpu_phase();
         user_lib::print("[TEST] cg PASS\n");
         user_lib::exit(0);
     } else {

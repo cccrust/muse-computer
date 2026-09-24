@@ -29,6 +29,9 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 // v2.0 container rootfs assembler: `ctr <name>` creates /ctr/<name>/bin
 // and hardlinks every /bin entry into it (zero-copy: links share inodes).
 // Idempotent (existing dirs/files are skipped, never fails on rerun).
+// v2.3: + `ctr run <name> <prog> [args...]` (one-shot container run) and
+// + `ctr pull <host> <port> <image>` (manifest + ustar layers from a
+// registry stub, unpacked into /ctr/<image>). See _doc/v2.3.md.
 fn mkdir_p(path: &[u8]) {
     // path is a NUL-terminated stack buffer built by caller
     if user_lib::mkdir(path.as_ptr()) != 0 {
@@ -36,36 +39,53 @@ fn mkdir_p(path: &[u8]) {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn main(argc: usize, argv: *const *const u8) {
-    if argc < 2 {
-        user_lib::print("usage: ctr <name>\n");
-        user_lib::exit(1);
+/// copy src into dst with NUL terminator; returns bytes copied (excl. NUL).
+fn nul_copy(dst: &mut [u8], src: &[u8]) -> usize {
+    let m = src.len().min(dst.len() - 1);
+    dst[..m].copy_from_slice(&src[..m]);
+    dst[m] = 0;
+    m
+}
+
+/// image/container name rules (shared by all subcommands): <24 chars,
+/// no `/`, no `..` (no path tricks out of /ctr).
+fn valid_name(name: &[u8]) -> bool {
+    if name.is_empty() || name.len() >= 24 {
+        return false;
     }
-    let name = match unsafe { user_lib::argv_str(argv, 1, argc) } {
-        Some(s) if !s.is_empty() && s.len() < 24 => s,
-        _ => {
-            user_lib::print("ctr: bad name\n");
-            user_lib::exit(1);
-        }
-    };
-    // reject path tricks in the name itself (no /, no ..)
     for &c in name.iter() {
         if c == b'/' || c == 0 {
-            user_lib::print("ctr: bad name\n");
-            user_lib::exit(1);
+            return false;
         }
     }
-    if name.len() >= 2 {
-        let mut i = 0;
-        while i + 1 < name.len() {
-            if name[i] == b'.' && name[i + 1] == b'.' {
-                user_lib::print("ctr: bad name\n");
-                user_lib::exit(1);
-            }
-            i += 1;
+    let mut i = 0;
+    while i + 1 < name.len() {
+        if name[i] == b'.' && name[i + 1] == b'.' {
+            return false;
         }
+        i += 1;
     }
+    true
+}
+
+/// wait for a specific child; returns its exit code, or -1 on reap error.
+fn wait_for(pid: isize) -> i32 {
+    let mut code: i32 = -1;
+    loop {
+        let w = user_lib::waitpid(pid, &mut code as *mut i32, 0);
+        if w == -2 {
+            user_lib::yield_();
+            continue;
+        }
+        if w != pid {
+            return -1;
+        }
+        return code;
+    }
+}
+
+// ---- v2.0 legacy: `ctr <name>` ----
+fn cmd_assemble(name: &[u8]) {
     // /ctr/<name>/bin
     let mut base = [0u8; 64];
     base[..5].copy_from_slice(b"/ctr/");
@@ -116,4 +136,541 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     let _ = user_lib::write(1, base.as_ptr(), basen);
     user_lib::print("\n");
     user_lib::exit(0);
+}
+
+// ---- v2.3: `ctr run <name> <prog> [args...]` ----
+fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]]) {
+    // root must exist (pull first; no implicit magic)
+    let mut root = [0u8; 64];
+    root[..5].copy_from_slice(b"/ctr/");
+    root[5..5 + name.len()].copy_from_slice(name);
+    root[5 + name.len()] = 0;
+    let mut probe = [0u8; 64];
+    if user_lib::getdents(root.as_ptr(), probe.as_mut_ptr(), 64) < 0 {
+        user_lib::print("ctr: no such image (pull first)\n");
+        user_lib::exit(1);
+    }
+    // prog resolution (same as the shell): contains `/` -> as-is
+    // (jailed by chroot after), bare name -> /bin/<prog>.
+    let mut progpath = [0u8; 64];
+    let mut slash = false;
+    for &c in prog.iter() {
+        if c == b'/' {
+            slash = true;
+            break;
+        }
+    }
+    if slash {
+        if prog.len() > 62 {
+            user_lib::print("ctr: prog too long\n");
+            user_lib::exit(1);
+        }
+        nul_copy(&mut progpath, prog);
+    } else {
+        if prog.len() > 57 {
+            user_lib::print("ctr: prog too long\n");
+            user_lib::exit(1);
+        }
+        progpath[..5].copy_from_slice(b"/bin/");
+        progpath[5..5 + prog.len()].copy_from_slice(prog);
+        progpath[5 + prog.len()] = 0;
+    }
+    // exec argv: argv[0] = prog as typed, then extra args (cap 6).
+    let mut toks = [[0u8; 64]; 7];
+    nul_copy(&mut toks[0], prog);
+    let mut n = 1usize;
+    for &a in args {
+        if n >= 7 {
+            break;
+        }
+        nul_copy(&mut toks[n], &a[..a.len().min(63)]);
+        n += 1;
+    }
+    let mut av: [*const u8; 8] = [core::ptr::null(); 8];
+    let mut i = 0;
+    while i < n {
+        av[i] = toks[i].as_ptr();
+        i += 1;
+    }
+    // new pid namespace (child becomes pid 1 there, v2.1 semantics),
+    // then fork: child jails itself, parent reaps + forwards the code.
+    if user_lib::unshare(user_lib::CLONE_NEWPID) != 0 {
+        user_lib::print("ctr: unshare failed\n");
+        user_lib::exit(1);
+    }
+    let pid = user_lib::fork();
+    if pid == 0 {
+        if user_lib::chroot(root.as_ptr()) != 0 {
+            user_lib::print("ctr: chroot failed\n");
+            user_lib::exit(127);
+        }
+        if user_lib::chdir(b"/\0".as_ptr()) != 0 {
+            user_lib::print("ctr: chdir failed\n");
+            user_lib::exit(127);
+        }
+        let _ = user_lib::exec(progpath.as_ptr(), av.as_ptr() as usize);
+        user_lib::print("ctr: exec failed\n");
+        user_lib::exit(127);
+    } else if pid > 0 {
+        // stdio inherited; no setfg (foreground semantics are v2.4).
+        let code = wait_for(pid);
+        if code < 0 {
+            user_lib::exit(1);
+        }
+        user_lib::exit(code);
+    } else {
+        user_lib::print("ctr: fork failed\n");
+        user_lib::exit(1);
+    }
+}
+
+// ---- v2.3: `ctr pull <host> <port> <image>` ----
+
+/// run `/bin/wget <host> <port> <path> <outfile>`; true iff exit code 0.
+fn run_wget(host: &[u8], port: &[u8], path: &[u8], out: &[u8]) -> bool {
+    let mut hb = [0u8; 64];
+    nul_copy(&mut hb, &host[..host.len().min(63)]);
+    let mut pb = [0u8; 16];
+    nul_copy(&mut pb, &port[..port.len().min(15)]);
+    let mut qb = [0u8; 128];
+    nul_copy(&mut qb, &path[..path.len().min(127)]);
+    let mut ob = [0u8; 32];
+    nul_copy(&mut ob, &out[..out.len().min(31)]);
+    let mut w0 = [0u8; 8];
+    w0[..4].copy_from_slice(b"wget");
+    let mut av: [*const u8; 6] = [
+        w0.as_ptr(),
+        hb.as_ptr(),
+        pb.as_ptr(),
+        qb.as_ptr(),
+        ob.as_ptr(),
+        core::ptr::null(),
+    ];
+    let mut wget = [0u8; 16];
+    wget[..9].copy_from_slice(b"/bin/wget");
+    let pid = user_lib::fork();
+    if pid == 0 {
+        let _ = user_lib::exec(wget.as_ptr(), av.as_ptr() as usize);
+        user_lib::exit(-1);
+    } else if pid > 0 {
+        return wait_for(pid) == 0;
+    }
+    false
+}
+
+fn is_zero_block(blk: &[u8; 512]) -> bool {
+    let mut i = 0;
+    while i < 512 {
+        if blk[i] != 0 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// octal size field (NUL/space padded); None on garbage.
+fn parse_octal(b: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < b.len() && (b[i] == 0 || b[i] == b' ') {
+        i += 1;
+    }
+    let mut v = 0usize;
+    let mut nd = 0;
+    while i < b.len() && b[i] >= b'0' && b[i] <= b'7' {
+        v = v.checked_mul(8)?.checked_add((b[i] - b'0') as usize)?;
+        i += 1;
+        nd += 1;
+    }
+    if nd == 0 {
+        return None;
+    }
+    Some(v)
+}
+
+fn read_block(fd: isize, blk: &mut [u8; 512]) -> bool {
+    let mut o = 0;
+    while o < 512 {
+        let r = user_lib::read(fd, unsafe { blk.as_mut_ptr().add(o) }, 512 - o);
+        if r <= 0 {
+            return false;
+        }
+        o += r as usize;
+    }
+    true
+}
+
+/// mkdir -p <root>/<rel> (rel may be a file path: only parents are made).
+/// Returns false if the final path would escape or overflow.
+fn mkdir_parents(root: &[u8], rootn: usize, rel: &[u8], is_dir: bool) -> bool {
+    // rel safety: relative only, no `..` components.
+    if rel.is_empty() || rel[0] == b'/' {
+        return false;
+    }
+    let mut i = 0;
+    while i < rel.len() {
+        let mut j = i;
+        while j < rel.len() && rel[j] != b'/' {
+            j += 1;
+        }
+        if &rel[i..j] == b".." {
+            return false;
+        }
+        let last = j >= rel.len();
+        if !last || is_dir {
+            // mkdir root/rel[..j]
+            let mut p = [0u8; 128];
+            if rootn + 1 + j > 127 {
+                return false;
+            }
+            p[..rootn].copy_from_slice(&root[..rootn]);
+            p[rootn] = b'/';
+            p[rootn + 1..rootn + 1 + j].copy_from_slice(&rel[..j]);
+            user_lib::mkdir(p.as_ptr());
+        }
+        i = j + 1;
+    }
+    true
+}
+
+fn skip_data(fd: isize, size: usize) -> bool {
+    let mut left = (size + 511) / 512;
+    let mut blk = [0u8; 512];
+    while left > 0 {
+        if !read_block(fd, &mut blk) {
+            return false;
+        }
+        left -= 1;
+    }
+    true
+}
+
+/// decimal print for untar diagnostics (no_std, no formatting).
+fn dbg_num(v: usize) {
+    let mut tmp = [0u8; 20];
+    let mut n = 0usize;
+    let mut x = v;
+    if x == 0 {
+        tmp[0] = b'0';
+        n = 1;
+    } else {
+        while x > 0 && n < 20 {
+            tmp[n] = b'0' + (x % 10) as u8;
+            x /= 10;
+            n += 1;
+        }
+    }
+    let mut i = 0;
+    while i < n {
+        let _ = user_lib::write(1, unsafe { tmp.as_ptr().add(n - 1 - i) }, 1);
+        i += 1;
+    }
+}
+
+/// unpack a ustar stream into root; returns #regular files, or -1 on error.
+/// Only regular files (`0`/`\0`) and dirs (`5`) are materialized; other
+/// typeflags are skipped by size. Later layers overwrite (plain write).
+fn untar(fd: isize, root: &[u8], rootn: usize) -> isize {
+    let mut blk = [0u8; 512];
+    let mut files = 0isize;
+    let mut nblk = 0usize; // diagnostic: tar-stream block index
+    loop {
+        if !read_block(fd, &mut blk) {
+            break; // EOF at a header boundary: clean end
+        }
+        if is_zero_block(&blk) {
+            break; // end-of-archive marker
+        }
+        // ustar magic (tarfile USTAR_FORMAT); garbage fails the pull.
+        if !(blk[257] == b'u'
+            && blk[258] == b's'
+            && blk[259] == b't'
+            && blk[260] == b'a'
+            && blk[261] == b'r')
+        {
+            user_lib::print("[TEST] img FAIL (untar:magic blk=");
+            dbg_num(nblk);
+            user_lib::print(" tf=");
+            dbg_num(blk[156] as usize);
+            user_lib::print(")\n");
+            return -1;
+        }
+        let mut nlen = 0;
+        while nlen < 100 && blk[nlen] != 0 {
+            nlen += 1;
+        }
+        if nlen == 0 || nlen > 90 {
+            user_lib::print("[TEST] img FAIL (untar:name blk=");
+            dbg_num(nblk);
+            user_lib::print(")\n");
+            return -1;
+        }
+        let size = match parse_octal(&blk[124..136]) {
+            Some(v) => v,
+            None => {
+                user_lib::print("[TEST] img FAIL (untar:octal blk=");
+                dbg_num(nblk);
+                user_lib::print(")\n");
+                return -1;
+            }
+        };
+        if size > (1 << 20) {
+            user_lib::print("[TEST] img FAIL (untar:big blk=");
+            dbg_num(nblk);
+            user_lib::print(" size=");
+            dbg_num(size);
+            user_lib::print(")\n");
+            return -1; // corrupt-size guard (guest ELFs are tens of KB)
+        }
+        let name = &blk[..nlen];
+        let tf = blk[156];
+        if tf == b'5' {
+            if !mkdir_parents(root, rootn, name, true) {
+                user_lib::print("[TEST] img FAIL (untar:mkdir blk=");
+                dbg_num(nblk);
+                user_lib::print(")\n");
+                return -1;
+            }
+            if !skip_data(fd, size) {
+                user_lib::print("[TEST] img FAIL (untar:skipdir blk=");
+                dbg_num(nblk);
+                user_lib::print(")\n");
+                return -1;
+            }
+            nblk += 1 + (size + 511) / 512;
+        } else if tf == b'0' || tf == 0 {
+            if !mkdir_parents(root, rootn, name, false) {
+                // unsafe path: skip its data, keep the pull alive
+                if !skip_data(fd, size) {
+                    user_lib::print("[TEST] img FAIL (untar:skipunsafe blk=");
+                    dbg_num(nblk);
+                    user_lib::print(")\n");
+                    return -1;
+                }
+                nblk += 1 + (size + 511) / 512;
+                continue;
+            }
+            let mut p = [0u8; 128];
+            p[..rootn].copy_from_slice(&root[..rootn]);
+            p[rootn] = b'/';
+            p[rootn + 1..rootn + 1 + nlen].copy_from_slice(name);
+            let f = user_lib::open(p.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
+            if f < 0 {
+                user_lib::print("[TEST] img FAIL (untar:open blk=");
+                dbg_num(nblk);
+                user_lib::print(")\n");
+                return -1;
+            }
+            let mut left = size;
+            let mut ok = true;
+            while left > 0 {
+                if !read_block(fd, &mut blk) {
+                    user_lib::print("[TEST] img FAIL (untar:data blk=");
+                    dbg_num(nblk);
+                    user_lib::print(" left=");
+                    dbg_num(left);
+                    user_lib::print(")\n");
+                    ok = false;
+                    break;
+                }
+                nblk += 1;
+                let take = left.min(512);
+                let mut w = 0;
+                while w < take {
+                    let r = user_lib::write(f, unsafe { blk.as_ptr().add(w) }, take - w);
+                    if r <= 0 {
+                        user_lib::print("[TEST] img FAIL (untar:write blk=");
+                        dbg_num(nblk);
+                        user_lib::print(")\n");
+                        ok = false;
+                        break;
+                    }
+                    w += r as usize;
+                }
+                if !ok {
+                    break;
+                }
+                left -= take;
+            }
+            user_lib::close(f);
+            if !ok {
+                return -1;
+            }
+            files += 1;
+            nblk += 1; // header block (data blocks counted above)
+        } else {
+            // unknown typeflag (x/g/L/K...): skip by size, stay in sync.
+            if !skip_data(fd, size) {
+                user_lib::print("[TEST] img FAIL (untar:skiptf blk=");
+                dbg_num(nblk);
+                user_lib::print(")\n");
+                return -1;
+            }
+            nblk += 1 + (size + 511) / 512;
+        }
+    }
+    files
+}
+
+fn cmd_pull(host: &[u8], port: &[u8], image: &[u8]) {
+    mkdir_p(b"/tmp\0");
+    mkdir_p(b"/ctr\0");
+    let mut root = [0u8; 64];
+    root[..5].copy_from_slice(b"/ctr/");
+    root[5..5 + image.len()].copy_from_slice(image);
+    let rootn = 5 + image.len();
+    mkdir_p(&root);
+    // 1. manifest -> /tmp/manifest
+    let mut mpath = [0u8; 128];
+    mpath[0] = b'/';
+    mpath[1..1 + image.len()].copy_from_slice(image);
+    let mpn = 1 + image.len();
+    mpath[mpn..mpn + 9].copy_from_slice(b"/manifest");
+    if !run_wget(host, port, &mpath[..mpn + 9], b"/tmp/manifest") {
+        user_lib::print("[TEST] img FAIL (manifest)\n");
+        user_lib::exit(1);
+    }
+    // 2. parse manifest: one layer filename per line, `#` comments.
+    let mf = user_lib::open(b"/tmp/manifest\0".as_ptr(), 0);
+    if mf < 0 {
+        user_lib::print("[TEST] img FAIL (manifest-open)\n");
+        user_lib::exit(1);
+    }
+    let mut mb = [0u8; 2048];
+    let mut mn = 0usize;
+    loop {
+        if mn >= mb.len() {
+            break;
+        }
+        let r = user_lib::read(mf, unsafe { mb.as_mut_ptr().add(mn) }, mb.len() - mn);
+        if r <= 0 {
+            break;
+        }
+        mn += r as usize;
+    }
+    user_lib::close(mf);
+    let mut layers = [[0u8; 64]; 8];
+    let mut layern = [0usize; 8];
+    let mut nl = 0usize;
+    let mut i = 0usize;
+    while i < mn {
+        let mut j = i;
+        while j < mn && mb[j] != b'\n' {
+            j += 1;
+        }
+        let mut e = j;
+        if e > i && mb[e - 1] == b'\r' {
+            e -= 1;
+        }
+        let line = &mb[i..e];
+        if !line.is_empty() && line[0] != b'#' && nl < 8 {
+            let m = line.len().min(63);
+            layers[nl][..m].copy_from_slice(&line[..m]);
+            layern[nl] = m;
+            nl += 1;
+        }
+        i = j + 1;
+    }
+    if nl == 0 {
+        user_lib::print("[TEST] img FAIL (no-layers)\n");
+        user_lib::exit(1);
+    }
+    // 3. fetch + unpack each layer in order (later layers overwrite).
+    let mut files = 0isize;
+    let mut li = 0usize;
+    while li < nl {
+        let layer = &layers[li][..layern[li]];
+        let mut rpath = [0u8; 128];
+        rpath[0] = b'/';
+        rpath[1..1 + image.len()].copy_from_slice(image);
+        let rpn = 1 + image.len();
+        rpath[rpn] = b'/';
+        rpath[rpn + 1..rpn + 1 + layer.len()].copy_from_slice(layer);
+        let mut ob = [0u8; 32];
+        ob[..7].copy_from_slice(b"/tmp/l0");
+        ob[6] = b'0' + li as u8;
+        ob[7..11].copy_from_slice(b".tar");
+        if !run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..11]) {
+            user_lib::print("[TEST] img FAIL (layer)\n");
+            user_lib::exit(1);
+        }
+        let tf = user_lib::open(ob.as_ptr(), 0);
+        if tf < 0 {
+            user_lib::print("[TEST] img FAIL (layer-open)\n");
+            user_lib::exit(1);
+        }
+        let f = untar(tf, &root[..rootn], rootn);
+        user_lib::close(tf);
+        user_lib::unlink(ob.as_ptr());
+        if f < 0 {
+            // reason already printed by untar (untar:<tag>)
+            user_lib::exit(1);
+        }
+        files += f;
+        li += 1;
+    }
+    user_lib::unlink(b"/tmp/manifest\0".as_ptr());
+    if files <= 0 {
+        user_lib::print("[TEST] img FAIL (empty)\n");
+        user_lib::exit(1);
+    }
+    user_lib::print("[TEST] img PASS\n");
+    user_lib::exit(0);
+}
+
+#[no_mangle]
+pub extern "C" fn main(argc: usize, argv: *const *const u8) {
+    if argc < 2 {
+        user_lib::print("usage: ctr <name> | ctr run <name> <prog> [args...] | ctr pull <host> <port> <image>\n");
+        user_lib::exit(1);
+    }
+    let a1 = match unsafe { user_lib::argv_str(argv, 1, argc) } {
+        Some(s) => s,
+        None => {
+            user_lib::print("ctr: bad args\n");
+            user_lib::exit(1);
+        }
+    };
+    if a1 == b"run" {
+        // ctr run <name> <prog> [args...]
+        if argc < 4 {
+            user_lib::print("usage: ctr run <name> <prog> [args...]\n");
+            user_lib::exit(1);
+        }
+        let name = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        let prog = unsafe { user_lib::argv_str(argv, 3, argc).unwrap_or(b"") };
+        if !valid_name(name) || prog.is_empty() {
+            user_lib::print("ctr: bad name or prog\n");
+            user_lib::exit(1);
+        }
+        let mut extra: [&[u8]; 6] = [b""; 6];
+        let mut ne = 0usize;
+        let mut k = 4usize;
+        while k < argc && ne < 6 {
+            extra[ne] = unsafe { user_lib::argv_str(argv, k, argc).unwrap_or(b"") };
+            ne += 1;
+            k += 1;
+        }
+        cmd_run(name, prog, &extra[..ne]);
+    } else if a1 == b"pull" {
+        // ctr pull <host> <port> <image>
+        if argc != 5 {
+            user_lib::print("usage: ctr pull <host> <port> <image>\n");
+            user_lib::exit(1);
+        }
+        let host = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        let port = unsafe { user_lib::argv_str(argv, 3, argc).unwrap_or(b"") };
+        let image = unsafe { user_lib::argv_str(argv, 4, argc).unwrap_or(b"") };
+        if host.is_empty() || port.is_empty() || !valid_name(image) {
+            user_lib::print("ctr: bad host/port/image\n");
+            user_lib::exit(1);
+        }
+        cmd_pull(host, port, image);
+    } else {
+        if !valid_name(a1) {
+            user_lib::print("ctr: bad name\n");
+            user_lib::exit(1);
+        }
+        cmd_assemble(a1);
+    }
 }

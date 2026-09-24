@@ -59,6 +59,8 @@ pub const SYS_UNSHARE: usize = 46;
 pub const SYS_CGCREATE: usize = 47;
 pub const SYS_CGENTER: usize = 48;
 pub const SYS_CGLIMIT: usize = 49;
+// v2.3: CPU cap percent (0-100) for a cgroup.
+pub const SYS_CGSETCPU: usize = 50;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -152,6 +154,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_CGCREATE => sys_cgcreate(a0 as u64) as isize,
         SYS_CGENTER => sys_cgenter(a0) as isize,
         SYS_CGLIMIT => sys_cglimit(a0, a1 as u64) as isize,
+        SYS_CGSETCPU => sys_cgsetcpu(a0, a1 as u64) as isize,
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,
@@ -358,7 +361,17 @@ fn sys_open(path_ptr: usize, flags: i32) -> isize {
         const O_TRUNC: i32 = 0x200;
         const O_APPEND: i32 = 0x400;
         const O_CLOEXEC: i32 = 0x80000;
-        if crate::fs::read_file(&path).is_none() {
+        // v2.3: existence must bypass the /bin embed fallback in
+        // fs::read_file (it returns embedded ELFs by basename: creating
+        // e.g. /ctr/testimg/bin/echo would "exist" as embedded `echo`,
+        // skip creation, and then every write fails on the missing
+        // disk file). exec keeps using the fallback; open must not.
+        let exists = if crate::fs::use_disk() {
+            crate::fs::disk::read_file(&path).is_some()
+        } else {
+            crate::fs::ramfs::read_file(&path).is_some()
+        };
+        if !exists {
             if flags & O_CREATE != 0 {
                 crate::fs::write_file(&path, b"");
             } else {
@@ -953,6 +966,15 @@ fn sys_cgenter(id: usize) -> isize {
 /// v2.2: set the frame limit of cgroup id (0 = unlimited).
 fn sys_cglimit(id: usize, limit: u64) -> isize {
     if crate::task::cgsetlimit(id, limit) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// v2.3: set the CPU cap percent of cgroup id (0-100).
+fn sys_cgsetcpu(id: usize, pct: u64) -> isize {
+    if crate::task::cg_set_cpu(id, pct) {
         0
     } else {
         -1

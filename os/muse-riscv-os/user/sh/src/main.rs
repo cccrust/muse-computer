@@ -1187,6 +1187,18 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"curl", b"10.0.2.2", b"8090", b"/test.txt"],
         &mut jobs,
     );
+    // v2.3: image suite (registry stub must be up: test.sh starts it).
+    // pull the test image, then run its /bin/echo inside a container.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"pull", b"10.0.2.2", b"8091", b"testimg"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"run", b"testimg", b"/bin/echo", b"hello-from-image"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

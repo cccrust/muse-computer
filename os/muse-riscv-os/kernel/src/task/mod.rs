@@ -116,6 +116,83 @@ pub struct Cg {
 // v1.1: successful cross-hart steals (informational; printed at halt).
 static STEALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// v2.3: CPU accounting + caps (atomics only -- the timer tick path must
+// not take new locks; the sched lock is already hot there).
+// CG_CPU[cg] = cumulative ticks charged. CG_CAP[cg] = cap percent + 1
+// (0 = uncapped default, so zeroed statics are correct by construction;
+// 1..101 store pct 0..100). Windowed enforcement state below.
+// NOTE: [AtomicU64; 256] can't use array-repeat (atomics aren't Copy), so
+// zeroed() initialization -- valid because 0 is the default for all four.
+static CG_CPU: [core::sync::atomic::AtomicU64; 256] = unsafe { core::mem::zeroed() };
+static CG_CAP: [core::sync::atomic::AtomicU64; 256] = unsafe { core::mem::zeroed() };
+static CG_WIN: [core::sync::atomic::AtomicU64; 256] = unsafe { core::mem::zeroed() };
+static CG_WIN_USE: [core::sync::atomic::AtomicU64; 256] = unsafe { core::mem::zeroed() };
+
+/// v2.3: charge one timer tick to the running task's cgroup. Called from
+/// the timer ISR (lock discipline: brief sched_lock like the neighboring
+/// wake_* calls, then lock-free atomic bumps).
+pub fn cg_tick() {
+    let cg = {
+        let s = sched_lock();
+        let cur = s.current[hartid() % crate::MAX_HART];
+        match s.procs.get(cur).and_then(|o| o.as_ref()) {
+            Some(p) => p.cg.min(255),
+            None => return,
+        }
+    };
+    use core::sync::atomic::Ordering::Relaxed;
+    CG_CPU[cg].fetch_add(1, Relaxed);
+    let now = crate::timer::ticks() as u64;
+    let win = now / 100;
+    // join the current window (first arrival opens it; races benign --
+    // worst case a slightly loose cap for one window, documented).
+    if CG_WIN[cg].load(Relaxed) != win {
+        CG_WIN[cg].store(win, Relaxed);
+        CG_WIN_USE[cg].store(1, Relaxed);
+    } else {
+        CG_WIN_USE[cg].fetch_add(1, Relaxed);
+    }
+}
+
+/// v2.3: is this cgroup over its cap in the current 100-tick window?
+/// Uncapped (stored 0) short-circuits. Races err toward leniency (see above).
+pub fn cg_over_quota(cg: usize) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    if cg >= 256 {
+        return false;
+    }
+    let stored = CG_CAP[cg].load(Relaxed);
+    if stored == 0 {
+        return false;
+    }
+    let pct = stored - 1;
+    let now = crate::timer::ticks() as u64;
+    if CG_WIN[cg].load(Relaxed) != now / 100 {
+        return false; // window turnover in flight: admit, recount follows
+    }
+    let used = CG_WIN_USE[cg].load(Relaxed);
+    let elapsed = (now % 100) + 1;
+    used * 100 > pct * elapsed
+}
+
+/// v2.3: set CPU cap percent (0-100; 0 = run only when nothing else wants
+/// the hart). Returns false for bogus ids.
+pub fn cg_set_cpu(id: usize, pct: u64) -> bool {
+    use core::sync::atomic::Ordering::SeqCst;
+    if id >= 256 {
+        return false;
+    }
+    // id must be a live cgroup (task-side table owns allocation)
+    {
+        let s = sched_lock();
+        if id >= s.cg.len() {
+            return false;
+        }
+    }
+    CG_CAP[id].store(pct.min(100) + 1, SeqCst);
+    true
+}
+
 /// v1.1: scheduler balance stats line (called on the halt path).
 /// v1.2: plus the SCHED-lock contention verdict line (v1.4 decision data).
 pub fn print_stats() {
@@ -131,6 +208,9 @@ pub fn print_stats() {
     // v1.6: heap watermark (fragmentation watch after dealloc coalescing).
     let (hfree, hlarge) = crate::mem::heap::stats();
     crate::println!("[MM] heap free={} largest={}", hfree, hlarge);
+    // v2.3: cgroup count (v2.2 doc promised this line; existence only).
+    let ngroups = sched_lock().cg.len();
+    crate::println!("[CG] groups={}", ngroups);
 }
 
 static mut SCHED: Option<crate::sync::SpinMutex<Sched>> = None;
@@ -334,9 +414,14 @@ fn enqueue_locked(s: &mut Sched, pid: usize, hq: usize) -> bool {
 /// v1.1: scan queues[v] (bounded), drop stale entries (reaped / zombie /
 /// blocked / owned by another hart), return the first takeable pid for
 /// hart h. Caller validates state was Runnable-or-orphan-Running.
-fn pop_valid_locked(s: &mut Sched, h: usize, v: usize) -> Option<usize> {
+fn pop_valid_locked(s: &mut Sched, h: usize, v: usize, skip_quota: bool) -> Option<usize> {
     let v = v % crate::MAX_HART;
     let n = s.queues[v].len();
+    // v2.3: over-quota picks are stashed (NOT dropped) and re-queued in
+    // order when nothing better is found. Moving them to the back is fair:
+    // throttled tasks wait longer, live ones are never lost.
+    let mut stashed: [usize; 32] = [0; 32];
+    let mut nstash = 0usize;
     for _ in 0..n {
         let pid = match s.queues[v].pop_front() {
             Some(p) => p,
@@ -357,10 +442,27 @@ fn pop_valid_locked(s: &mut Sched, h: usize, v: usize) -> Option<usize> {
             }
             _ => false,
         };
-        if live {
-            return Some(pid);
+        if !live {
+            continue; // drop stale entry
         }
-        // else: drop stale entry
+        if skip_quota && nstash < 32 {
+            let cg = match s.procs.get(pid).and_then(|o| o.as_ref()) {
+                Some(p) => p.cg,
+                None => 0,
+            };
+            if cg_over_quota(cg) {
+                stashed[nstash] = pid;
+                nstash += 1;
+                continue;
+            }
+        }
+        for k in 0..nstash {
+            s.queues[v].push_back(stashed[k]);
+        }
+        return Some(pid);
+    }
+    for k in 0..nstash {
+        s.queues[v].push_back(stashed[k]);
     }
     None
 }
@@ -368,14 +470,24 @@ fn pop_valid_locked(s: &mut Sched, h: usize, v: usize) -> Option<usize> {
 /// v1.1: pick next task for hart h: local queue first, then steal one
 /// task per pass from other harts (round-robin). A successful steal bumps
 /// STEALS. Caller marks Running + current[h] + idle[h]=false.
+/// v2.3: two passes -- first respects CPU caps (skips over-quota tasks),
+/// second takes anything (work-conserving: idleness is worse than
+/// over-quota execution).
 fn pick_locked(s: &mut Sched, h: usize) -> Option<usize> {
     let h = h % crate::MAX_HART;
-    if let Some(pid) = pop_valid_locked(s, h, h) {
+    if let Some(pid) = pick_pass(s, h, true) {
+        return Some(pid);
+    }
+    pick_pass(s, h, false)
+}
+
+fn pick_pass(s: &mut Sched, h: usize, skip_quota: bool) -> Option<usize> {
+    if let Some(pid) = pop_valid_locked(s, h, h, skip_quota) {
         return Some(pid);
     }
     for off in 1..crate::MAX_HART {
         let v = (h + off) % crate::MAX_HART;
-        if let Some(pid) = pop_valid_locked(s, h, v) {
+        if let Some(pid) = pop_valid_locked(s, h, v, skip_quota) {
             STEALS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
             return Some(pid);
         }
@@ -1079,7 +1191,20 @@ fn find_next(s: &mut Sched, exclude: usize) -> Option<usize> {
     // v1.1: exiting hart takes local work first, then steals (one task).
     // RR within a queue is preserved (pop front, stale dropped). The
     // exiting pid is dropped wherever met (it just went Zombie).
+    // v2.3: two passes like pick_locked -- first skips over-quota tasks
+    // (stashed back to their queues), second takes anything
+    // (work-conserving: idleness is worse than over-quota execution).
+    if let Some(pid) = find_next_pass(s, exclude, true) {
+        return Some(pid);
+    }
+    find_next_pass(s, exclude, false)
+}
+
+fn find_next_pass(s: &mut Sched, exclude: usize, skip_quota: bool) -> Option<usize> {
     let h = hartid() % crate::MAX_HART;
+    // (queue, pid) stash for pass-1 over-quota tasks; pushed back below.
+    let mut stashed = [(0usize, 0usize); 64];
+    let mut nstash = 0usize;
     for off in 0..crate::MAX_HART {
         let v = (h + off) % crate::MAX_HART;
         let n = s.queues[v].len();
@@ -1103,15 +1228,30 @@ fn find_next(s: &mut Sched, exclude: usize) -> Option<usize> {
             }
             if let Some(Some(p)) = s.procs.get(pid) {
                 if p.state == State::Runnable || p.state == State::Running {
+                    if skip_quota && cg_over_quota(p.cg) {
+                        if nstash < stashed.len() {
+                            stashed[nstash] = (v, pid);
+                            nstash += 1;
+                        } else {
+                            s.queues[v].push_back(pid);
+                        }
+                        continue;
+                    }
                     // do NOT push back: becomes current
                     if off > 0 {
                         STEALS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                    }
+                    for k in 0..nstash {
+                        s.queues[stashed[k].0].push_back(stashed[k].1);
                     }
                     return Some(pid);
                 }
                 // zombie skipped
             }
         }
+    }
+    for k in 0..nstash {
+        s.queues[stashed[k].0].push_back(stashed[k].1);
     }
     None
 }

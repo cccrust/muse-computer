@@ -235,6 +235,10 @@ pub extern "C" fn rust_trap_handler(tf: *mut TrapFrame) {
                 }
                 5 => {
                     crate::timer::tick();
+                    // v2.3: charge this tick to the running task's cgroup
+                    // (atomics + brief sched_lock, same discipline as the
+                    // neighboring wake_* calls).
+                    crate::task::cg_tick();
                     crate::timer::set_next();
                     crate::task::wake_sleepers(crate::timer::ticks() as u64);
                     // v0.6 watchdog: re-check virtio-blocked tasks every tick
