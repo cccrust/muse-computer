@@ -76,6 +76,10 @@ pub struct Proc {
     pub ns: usize,
     pub lpid: usize,
     pub pending_ns: bool,
+    // v2.4: spawn/fork tick (timer::ticks) -- SYS_PIDINFO identity check.
+    // Pids never repeat within a boot, so (pid,start) is unique even
+    // across reboot-stale state files (ticks restart at 0 each boot).
+    pub start_ms: u64,
 }
 
 /// v2.1: pid namespace descriptor. `parent` is recorded, not traversed
@@ -319,10 +323,38 @@ pub fn current_cg() -> usize {
         .unwrap_or(0)
 }
 
+/// v2.4: cross-namespace liveness + identity for `ctr ps/stop`.
+/// Returns +(start+2) if the slot holds a live task, -(start+2) if it
+/// holds an (unreaped) zombie, -1 if the slot is empty or out of range.
+/// The +2 bias keeps -1 exclusively for "gone" (a tick-0 zombie would
+/// otherwise collide). No namespace check: flat root model, and kill(2)
+/// already resolves cross-ns via the global fallback -- stat is consistent.
+pub fn pidinfo(pid: usize) -> isize {
+    let s = sched_lock();
+    match s.procs.get(pid).and_then(|o| o.as_ref()) {
+        Some(p) => {
+            let v = p.start_ms.min(isize::MAX as u64 - 2) as isize + 2;
+            if p.state == State::Zombie {
+                -v
+            } else {
+                v
+            }
+        }
+        None => -1,
+    }
+}
+
 /// v2.2: create a child cgroup of the caller's, with a frame limit
 /// (0 = unlimited). Returns the new id, or usize::MAX if table full.
 /// Limit is mirrored into frame.rs under its own lock (sequential, never
 /// nested with sched_lock).
+/// v2.4: NO slot reuse here (deliberately): create and enter are separate
+/// syscalls, so "unreferenced right now" cannot see future intent -- the
+/// standard create-then-children-enter pattern would collapse two groups
+/// into one slot (observed: cgtest's cap/free groups merged, cpu-order
+/// FAIL). Slots stay push-only like v2.2/v2.3; growth is bounded in
+/// practice (one create per test, containers inherit instead of creating).
+/// Namespace slots ARE reused (see fork): alloc+occupancy are atomic there.
 pub fn cgcreate(limit: u64) -> usize {
     let id = {
         let mut s = sched_lock();
@@ -699,6 +731,8 @@ fn finish_spawn(
         pending_ns: false,
         // v2.2: spawn (init only) lives in the root cgroup (unlimited).
         cg: 0,
+        // v2.4: boot tick (timer starts at 0; init is the first proc).
+        start_ms: crate::timer::ticks() as u64,
     };
     s.procs[pid] = Some(proc);
     if parent != 0 {
@@ -905,8 +939,34 @@ pub fn fork(parent_pid: usize) -> usize {
         if let Some(Some(pp)) = s.procs.get_mut(parent_pid) {
             pp.pending_ns = false;
         }
-        let id = s.ns.len();
-        s.ns.push(Ns { parent: pns, next: 2 });
+        // v2.4: reuse a dead ns slot if one exists (no live proc points
+        // at it; 0 = root is never reused). Sound (unlike cg slot reuse,
+        // which was reverted): alloc and occupancy are atomic here -- the
+        // child taking this ns is inserted under the same sched_lock
+        // below, so no enter can slip between. Stops unbounded growth
+        // under repeated run -d/stop/rm cycles.
+        let mut id = usize::MAX;
+        for i in 1..s.ns.len() {
+            let mut used = false;
+            for slot in s.procs.iter() {
+                if let Some(p) = slot {
+                    if p.ns == i {
+                        used = true;
+                        break;
+                    }
+                }
+            }
+            if !used {
+                id = i;
+                break;
+            }
+        }
+        if id == usize::MAX {
+            id = s.ns.len();
+            s.ns.push(Ns { parent: pns, next: 2 });
+        } else {
+            s.ns[id] = Ns { parent: pns, next: 2 };
+        }
         (id, 1)
     } else if pns == 0 {
         // root ns: identity (lpid == global pid, old behavior bit-for-bit)
@@ -955,6 +1015,8 @@ pub fn fork(parent_pid: usize) -> usize {
         pending_ns: false,
         // v2.2: cgroup follows the parent (limits are hierarchical fate-sharing)
         cg: p_cg,
+        // v2.4: fork tick (PIDINFO identity; see start_ms on the struct).
+        start_ms: crate::timer::ticks() as u64,
     };
     s.procs[child] = Some(proc);
     if let Some(Some(pp)) = s.procs.get_mut(parent_pid) {

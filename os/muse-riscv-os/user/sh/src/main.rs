@@ -1199,6 +1199,39 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"ctr", b"run", b"testimg", b"/bin/echo", b"hello-from-image"],
         &mut jobs,
     );
+    // v2.4: lifecycle suite (`ctr ps/stop/rm` over `run -d`). `life` is
+    // assembled (links all of /bin, incl sleeper); sleeper runs 30s but
+    // stop kills it at once -- order only, no timing.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"life"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"run", b"-d", b"life", b"/bin/sleeper", b"30"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"ps"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"stop", b"life"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"ps"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"rm", b"life"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

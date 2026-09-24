@@ -174,6 +174,13 @@ pub fn cglimit(id: isize, limit_frames: usize) -> isize {
 pub fn cgsetcpu(id: isize, pct: usize) -> isize {
     ecall(50, id as usize, pct, 0)
 }
+/// v2.4: pid liveness + identity (SYS_PIDINFO=51). Returns +(start+2) if
+/// the pid slot holds a live task, -(start+2) for an unreaped zombie,
+/// -1 if the slot is empty (reaped) or out of range. `start` is the
+/// spawn/fork tick; (pid,start) is unique even across reboot-stale pids.
+pub fn pidinfo(pid: isize) -> isize {
+    ecall(51, pid as usize, 0, 0)
+}
 pub fn getcwd(buf: *mut u8, len: usize) -> isize {
     ecall(25, buf as usize, len, 0)
 }

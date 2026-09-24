@@ -776,7 +776,10 @@ pub fn unlink(path: &str) -> bool {
                     ib[off] = 0;
                     crate::fs::blk::write(lba, &ib);
                 } else {
-                    // dir with nlink<=1: just clear inode
+                    // dir with nlink<=1: free data blocks (v2.4: used to
+                    // leak them -- matters now that `ctr rm` deletes whole
+                    // image trees), then clear inode.
+                    free_ino_blocks(&crec);
                     let (lba, off) = ino_pos(child);
                     let mut ib = [0u8; 512];
                     crate::fs::blk::read(lba, &mut ib);

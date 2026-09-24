@@ -33,8 +33,14 @@ pub struct Image {
 
 impl Image {
     pub fn new(nfiles: usize) -> Self {
-        // inodes: root + bin + files + spare for runtime creates
-        let ninodes = (2 + nfiles + 16) as u32;
+        // inodes: root + bin + files + spare for runtime creates.
+        // v2.4: spare 16 -> 64. Steady-state runtime files (~14: /tmp,
+        // /ctr, testimg x4, ctrtest x2, dl.txt, WD x3, CRASHDAT, TESTDATA)
+        // plus per-boot transients (ctr suite: life, bin, .pid) left ZERO
+        // headroom -- the 17th create (.pid) failed on used images
+        // ("detached state failed"; inode exhaustion, not corruption).
+        // All consumers read ninodes from the superblock; no hardcoding.
+        let ninodes = (2 + nfiles + 64) as u32;
         let ino_blocks = (ninodes + INODES_PER_BLOCK - 1) / INODES_PER_BLOCK;
         let data_lba = INO_LBA + ino_blocks;
         let mut img = Self {
@@ -290,7 +296,7 @@ fn main() {
     let names = [
         "init", "sh", "ls", "cat", "echo", "grep", "fork_test", "pipe_test", "usertests",
         "persist", "printenv", "smp_test", "reclaim_test", "stress", "udpping", "webserver",
-        "crashwrite", "nslookup", "wget", "curl", "ctr", "chroot_test", "nstest", "cgtest", "ping",
+        "crashwrite", "nslookup", "wget", "curl", "ctr", "sleeper", "chroot_test", "nstest", "cgtest", "ping",
     ];
     let mut img = Image::new(names.len() + 1); // + README
     for n in names {

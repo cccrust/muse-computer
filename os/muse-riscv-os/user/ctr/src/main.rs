@@ -32,6 +32,9 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 // v2.3: + `ctr run <name> <prog> [args...]` (one-shot container run) and
 // + `ctr pull <host> <port> <image>` (manifest + ustar layers from a
 // registry stub, unpacked into /ctr/<image>). See _doc/v2.3.md.
+// v2.4: + `ctr run -d` (detached: state file + `detached <pid>`) and
+// + `ctr ps/stop/rm` (lifecycle over /ctr/*/.pid state files +
+// SYS_PIDINFO liveness). See _doc/v2.4.md.
 fn mkdir_p(path: &[u8]) {
     // path is a NUL-terminated stack buffer built by caller
     if user_lib::mkdir(path.as_ptr()) != 0 {
@@ -108,7 +111,13 @@ fn cmd_assemble(name: &[u8]) {
     }
     let mut off = 0usize;
     let mut n = 0;
-    while off < r as usize && off < 511 {
+    // v2.4: `r` is an ENTRY COUNT, not a byte length (pre-v2.4 code
+    // compared the byte offset `off` against it, silently linking only
+    // the first few entries -- more than a day of debugging: sleeper
+    // is 22nd, echo 5th just squeaked through, which is why only the
+    // new binary ever failed). Consume exactly r entries.
+    let mut seen = 0isize;
+    while seen < r && off < 511 {
         // NUL-terminated name at nb[off..]
         let mut len = 0;
         while off + len < 511 && nb[off + len] != 0 {
@@ -128,6 +137,7 @@ fn cmd_assemble(name: &[u8]) {
         user_lib::link(src.as_ptr(), dst.as_ptr());
         n += 1;
         off += len + 1;
+        seen += 1;
         if n >= 32 {
             break;
         }
@@ -139,7 +149,9 @@ fn cmd_assemble(name: &[u8]) {
 }
 
 // ---- v2.3: `ctr run <name> <prog> [args...]` ----
-fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]]) {
+// v2.4: `detached` (from `run -d`) records /ctr/<name>/.pid and returns
+// immediately; the container is reparented to init on our exit.
+fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool) {
     // root must exist (pull first; no implicit magic)
     let mut root = [0u8; 64];
     root[..5].copy_from_slice(b"/ctr/");
@@ -212,7 +224,28 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]]) {
         user_lib::print("ctr: exec failed\n");
         user_lib::exit(127);
     } else if pid > 0 {
-        // stdio inherited; no setfg (foreground semantics are v2.4).
+        if detached {
+            // v2.4: learn the child's start tick for the state file
+            // (SYS_PIDINFO, +2 biased; must be > 0 here).
+            let info = user_lib::pidinfo(pid);
+            if info <= 0 {
+                user_lib::kill(pid);
+                user_lib::print("ctr: detached start failed\n");
+                user_lib::exit(1);
+            }
+            let start = (info - 2) as usize;
+            if !write_state(name, pid as usize, start) {
+                // hygiene: never leave an orphan we cannot track.
+                user_lib::kill(pid);
+                user_lib::print("ctr: detached state failed\n");
+                user_lib::exit(1);
+            }
+            user_lib::print("detached ");
+            dbg_num(pid as usize);
+            user_lib::print("\n");
+            user_lib::exit(0);
+        }
+        // stdio inherited; no setfg (fg job control stays shell-side).
         let code = wait_for(pid);
         if code < 0 {
             user_lib::exit(1);
@@ -618,10 +651,342 @@ fn cmd_pull(host: &[u8], port: &[u8], image: &[u8]) {
     user_lib::exit(0);
 }
 
+// ---- v2.4: lifecycle (`run -d`, `ps`, `stop`, `rm`) ----
+
+/// decimal parse (leading digits only); None if no digits.
+fn parse_dec(b: &[u8]) -> Option<usize> {
+    let mut v = 0usize;
+    let mut nd = 0;
+    for &c in b {
+        if c < b'0' || c > b'9' {
+            break;
+        }
+        v = v.checked_mul(10)?.checked_add((c - b'0') as usize)?;
+        nd += 1;
+    }
+    if nd == 0 {
+        return None;
+    }
+    Some(v)
+}
+
+/// decimal append into a stack buffer; returns new length (saturating).
+fn push_dec(buf: &mut [u8], mut n: usize, mut v: usize) -> usize {
+    let mut tmp = [0u8; 20];
+    let mut m = 0usize;
+    if v == 0 {
+        tmp[0] = b'0';
+        m = 1;
+    } else {
+        while v > 0 && m < 20 {
+            tmp[m] = b'0' + (v % 10) as u8;
+            v /= 10;
+            m += 1;
+        }
+    }
+    let mut i = m;
+    while i > 0 && n < buf.len() {
+        i -= 1;
+        buf[n] = tmp[i];
+        n += 1;
+    }
+    n
+}
+
+/// build `/ctr/<name>/.pid` (NUL-terminated) into `out`; returns length.
+fn state_path(name: &[u8], out: &mut [u8; 64]) -> usize {
+    out[..5].copy_from_slice(b"/ctr/");
+    out[5..5 + name.len()].copy_from_slice(name);
+    let mut n = 5 + name.len();
+    out[n..n + 5].copy_from_slice(b"/.pid");
+    n += 5;
+    out[n] = 0;
+    n
+}
+
+/// write `<pid> <start> <name>\n` state; false on any I/O error.
+fn write_state(name: &[u8], pid: usize, start: usize) -> bool {
+    let mut sp = [0u8; 64];
+    state_path(name, &mut sp);
+    let f = user_lib::open(sp.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
+    if f < 0 {
+        return false;
+    }
+    let mut b = [0u8; 64];
+    let mut n = push_dec(&mut b, 0, pid);
+    // (pids/starts are small in practice, but push_dec saturates: never
+    // index past the end on absurd values -- fail the state write instead,
+    // and the caller kills the untrackable child.)
+    if n + 30 > b.len() {
+        user_lib::close(f);
+        return false;
+    }
+    b[n] = b' ';
+    n += 1;
+    n = push_dec(&mut b, n, start);
+    if n + 26 > b.len() {
+        user_lib::close(f);
+        return false;
+    }
+    b[n] = b' ';
+    n += 1;
+    let m = name.len().min(23);
+    b[n..n + m].copy_from_slice(&name[..m]);
+    n += m;
+    b[n] = b'\n';
+    n += 1;
+    let mut w = 0;
+    while w < n {
+        let r = user_lib::write(f, unsafe { b.as_ptr().add(w) }, n - w);
+        if r <= 0 {
+            user_lib::close(f);
+            return false;
+        }
+        w += r as usize;
+    }
+    user_lib::close(f);
+    true
+}
+
+/// read state into (pid, start); None if missing/unparseable.
+fn read_state(name: &[u8]) -> Option<(usize, usize)> {
+    let mut sp = [0u8; 64];
+    state_path(name, &mut sp);
+    let f = user_lib::open(sp.as_ptr(), 0);
+    if f < 0 {
+        return None;
+    }
+    let mut b = [0u8; 64];
+    let mut n = 0usize;
+    loop {
+        if n >= b.len() {
+            break;
+        }
+        let r = user_lib::read(f, unsafe { b.as_mut_ptr().add(n) }, b.len() - n);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    user_lib::close(f);
+    let mut i = 0;
+    while i < n && b[i] != b' ' {
+        i += 1;
+    }
+    let pid = parse_dec(&b[..i])?;
+    let mut j = i + 1;
+    while j < n && b[j] != b' ' && b[j] != b'\n' {
+        j += 1;
+    }
+    let start = parse_dec(&b[i + 1..j])?;
+    Some((pid, start))
+}
+
+/// pidinfo decode: (alive, start-matches-state). Zombie counts as NOT
+/// alive here (init reaps it within ticks); gone (-1) is not alive.
+/// A state file whose start disagrees is stale (reboot) -> not alive.
+fn state_alive(pid: usize, want_start: usize) -> bool {
+    let v = user_lib::pidinfo(pid as isize);
+    if v <= 0 {
+        return false;
+    }
+    (v - 2) as usize == want_start
+}
+
+fn cmd_ps() {
+    let mut nb = [0u8; 512];
+    user_lib::print("CTRPS NAME PID STATUS\n");
+    let r = user_lib::getdents(b"/ctr\0".as_ptr(), nb.as_mut_ptr(), 512);
+    if r <= 0 {
+        return;
+    }
+    let mut off = 0usize;
+    // v2.4: same count-vs-bytes fix as cmd_assemble (r = entries).
+    let mut seen = 0isize;
+    while seen < r && off < 511 {
+        let mut len = 0;
+        while off + len < 511 && nb[off + len] != 0 {
+            len += 1;
+        }
+        if len == 0 || len > 28 {
+            break;
+        }
+        let entry = &nb[off..off + len];
+        // getdents marks dirs with a trailing '/'; display + state lookup
+        // use the bare name ("/ctr/life//.pid" would still resolve, but
+        // the ps table should read clean). NOTE: `off` still steps by the
+        // raw `len` below.
+        let mut dlen = len;
+        if dlen > 0 && entry[dlen - 1] == b'/' {
+            dlen -= 1;
+        }
+        if dlen == 0 {
+            off += len + 1;
+            seen += 1;
+            continue;
+        }
+        let entry = &entry[..dlen];
+        // state probe: non-containers (plain files) fail the open.
+        // (`rlen` = raw step length: `off` must skip the '/' too.)
+        let (entry, len, rlen) = (entry, dlen, len);
+        let mut sp = [0u8; 64];
+        if 5 + len + 5 < 63 {
+            sp[..5].copy_from_slice(b"/ctr/");
+            sp[5..5 + len].copy_from_slice(entry);
+            sp[5 + len..5 + len + 5].copy_from_slice(b"/.pid");
+            let f = user_lib::open(sp.as_ptr(), 0);
+            if f >= 0 {
+                user_lib::close(f);
+                if let Some((pid, start)) = read_state(entry) {
+                    user_lib::print("CTRPS ");
+                    let _ = user_lib::write(1, entry.as_ptr(), len);
+                    user_lib::print(" ");
+                    dbg_num(pid);
+                    if state_alive(pid, start) {
+                        // Up seconds are for humans (time() is ms,
+                        // start is ticks); never asserted, only the
+                        // `Up` word is (see _doc/v2.4.md §5).
+                        let now = user_lib::time().max(0) as usize;
+                        let up = now / 1000;
+                        user_lib::print(" Up ");
+                        dbg_num(up);
+                        user_lib::print("s");
+                    } else {
+                        user_lib::print(" Exited");
+                    }
+                    user_lib::print("\n");
+                }
+            }
+        }
+        off += rlen + 1;
+        seen += 1;
+    }
+}
+
+fn cmd_stop(name: &[u8]) {
+    let (pid, start) = match read_state(name) {
+        Some(t) => t,
+        None => {
+            user_lib::print("ctr: no such container\n");
+            user_lib::exit(1);
+        }
+    };
+    if !state_alive(pid, start) {
+        user_lib::print("stopped ");
+        let _ = user_lib::write(1, name.as_ptr(), name.len());
+        user_lib::print(" (already exited)\n");
+        user_lib::exit(0);
+    }
+    if user_lib::kill(pid as isize) != 0 {
+        // lost a race with exit/reap: same terminal state, same code.
+        user_lib::print("stopped ");
+        let _ = user_lib::write(1, name.as_ptr(), name.len());
+        user_lib::print(" (already exited)\n");
+        user_lib::exit(0);
+    }
+    // poll for the death (!alive covers zombie-or-gone-or-stale: init
+    // reaps within ticks, and a lingering zombie is already dead here).
+    let mut i = 0;
+    while i < 10 {
+        if !state_alive(pid, start) {
+            user_lib::print("stopped ");
+            let _ = user_lib::write(1, name.as_ptr(), name.len());
+            user_lib::print("\n");
+            user_lib::exit(0);
+        }
+        user_lib::sleep(100); // 1s (sleep takes 10ms ticks)
+        i += 1;
+    }
+    user_lib::print("ctr: stop timeout\n");
+    user_lib::exit(1);
+}
+
+/// delete path and everything under it. Files and dirs share one path:
+/// getdents on a file yields no children, so recurse-then-unlink is
+/// correct for both without a stat/is_dir probe (no symlinks exist).
+/// Repeats getdents until empty (512B buffer may truncate big dirs).
+fn rm_all(path: &[u8; 64]) -> bool {
+    loop {
+        let mut nb = [0u8; 512];
+        let r = user_lib::getdents(path.as_ptr(), nb.as_mut_ptr(), 512);
+        if r < 0 {
+            return false;
+        }
+        if r == 0 {
+            break;
+        }
+        let mut off = 0usize;
+        let mut n = 0;
+        // (same count-vs-bytes rule; the outer loop repeats until empty,
+        // so a short pass here only costs an extra pass, never correctness)
+        let mut seen = 0isize;
+        while seen < r && off < 511 {
+            let mut len = 0;
+            while off + len < 511 && nb[off + len] != 0 {
+                len += 1;
+            }
+            if len == 0 || len > 90 {
+                return false;
+            }
+            // path + "/" + child (NUL); overflow fails loud, never silent.
+            let mut plen = 0;
+            while plen < 64 && path[plen] != 0 {
+                plen += 1;
+            }
+            if plen + 1 + len >= 63 {
+                return false;
+            }
+            let mut child = [0u8; 64];
+            child[..plen].copy_from_slice(&path[..plen]);
+            child[plen] = b'/';
+            child[plen + 1..plen + 1 + len].copy_from_slice(&nb[off..off + len]);
+            if !rm_all(&child) {
+                return false;
+            }
+            n += 1;
+            seen += 1;
+            off += len + 1;
+        }
+        if n == 0 {
+            break;
+        }
+    }
+    user_lib::unlink(path.as_ptr()) == 0
+}
+
+fn cmd_rm(name: &[u8]) {
+    // refuse to delete a live container (stop first, docker-style).
+    // A stale state (reboot, start mismatch) is NOT live: falls through.
+    if let Some((pid, start)) = read_state(name) {
+        if state_alive(pid, start) {
+            user_lib::print("ctr: running (stop first)\n");
+            user_lib::exit(1);
+        }
+    }
+    let mut root = [0u8; 64];
+    root[..5].copy_from_slice(b"/ctr/");
+    root[5..5 + name.len()].copy_from_slice(name);
+    root[5 + name.len()] = 0;
+    // existence probe (getdents < 0): unknown names fail, never "remove".
+    let mut probe = [0u8; 64];
+    if user_lib::getdents(root.as_ptr(), probe.as_mut_ptr(), 64) < 0 {
+        user_lib::print("ctr: no such image\n");
+        user_lib::exit(1);
+    }
+    if !rm_all(&root) {
+        user_lib::print("ctr: rm failed\n");
+        user_lib::exit(1);
+    }
+    user_lib::print("removed ");
+    let _ = user_lib::write(1, name.as_ptr(), name.len());
+    user_lib::print("\n");
+    user_lib::exit(0);
+}
+
 #[no_mangle]
 pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     if argc < 2 {
-        user_lib::print("usage: ctr <name> | ctr run <name> <prog> [args...] | ctr pull <host> <port> <image>\n");
+        user_lib::print("usage: ctr <name> | ctr run [-d] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm <name>\n");
         user_lib::exit(1);
     }
     let a1 = match unsafe { user_lib::argv_str(argv, 1, argc) } {
@@ -632,26 +997,68 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         }
     };
     if a1 == b"run" {
-        // ctr run <name> <prog> [args...]
-        if argc < 4 {
-            user_lib::print("usage: ctr run <name> <prog> [args...]\n");
+        // ctr run [-d] <name> <prog> [args...]
+        let mut k = 2usize;
+        let mut detached = false;
+        if argc > 3 {
+            if let Some(s) = unsafe { user_lib::argv_str(argv, 2, argc) } {
+                if s == b"-d" {
+                    detached = true;
+                    k = 3;
+                }
+            }
+        }
+        if argc < k + 2 {
+            user_lib::print("usage: ctr run [-d] <name> <prog> [args...]\n");
             user_lib::exit(1);
         }
-        let name = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
-        let prog = unsafe { user_lib::argv_str(argv, 3, argc).unwrap_or(b"") };
+        let name = unsafe { user_lib::argv_str(argv, k, argc).unwrap_or(b"") };
+        let prog = unsafe { user_lib::argv_str(argv, k + 1, argc).unwrap_or(b"") };
         if !valid_name(name) || prog.is_empty() {
             user_lib::print("ctr: bad name or prog\n");
             user_lib::exit(1);
         }
         let mut extra: [&[u8]; 6] = [b""; 6];
         let mut ne = 0usize;
-        let mut k = 4usize;
-        while k < argc && ne < 6 {
-            extra[ne] = unsafe { user_lib::argv_str(argv, k, argc).unwrap_or(b"") };
+        let mut q = k + 2;
+        while q < argc && ne < 6 {
+            extra[ne] = unsafe { user_lib::argv_str(argv, q, argc).unwrap_or(b"") };
             ne += 1;
-            k += 1;
+            q += 1;
         }
-        cmd_run(name, prog, &extra[..ne]);
+        cmd_run(name, prog, &extra[..ne], detached);
+    } else if a1 == b"ps" {
+        // ctr ps (no args)
+        if argc != 2 {
+            user_lib::print("usage: ctr ps\n");
+            user_lib::exit(1);
+        }
+        cmd_ps();
+        user_lib::exit(0);
+    } else if a1 == b"stop" {
+        // ctr stop <name>
+        if argc != 3 {
+            user_lib::print("usage: ctr stop <name>\n");
+            user_lib::exit(1);
+        }
+        let name = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        if !valid_name(name) {
+            user_lib::print("ctr: bad name\n");
+            user_lib::exit(1);
+        }
+        cmd_stop(name);
+    } else if a1 == b"rm" {
+        // ctr rm <name>
+        if argc != 3 {
+            user_lib::print("usage: ctr rm <name>\n");
+            user_lib::exit(1);
+        }
+        let name = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        if !valid_name(name) {
+            user_lib::print("ctr: bad name\n");
+            user_lib::exit(1);
+        }
+        cmd_rm(name);
     } else if a1 == b"pull" {
         // ctr pull <host> <port> <image>
         if argc != 5 {

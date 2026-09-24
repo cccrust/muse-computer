@@ -148,6 +148,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sleeper"
+version = "0.1.0"
+dependencies = [
+ "user-lib",
+]
+
+[[package]]
 name = "smp_test"
 version = "0.1.0"
 dependencies = [

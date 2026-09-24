@@ -61,6 +61,8 @@ pub const SYS_CGENTER: usize = 48;
 pub const SYS_CGLIMIT: usize = 49;
 // v2.3: CPU cap percent (0-100) for a cgroup.
 pub const SYS_CGSETCPU: usize = 50;
+// v2.4: cross-namespace pid liveness + start-tick identity (ctr ps/stop).
+pub const SYS_PIDINFO: usize = 51;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -155,6 +157,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_CGENTER => sys_cgenter(a0) as isize,
         SYS_CGLIMIT => sys_cglimit(a0, a1 as u64) as isize,
         SYS_CGSETCPU => sys_cgsetcpu(a0, a1 as u64) as isize,
+        SYS_PIDINFO => crate::task::pidinfo(a0) as isize,
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,
