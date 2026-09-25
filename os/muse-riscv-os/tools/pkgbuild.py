@@ -106,22 +106,28 @@ def build_layer(binary, elf_bytes, extra):
     return buf.getvalue()
 
 
-def build_manifest(pkg, version, layer, depends):
+def build_manifest(pkg, version, layer, depends, sha_hex=None):
     lines = ["# pkg %s %s (built by tools/pkgbuild.py)" % (pkg, version)]
     lines.append("name: %s" % pkg)
     lines.append("version: %s" % version)
     if depends:
         lines.append("depends: %s" % depends)
+    if sha_hex is not None:
+        lines.append("sha256: %s" % sha_hex)
     lines.append(layer)
     return ("\n".join(lines) + "\n").encode()
 
 
 def build_package(crate_dir, pkg, version, binary, out_dir=None,
                   extra=(), depends=""):
+    import hashlib
     elf = build_elf(crate_dir, binary)
     layer = "%s.tar" % pkg
     tar = build_layer(binary, elf, list(extra))
-    manifest = build_manifest(pkg, version, layer, depends)
+    # v3.4: integrity hash over the concatenated layer bytes (single
+    # layer here; multi-layer callers hash b"".join in manifest order).
+    manifest = build_manifest(pkg, version, layer, depends,
+                              sha_hex=hashlib.sha256(tar).hexdigest())
     if out_dir is not None:
         os.makedirs(out_dir, exist_ok=True)
         with open(os.path.join(out_dir, "manifest"), "wb") as f:

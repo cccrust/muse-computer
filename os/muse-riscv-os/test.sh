@@ -5,7 +5,7 @@ TARGET=riscv64gc-unknown-none-elf
 PASS=1
 
 echo "=== 1. host unit tests ==="
-cargo test -p kernel -p host-tests -p mkfs || PASS=0
+cargo test -p kernel -p host-tests -p mkfs -p user-lib || PASS=0
 
 echo "=== 2. build user ELFs ==="
 cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver -p crashwrite -p ping -p nslookup -p wget -p curl -p ctr -p sleeper -p linger -p chroot_test -p nstest -p cgtest || PASS=0
@@ -182,6 +182,22 @@ check "pkg-installed fortune 1.0"
 check "PKGLS fortune 1.0"
 check "fortune-sez hello-from-fortune"
 check "pkg-removed fortune"
+check "pkg-upgraded hello 2.0"
+check "pkg-hello-txt-v2"
+check "PKGLS hello 2.0"
+check "version mismatch"
+check "autoremove hello"
+check "pkg fetch failed (index)"
+check "login ok"
+check "pkg-installed secret 1.0"
+check "secret-marker"
+check "pkg-removed secret"
+check "sha256 mismatch"
+check "vol-created data1"
+check "VOL data1"
+check "hi-vol"
+check "removed volc"
+check "vol-removed data1"
 check "CTRPS life"
 check "Up"
 check "stopped life"

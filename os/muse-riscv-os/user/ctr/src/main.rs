@@ -223,7 +223,7 @@ pub struct Quota {
     pub weight_set: bool,
 }
 
-fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool, q: &Quota) {
+fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool, q: &Quota, vols: &[VolBind], nvols: usize) {
     // root must exist (pull first; no implicit magic)
     let mut root = [0u8; 64];
     root[..5].copy_from_slice(b"/ctr/");
@@ -288,6 +288,39 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool, q: &Quota) 
         if user_lib::cgenter(ccg as isize) != 0 {
             user_lib::print("ctr: cgenter failed\n");
             user_lib::exit(127);
+        }
+        // v3.5: volume binds (host view: <root><cpath> <- /vol/<v>),
+        // before chroot (the jail step needs them in place).
+        let mut vi = 0usize;
+        while vi < nvols {
+            // mountpoint = root + cpath (both NUL-terminated parts).
+            let mut rlen = 0;
+            while rlen < 64 && root[rlen] != 0 {
+                rlen += 1;
+            }
+            let mut clen = 0;
+            while clen < 64 && vols[vi].cpath[clen] != 0 {
+                clen += 1;
+            }
+            let mut vlen = 0;
+            while vlen < 64 && vols[vi].vol[vlen] != 0 {
+                vlen += 1;
+            }
+            if rlen + clen >= 63 || vlen == 0 {
+                user_lib::print("ctr: vol mount failed\n");
+                user_lib::exit(127);
+            }
+            let mut mp = [0u8; 64];
+            mp[..rlen].copy_from_slice(&root[..rlen]);
+            mp[rlen..rlen + clen].copy_from_slice(&vols[vi].cpath[..clen]);
+            let mut vp = [0u8; 64];
+            vp[..5].copy_from_slice(b"/vol/");
+            vp[5..5 + vlen].copy_from_slice(&vols[vi].vol[..vlen]);
+            if user_lib::mount_vol(mp.as_ptr(), vp.as_ptr()) != 0 {
+                user_lib::print("ctr: vol mount failed\n");
+                user_lib::exit(127);
+            }
+            vi += 1;
         }
         if user_lib::chroot(root.as_ptr()) != 0 {
             user_lib::print("ctr: chroot failed\n");
@@ -361,7 +394,36 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool, q: &Quota) 
 
 // ---- v2.3: `ctr pull <host> <port> <image>` ----
 
+/// v3.4: read /pkg/token (first line, CR/LF-trimmed) into `out`.
+/// Returns length (0 = absent). Written by `ctr login`.
+fn read_token(out: &mut [u8; 64]) -> usize {
+    let f = user_lib::open(b"/pkg/token\0".as_ptr(), 0);
+    if f < 0 {
+        return 0;
+    }
+    let mut n = 0usize;
+    loop {
+        if n >= out.len() {
+            break;
+        }
+        let r = user_lib::read(f, unsafe { out.as_mut_ptr().add(n) }, out.len() - n);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    user_lib::close(f);
+    let mut e = 0;
+    while e < n && out[e] != b'\n' && out[e] != b'\r' {
+        e += 1;
+    }
+    e
+}
+
 /// run `/bin/wget <host> <port> <path> <outfile>`; true iff exit code 0.
+/// v3.4: attaches /pkg/token as a bearer header when present
+/// (registry private routes; public routes ignore it -- pull and all
+/// pre-login fetches behave bit-for-bit as before).
 fn run_wget(host: &[u8], port: &[u8], path: &[u8], out: &[u8]) -> bool {
     let mut hb = [0u8; 64];
     nul_copy(&mut hb, &host[..host.len().min(63)]);
@@ -373,14 +435,24 @@ fn run_wget(host: &[u8], port: &[u8], path: &[u8], out: &[u8]) -> bool {
     nul_copy(&mut ob, &out[..out.len().min(31)]);
     let mut w0 = [0u8; 8];
     w0[..4].copy_from_slice(b"wget");
-    let mut av: [*const u8; 6] = [
+    // token: first line of /pkg/token (login-validated charset).
+    // Absent token leaves av[5] NULL (argc 5, pre-v3.4 behavior).
+    let mut tb = [0u8; 64];
+    let tn = read_token(&mut tb);
+    // NUL-terminate for argv (wget reads a C string; length capped).
+    tb[tn.min(63)] = 0;
+    let mut av: [*const u8; 7] = [
         w0.as_ptr(),
         hb.as_ptr(),
         pb.as_ptr(),
         qb.as_ptr(),
         ob.as_ptr(),
+        tb.as_ptr(),
         core::ptr::null(),
     ];
+    if tn == 0 {
+        av[5] = core::ptr::null();
+    }
     let mut wget = [0u8; 16];
     wget[..9].copy_from_slice(b"/bin/wget");
     let pid = user_lib::fork();
@@ -757,7 +829,7 @@ fn cmd_pull(host: &[u8], port: &[u8], image: &[u8]) {
 
 /// v2.8 flag helpers (for `run`; see _doc/v2.8.md §1).
 fn bad_flag() -> ! {
-    user_lib::print("usage: ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...]\n");
+    user_lib::print("usage: ctr run [-d] [--memory N] [--cpu P] [--weight W] [-v V:/cpath] <name> <prog> [args...]\n");
     user_lib::exit(1);
 }
 
@@ -1222,6 +1294,114 @@ fn cmd_rm(name: &[u8]) {
 
 // ---- v3.0: packages (`install/remove/list`, apt-style) ----
 // v3.1: `depends:` + recursive install + remove protection.
+// v3.3: versions (`x.y.z`), `>=` constraints, index resolution,
+// `upgrade`, `autoremove`.
+
+/// v3.3: version constraint operators.
+const VEXACT: u8 = 0;
+const VATLEAST: u8 = 1;
+
+/// v3.3: is `v` a well-formed version (`x.y.z`, all-numeric non-empty
+/// components)? Guards route building (no traversal) and comparisons.
+fn ver_valid(v: &[u8]) -> bool {
+    if v.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    let mut comp = 0;
+    loop {
+        let mut j = i;
+        while j < v.len() && v[j] != b'.' {
+            if v[j] < b'0' || v[j] > b'9' {
+                return false;
+            }
+            j += 1;
+        }
+        if j == i {
+            return false; // empty component
+        }
+        comp += 1;
+        if j >= v.len() {
+            break;
+        }
+        i = j + 1;
+    }
+    comp > 0
+}
+
+/// v3.3: decimal value of an all-digit slice (caller guarantees digits).
+fn ver_num(s: &[u8]) -> usize {
+    let mut v = 0usize;
+    for &c in s {
+        v = v.saturating_mul(10).saturating_add((c - b'0') as usize);
+    }
+    v
+}
+
+/// v3.3: compare versions (-1/0/1). Missing components read as 0
+/// (`1.0` == `1.0.0`). Both sides must be ver_valid (caller ensures).
+fn vercmp(a: &[u8], b: &[u8]) -> i8 {
+    let mut i = 0usize;
+    let mut j = 0usize;
+    loop {
+        let ae = i >= a.len();
+        let be = j >= b.len();
+        if ae && be {
+            return 0;
+        }
+        let mut ie = i;
+        while ie < a.len() && a[ie] != b'.' {
+            ie += 1;
+        }
+        let mut je = j;
+        while je < b.len() && b[je] != b'.' {
+            je += 1;
+        }
+        let av = if ae { 0 } else { ver_num(&a[i..ie]) };
+        let bv = if be { 0 } else { ver_num(&b[j..je]) };
+        if av < bv {
+            return -1;
+        }
+        if av > bv {
+            return 1;
+        }
+        i = if ie < a.len() { ie + 1 } else { a.len() };
+        j = if je < b.len() { je + 1 } else { b.len() };
+    }
+}
+
+/// v3.3: does installed/fetched `have` satisfy (`want`, `op`)?
+fn ver_sat(have: &[u8], want: &[u8], op: u8) -> bool {
+    if !ver_valid(have) || !ver_valid(want) {
+        return false;
+    }
+    let c = vercmp(have, want);
+    if op == VATLEAST {
+        c >= 0
+    } else {
+        c == 0
+    }
+}
+
+/// split a dep/install token into (name, Option<(ver, op)>).
+/// `foo` -> (foo, None); `foo=1.0` -> Exact; `foo>=1.0` -> AtLeast.
+/// A `>` not followed by `=` degrades to name-only (loud later).
+fn split_vreq(tok: &[u8]) -> (&[u8], Option<(&[u8], u8)>) {
+    let mut e = 0;
+    while e < tok.len() && tok[e] != b'=' && tok[e] != b'>' {
+        e += 1;
+    }
+    if e >= tok.len() {
+        return (tok, None);
+    }
+    if tok[e] == b'>' {
+        if e + 1 >= tok.len() || tok[e + 1] != b'=' {
+            return (&tok[..e], None);
+        }
+        return (&tok[..e], Some((&tok[e + 2..], VATLEAST)));
+    }
+    (&tok[..e], Some((&tok[e + 1..], VEXACT)))
+}
 
 /// list bare entry names of dir `path` (no trailing `/`); returns
 /// count. Entry-count getdents discipline, same as cmd_ps (r = entries,
@@ -1303,8 +1483,11 @@ fn pkg_db_has(name: &[u8]) -> bool {
     false
 }
 
-/// append `name version\n` to /pkg/db. false on any I/O error.
-fn pkg_db_add(name: &[u8], ver: &[u8]) -> bool {
+/// append `name version manual|auto\n` to /pkg/db. false on I/O error.
+/// v3.3: the manual flag (top-level installs) vs auto (pulled-in deps);
+/// autoremove only collects auto orphans. Missing flag on old lines
+/// reads as manual (never auto-remove user stuff by default).
+fn pkg_db_add(name: &[u8], ver: &[u8], manual: bool) -> bool {
     let f = user_lib::open(
         b"/pkg/db\0".as_ptr(),
         user_lib::O_CREATE | user_lib::O_APPEND,
@@ -1316,10 +1499,24 @@ fn pkg_db_add(name: &[u8], ver: &[u8]) -> bool {
     let m = name.len().min(23);
     b[..m].copy_from_slice(&name[..m]);
     b[m] = b' ';
-    let v = ver.len().min(62 - m - 2);
+    let v = ver.len().min(31);
     b[m + 1..m + 1 + v].copy_from_slice(&ver[..v]);
-    b[m + 1 + v] = b'\n';
-    let n = m + 1 + v + 1;
+    let mut n = m + 1 + v;
+    // manual/auto flag (v3.3).
+    if n + 1 + 6 + 1 > b.len() {
+        user_lib::close(f);
+        return false;
+    }
+    b[n] = b' ';
+    if manual {
+        b[n + 1..n + 7].copy_from_slice(b"manual");
+        n += 7;
+    } else {
+        b[n + 1..n + 5].copy_from_slice(b"auto");
+        n += 5;
+    }
+    b[n] = b'\n';
+    n += 1;
     let mut w = 0;
     while w < n {
         let r = user_lib::write(f, unsafe { b.as_ptr().add(w) }, n - w);
@@ -1396,7 +1593,8 @@ fn pkg_db_del(name: &[u8]) -> bool {
 /// store back (db entry ⟺ fully installed); reinstall is refused
 /// (upgrade is a later version's job).
 /// v3.1: thin wrapper -- recursion lives in install_one (deps first).
-fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8]) {
+/// v3.3: want carries an install-argv pin (`=ver` / `>=ver`), or None.
+fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8], want: Option<(&[u8], u8)>) {
     mkdir_p(b"/tmp\0");
     mkdir_p(b"/pkg\0");
     if pkg_db_has(pkg) {
@@ -1405,7 +1603,7 @@ fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8]) {
     }
     let mut stack = [[0u8; 64]; 8];
     let mut stklen = [0usize; 8];
-    install_one(host, port, pkg, None, &mut stack, &mut stklen, 0);
+    install_one(host, port, pkg, want, &mut stack, &mut stklen, 0, true);
     user_lib::exit(0);
 }
 
@@ -1436,8 +1634,13 @@ fn pkg_db_ver(pkg: &[u8], ver_out: &mut [u8; 32]) -> usize {
             j += 1;
         }
         if j - i > pkg.len() && &b[i..i + pkg.len()] == pkg && b[i + pkg.len()] == b' ' {
+            // version runs to the next space (v3.3 flag) or EOL.
             let vs = i + pkg.len() + 1;
-            let m = (j - vs).min(31);
+            let mut ve = vs;
+            while ve < j && b[ve] != b' ' {
+                ve += 1;
+            }
+            let m = (ve - vs).min(31);
             ver_out[..m].copy_from_slice(&b[vs..vs + m]);
             return m;
         }
@@ -1446,9 +1649,54 @@ fn pkg_db_ver(pkg: &[u8], ver_out: &mut [u8; 32]) -> usize {
     usize::MAX
 }
 
+/// v3.3: manual flag of an installed pkg (db third field). Absent or
+/// unparseable reads as manual (safe default: never auto-remove).
+fn pkg_db_manual(pkg: &[u8]) -> bool {
+    let f = user_lib::open(b"/pkg/db\0".as_ptr(), 0);
+    if f < 0 {
+        return true;
+    }
+    let mut b = [0u8; 2048];
+    let mut n = 0usize;
+    loop {
+        if n >= b.len() {
+            break;
+        }
+        let r = user_lib::read(f, unsafe { b.as_mut_ptr().add(n) }, b.len() - n);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    user_lib::close(f);
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && b[j] != b'\n' {
+            j += 1;
+        }
+        if j - i > pkg.len() && &b[i..i + pkg.len()] == pkg && b[i + pkg.len()] == b' ' {
+            // third field, if any: `auto` counts, anything else manual.
+            let vs = i + pkg.len() + 1;
+            let mut ve = vs;
+            while ve < j && b[ve] != b' ' {
+                ve += 1;
+            }
+            if ve < j && &b[ve + 1..j] == b"auto" {
+                return false;
+            }
+            return true;
+        }
+        i = j + 1;
+    }
+    true
+}
+
 /// parse manifest bytes: version + layer files + dep tokens.
 /// Unknown `key:` lines ignored (forward-compat, see plan3.x §3).
 /// Layer cap 8 (pull discipline); dep cap 8. Returns (vern, nl, ndeps).
+/// v3.4: also captures `sha256:` (64 lowercase hex, else ignored here
+/// and reported missing at verify time).
 fn parse_manifest(
     mb: &[u8],
     mn: usize,
@@ -1457,10 +1705,12 @@ fn parse_manifest(
     layern: &mut [usize; 8],
     deps: &mut [[u8; 64]; 8],
     depn: &mut [usize; 8],
-) -> (usize, usize, usize) {
+    sha: &mut [u8; 64],
+) -> (usize, usize, usize, usize) {
     let mut vern = 0usize;
     let mut nl = 0usize;
     let mut ndeps = 0usize;
+    let mut shan = 0usize;
     let mut i = 0usize;
     while i < mn {
         let mut j = i;
@@ -1483,6 +1733,12 @@ fn parse_manifest(
                 if k == b"version" && vern == 0 {
                     vern = v.len().min(31);
                     ver[..vern].copy_from_slice(&v[..vern]);
+                } else if k == b"sha256" && shan == 0 {
+                    // v3.4: 64 lowercase hex (validated at verify time).
+                    // (Buffer is [u8; 64]: cap at 64, not 63 -- a truncated
+                    // hash mismatches forever and everything fails.)
+                    shan = v.len().min(64);
+                    sha[..shan].copy_from_slice(&v[..shan]);
                 } else if k == b"depends" {
                     // space-separated `name` / `name=ver` tokens.
                     let mut t = 0;
@@ -1514,31 +1770,93 @@ fn parse_manifest(
         }
         i = j + 1;
     }
-    (vern, nl, ndeps)
+    (vern, nl, ndeps, shan)
+}
+
+/// v3.3: fetch `/pkg/<pkg>/index`, collect well-formed versions
+/// (skips `#`/empty/non-conforming lines). Returns count (cap 8).
+fn fetch_index(
+    host: &[u8],
+    port: &[u8],
+    pkg: &[u8],
+    vers: &mut [[u8; 32]; 8],
+    versn: &mut [usize; 8],
+) -> usize {
+    let mut ipath = [0u8; 128];
+    ipath[..5].copy_from_slice(b"/pkg/");
+    ipath[5..5 + pkg.len()].copy_from_slice(pkg);
+    let ipn = 5 + pkg.len();
+    ipath[ipn..ipn + 6].copy_from_slice(b"/index");
+    if !run_wget(host, port, &ipath[..ipn + 6], b"/tmp/pindex") {
+        user_lib::print("ctr: pkg fetch failed (index)\n");
+        user_lib::exit(1);
+    }
+    let f = user_lib::open(b"/tmp/pindex\0".as_ptr(), 0);
+    if f < 0 {
+        user_lib::print("ctr: pkg fetch failed (index-open)\n");
+        user_lib::exit(1);
+    }
+    let mut b = [0u8; 512];
+    let mut n = 0usize;
+    loop {
+        if n >= b.len() {
+            break;
+        }
+        let r = user_lib::read(f, unsafe { b.as_mut_ptr().add(n) }, b.len() - n);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    user_lib::close(f);
+    user_lib::unlink(b"/tmp/pindex\0".as_ptr());
+    let mut nv = 0;
+    let mut i = 0;
+    while i < n && nv < 8 {
+        let mut j = i;
+        while j < n && b[j] != b'\n' {
+            j += 1;
+        }
+        let mut e = j;
+        if e > i && b[e - 1] == b'\r' {
+            e -= 1;
+        }
+        let line = &b[i..e];
+        if !line.is_empty() && line[0] != b'#' && ver_valid(line) {
+            let m = line.len().min(31);
+            vers[nv][..m].copy_from_slice(&line[..m]);
+            versn[nv] = m;
+            nv += 1;
+        }
+        i = j + 1;
+    }
+    nv
 }
 
 /// install pkg + its transitive deps (DFS post-order: deps first).
-/// want_ver (from a parent's `name=ver` token) is enforced against the
-/// db when already installed, and against the fetched manifest
-/// otherwise. The ancestor chain lives in `stack`/`stklen` as COPIES
-/// (borrows cannot outlive their frame across recursion); `depth` is
-/// the chain length (cycle + depth guard). Loud exits throughout
-/// (install discipline, see v2.8).
+/// want (from a parent's token or install argv) is enforced against
+/// the db when already installed; otherwise the target version is
+/// resolved (Exact = direct route, else index max satisfying) and the
+/// fetched manifest must equal it. The ancestor chain lives in
+/// `stack`/`stklen` as COPIES (borrows cannot outlive their frame
+/// across recursion); `depth` is the chain length (cycle + depth
+/// guard). Loud exits throughout (install discipline, see v2.8).
 fn install_one(
     host: &[u8],
     port: &[u8],
     pkg: &[u8],
-    want_ver: Option<&[u8]>,
+    want: Option<(&[u8], u8)>,
     stack: &mut [[u8; 64]; 8],
     stklen: &mut [usize; 8],
     depth: usize,
+    manual: bool,
 ) {
-    // already installed: skip iff any required version matches.
+    // already installed: skip iff any required version satisfies.
     if pkg_db_has(pkg) {
-        if let Some(w) = want_ver {
+        if let Some((w, op)) = want {
             let mut vb = [0u8; 32];
             let vn = pkg_db_ver(pkg, &mut vb);
-            if vn == usize::MAX || &vb[..vn] != w {
+            if vn == usize::MAX || !ver_sat(&vb[..vn], w, op) {
                 user_lib::print("ctr: version mismatch (");
                 let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
                 user_lib::print(")\n");
@@ -1559,13 +1877,58 @@ fn install_one(
         }
         s += 1;
     }
-    // manifest -> /tmp/manifest (shared tmp name is safe: the parent's
-    // parsed lists already live in ITS stack buffers before we recurse,
-    // and layers fetch only after all deps return).
+    // resolve the version to fetch: pinned goes direct, otherwise the
+    // index maximum satisfying the constraint (unconstrained = max).
+    let mut target = [0u8; 32];
+    let mut targetn = 0usize;
+    match want {
+        Some((w, VEXACT)) => {
+            if !ver_valid(w) {
+                user_lib::print("ctr: bad pkg version\n");
+                user_lib::exit(1);
+            }
+            targetn = w.len().min(31);
+            target[..targetn].copy_from_slice(&w[..targetn]);
+        }
+        _ => {
+            let mut vers = [[0u8; 32]; 8];
+            let mut versn = [0usize; 8];
+            let nv = fetch_index(host, port, pkg, &mut vers, &mut versn);
+            if nv == 0 {
+                user_lib::print("ctr: no versions\n");
+                user_lib::exit(1);
+            }
+            let mut best = usize::MAX;
+            let mut vi = 0;
+            while vi < nv {
+                let ok = match want {
+                    Some((w, op)) => ver_sat(&vers[vi][..versn[vi]], w, op),
+                    None => true,
+                };
+                if ok
+                    && (best == usize::MAX
+                        || vercmp(&vers[vi][..versn[vi]], &vers[best][..versn[best]]) > 0)
+                {
+                    best = vi;
+                }
+                vi += 1;
+            }
+            if best == usize::MAX {
+                user_lib::print("ctr: no matching version\n");
+                user_lib::exit(1);
+            }
+            targetn = versn[best];
+            target[..targetn].copy_from_slice(&vers[best][..targetn]);
+        }
+    }
+    // manifest at the versioned route.
     let mut mpath = [0u8; 128];
     mpath[..5].copy_from_slice(b"/pkg/");
     mpath[5..5 + pkg.len()].copy_from_slice(pkg);
     let mpn = 5 + pkg.len();
+    mpath[mpn] = b'/';
+    mpath[mpn + 1..mpn + 1 + targetn].copy_from_slice(&target[..targetn]);
+    let mpn = mpn + 1 + targetn;
     mpath[mpn..mpn + 9].copy_from_slice(b"/manifest");
     if !run_wget(host, port, &mpath[..mpn + 9], b"/tmp/manifest") {
         user_lib::print("ctr: pkg fetch failed (manifest)\n");
@@ -1594,20 +1957,20 @@ fn install_one(
     let mut layern = [0usize; 8];
     let mut deps = [[0u8; 64]; 8];
     let mut depn = [0usize; 8];
-    let (vern, nl, ndeps) = parse_manifest(&mb, mn, &mut ver, &mut layers, &mut layern, &mut deps, &mut depn);
+    let mut sha = [0u8; 64];
+    let (vern, nl, ndeps, shan) = parse_manifest(&mb, mn, &mut ver, &mut layers, &mut layern, &mut deps, &mut depn, &mut sha);
     if nl == 0 {
         user_lib::print("ctr: pkg fetch failed (no-layers)\n");
         user_lib::exit(1);
     }
-    // manifest version must satisfy the parent's `=ver` (db check above
-    // covers the already-installed case; this covers fresh fetches).
-    if let Some(w) = want_ver {
-        if &ver[..vern] != w {
-            user_lib::print("ctr: version mismatch (");
-            let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
-            user_lib::print(")\n");
-            user_lib::exit(1);
-        }
+    // manifest version must equal the resolved target (index skew or
+    // registry inconsistency screams here; the constraint itself was
+    // enforced by resolution).
+    if vern != targetn || &ver[..vern] != &target[..targetn] {
+        user_lib::print("ctr: version skew (");
+        let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
+        user_lib::print(")\n");
+        user_lib::exit(1);
     }
     // deps first (post-order). The chain slot holds a copy: the dep
     // name slices below borrow this frame's `deps` buffer and cannot
@@ -1619,24 +1982,243 @@ fn install_one(
     }
     let mut d = 0;
     while d < ndeps {
-        let tok = &deps[d][..depn[d]];
-        let mut e = 0;
-        while e < tok.len() && tok[e] != b'=' {
-            e += 1;
-        }
-        let (dn, dv) = if e < tok.len() {
-            (&tok[..e], Some(&tok[e + 1..]))
-        } else {
-            (tok, None)
-        };
-        if dn.is_empty() {
+        let (dn, dw) = split_vreq(&deps[d][..depn[d]]);
+        if dn.is_empty() || !valid_name(dn) {
             user_lib::print("ctr: bad dependency\n");
             user_lib::exit(1);
         }
-        install_one(host, port, dn, dv, stack, stklen, depth + 1);
+        if let Some((w, _)) = dw {
+            if !ver_valid(w) {
+                user_lib::print("ctr: bad dependency version\n");
+                user_lib::exit(1);
+            }
+        }
+        install_one(host, port, dn, dw, stack, stklen, depth + 1, false);
         d += 1;
     }
-    install_layers(host, port, pkg, &ver[..vern], &mb[..mn], &layers, &layern, nl);
+    install_layers(host, port, pkg, &ver[..vern], &mb[..mn], &layers, &layern, nl, manual, &sha[..shan]);
+}
+
+/// v3.3: scan a tar file's headers, collecting regular-file paths
+/// (prefix-joined; dirs skipped). Returns count (cap 64) or usize::MAX
+/// on I/O or format failure. Same header layout untar() walks
+/// (name[0..100], size octal[124..136], prefix[345..500]).
+fn tar_files(tarpath: &[u8], out: &mut [[u8; 128]]) -> usize {
+    let f = user_lib::open(tarpath.as_ptr(), 0);
+    if f < 0 {
+        return usize::MAX;
+    }
+    let mut n = 0usize;
+    let mut blk = [0u8; 512];
+    loop {
+        let mut o = 0;
+        let mut ok = true;
+        while o < 512 {
+            let r = user_lib::read(f, unsafe { blk.as_mut_ptr().add(o) }, 512 - o);
+            if r <= 0 {
+                ok = false;
+                break;
+            }
+            o += r as usize;
+        }
+        if !ok {
+            user_lib::close(f);
+            return usize::MAX;
+        }
+        if is_zero_block(&blk) {
+            break;
+        }
+        let size = parse_octal(&blk[124..136]).unwrap_or(usize::MAX);
+        if size == usize::MAX {
+            user_lib::close(f);
+            return usize::MAX;
+        }
+        let mut nn = 0;
+        while nn < 100 && blk[nn] != 0 {
+            nn += 1;
+        }
+        let mut pn = 0;
+        while pn < 155 && blk[345 + pn] != 0 {
+            pn += 1;
+        }
+        if blk[156] != b'5' && n < out.len() {
+            let mut w = 0;
+            if pn > 0 {
+                let m = pn.min(100);
+                out[n][..m].copy_from_slice(&blk[345..345 + m]);
+                w = m;
+                if w < 127 {
+                    out[n][w] = b'/';
+                    w += 1;
+                }
+            }
+            let m = nn.min(127 - w);
+            out[n][w..w + m].copy_from_slice(&blk[..m]);
+            w += m;
+            out[n][w] = 0;
+            n += 1;
+        }
+        let mut left = (size + 511) / 512;
+        while left > 0 {
+            let mut o2 = 0;
+            let mut ok2 = true;
+            while o2 < 512 {
+                let r = user_lib::read(f, unsafe { blk.as_mut_ptr().add(o2) }, 512 - o2);
+                if r <= 0 {
+                    ok2 = false;
+                    break;
+                }
+                o2 += r as usize;
+            }
+            if !ok2 {
+                user_lib::close(f);
+                return usize::MAX;
+            }
+            left -= 1;
+        }
+    }
+    user_lib::close(f);
+    n
+}
+
+/// v3.3: write the store file list (`files`: installed relative paths,
+/// one per line) for upgrade GC.
+fn store_write_files(root: &[u8; 64], rootn: usize, names: &[[u8; 128]; 64], nn: usize) -> bool {
+    let mut fp = [0u8; 64];
+    fp[..rootn].copy_from_slice(&root[..rootn]);
+    fp[rootn..rootn + 6].copy_from_slice(b"/files");
+    let f = user_lib::open(fp.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
+    if f < 0 {
+        return false;
+    }
+    let mut ok = true;
+    let mut k = 0;
+    while k < nn && ok {
+        let mut nlen = 0;
+        while nlen < 128 && names[k][nlen] != 0 {
+            nlen += 1;
+        }
+        let mut w = 0;
+        while w < nlen {
+            let r = user_lib::write(f, unsafe { names[k].as_ptr().add(w) }, nlen - w);
+            if r <= 0 {
+                ok = false;
+                break;
+            }
+            w += r as usize;
+        }
+        if ok {
+            let r = user_lib::write(f, b"\n".as_ptr(), 1);
+            if r <= 0 {
+                ok = false;
+            }
+        }
+        k += 1;
+    }
+    user_lib::close(f);
+    ok
+}
+
+/// v3.3: read the store file list. Returns count (cap 64);
+/// a missing file reads as empty (pre-v3.3 stores).
+fn store_read_files(root: &[u8; 64], rootn: usize, out: &mut [[u8; 128]; 64]) -> usize {
+    let mut fp = [0u8; 64];
+    fp[..rootn].copy_from_slice(&root[..rootn]);
+    fp[rootn..rootn + 6].copy_from_slice(b"/files");
+    let f = user_lib::open(fp.as_ptr(), 0);
+    if f < 0 {
+        return 0;
+    }
+    let mut b = [0u8; 4096];
+    let mut n = 0usize;
+    loop {
+        if n >= b.len() {
+            break;
+        }
+        let r = user_lib::read(f, unsafe { b.as_mut_ptr().add(n) }, b.len() - n);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    user_lib::close(f);
+    let mut nn = 0;
+    let mut i = 0;
+    while i < n && nn < out.len() {
+        let mut j = i;
+        while j < n && b[j] != b'\n' {
+            j += 1;
+        }
+        if j > i {
+            let m = (j - i).min(127);
+            out[nn][..m].copy_from_slice(&b[i..i + m]);
+            out[nn][m] = 0;
+            nn += 1;
+        }
+        i = j + 1;
+    }
+    nn
+}
+
+/// v3.4: verify the concatenated layer tars (/tmp/p0..p<nl-1>.tar)
+/// against the manifest hex. Missing/short hash -> `sha256 missing`;
+/// mismatch or unreadable tar -> `sha256 mismatch`. True on success
+/// (callers roll back / abort loud on false).
+fn verify_tars(nl: usize, hex: &[u8]) -> bool {
+    if hex.is_empty() {
+        user_lib::print("ctr: sha256 missing\n");
+        return false;
+    }
+    if hex.len() != 64 {
+        user_lib::print("ctr: sha256 mismatch\n");
+        return false;
+    }
+    // (lowercase only: pkgbuild/registry emit lowercase, write it down.)
+    let mut li = 0;
+    while li < hex.len() {
+        let c = hex[li];
+        if !((c >= b'0' && c <= b'9') || (c >= b'a' && c <= b'f')) {
+            user_lib::print("ctr: sha256 mismatch\n");
+            return false;
+        }
+        li += 1;
+    }
+    let mut st = user_lib::Sha256::new();
+    let mut li = 0usize;
+    while li < nl {
+        let mut ob = [0u8; 32];
+        ob[..7].copy_from_slice(b"/tmp/p0");
+        ob[6] = b'0' + li as u8;
+        ob[7..11].copy_from_slice(b".tar");
+        let f = user_lib::open(ob.as_ptr(), 0);
+        if f < 0 {
+            user_lib::print("ctr: sha256 mismatch\n");
+            return false;
+        }
+        let mut blk = [0u8; 512];
+        loop {
+            let r = user_lib::read(f, blk.as_mut_ptr(), blk.len());
+            if r < 0 {
+                user_lib::close(f);
+                user_lib::print("ctr: sha256 mismatch\n");
+                return false;
+            }
+            if r == 0 {
+                break;
+            }
+            st.update(&blk[..r as usize]);
+        }
+        user_lib::close(f);
+        li += 1;
+    }
+    let sum = st.finalize();
+    let mut hb = [0u8; 64];
+    user_lib::sha256_hex(&sum, &mut hb);
+    if &hb[..] != hex {
+        user_lib::print("ctr: sha256 mismatch\n");
+        return false;
+    }
+    true
 }
 
 /// unpack + link + db for an already-resolved package (deps done).
@@ -1655,6 +2237,8 @@ fn install_layers(
     layers: &[[u8; 64]; 8],
     layern: &[usize; 8],
     nl: usize,
+    manual: bool,
+    sha: &[u8],
 ) {
     let mut root = [0u8; 64];
     root[..5].copy_from_slice(b"/pkg/");
@@ -1669,10 +2253,14 @@ fn install_layers(
     let mut li = 0usize;
     while li < nl {
         let layer = &layers[li][..layern[li]];
+        // v3.3: versioned layer route.
         let mut rpath = [0u8; 128];
         rpath[..5].copy_from_slice(b"/pkg/");
         rpath[5..5 + pkg.len()].copy_from_slice(pkg);
         let rpn = 5 + pkg.len();
+        rpath[rpn] = b'/';
+        rpath[rpn + 1..rpn + 1 + ver.len()].copy_from_slice(ver);
+        let rpn = rpn + 1 + ver.len();
         rpath[rpn] = b'/';
         rpath[rpn + 1..rpn + 1 + layer.len()].copy_from_slice(layer);
         let mut ob = [0u8; 32];
@@ -1682,13 +2270,25 @@ fn install_layers(
         if !run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..11]) {
             rollback(&root);
         }
+        li += 1;
+    }
+    // v3.4: verify BEFORE unpacking (tampered bytes never touch the store).
+    if !verify_tars(nl, sha) {
+        rollback(&root);
+    }
+    let mut li = 0usize;
+    while li < nl {
+        let mut ob = [0u8; 32];
+        ob[..7].copy_from_slice(b"/tmp/p0");
+        ob[6] = b'0' + li as u8;
+        ob[7..11].copy_from_slice(b".tar");
         let tf = user_lib::open(ob.as_ptr(), 0);
         if tf < 0 {
             rollback(&root);
         }
         let f = untar(tf, &root[..rootn], rootn);
         user_lib::close(tf);
-        user_lib::unlink(ob.as_ptr());
+        // (tars stay until the files list is scanned below.)
         if f <= 0 {
             // (empty package is bogus, like pull's empty guard)
             rollback(&root);
@@ -1716,6 +2316,35 @@ fn install_layers(
             w += r as usize;
         }
         user_lib::close(f);
+    }
+    // v3.3: scan the kept tars into the store file list (upgrade GC),
+    // then drop the tars.
+    {
+        let mut names = [[0u8; 128]; 64];
+        let mut nn = 0usize;
+        let mut li = 0usize;
+        let mut ok = true;
+        while li < nl && ok {
+            let mut ob = [0u8; 32];
+            ob[..7].copy_from_slice(b"/tmp/p0");
+            ob[6] = b'0' + li as u8;
+            ob[7..11].copy_from_slice(b".tar");
+            if nn >= 64 {
+                ok = false;
+            } else {
+                let got = tar_files(&ob, &mut names[nn..]);
+                if got == usize::MAX || nn + got > 64 {
+                    ok = false;
+                } else {
+                    nn += got;
+                }
+            }
+            user_lib::unlink(ob.as_ptr());
+            li += 1;
+        }
+        if !ok || !store_write_files(&root, rootn, &names, nn) {
+            rollback(&root);
+        }
     }
     // 4. link store/bin/* into /bin -- after a full shadow pre-check
     // (an existing /bin name refuses the whole install: no clobber,
@@ -1761,7 +2390,7 @@ fn install_layers(
         }
         k += 1;
     }
-    if !pkg_db_add(pkg, ver) {
+    if !pkg_db_add(pkg, ver, manual) {
         // db unwritable: roll the files back too (db entry ⟺ installed).
         let mut k = 0usize;
         while k < nn {
@@ -1838,7 +2467,8 @@ fn pkg_needed_by(pkg: &[u8], out: &mut [u8; 32]) -> bool {
         let mut layern = [0usize; 8];
         let mut deps = [[0u8; 64]; 8];
         let mut depn = [0usize; 8];
-        let (_, _, ndeps) = parse_manifest(&mb, mn, &mut ver, &mut layers, &mut layern, &mut deps, &mut depn);
+        let mut sha_ign = [0u8; 64];
+        let (_, _, ndeps, _) = parse_manifest(&mb, mn, &mut ver, &mut layers, &mut layern, &mut deps, &mut depn, &mut sha_ign);
         let mut d = 0;
         while d < ndeps {
             let tok = &deps[d][..depn[d]];
@@ -1857,6 +2487,75 @@ fn pkg_needed_by(pkg: &[u8], out: &mut [u8; 32]) -> bool {
         k += 1;
     }
     false
+}
+
+/// v3.3: installed package names from /pkg/db into `out`.
+/// Returns count (cap 32).
+fn pkg_db_names(out: &mut [[u8; 64]; 32]) -> usize {
+    let f = user_lib::open(b"/pkg/db\0".as_ptr(), 0);
+    if f < 0 {
+        return 0;
+    }
+    let mut b = [0u8; 2048];
+    let mut n = 0usize;
+    loop {
+        if n >= b.len() {
+            break;
+        }
+        let r = user_lib::read(f, unsafe { b.as_mut_ptr().add(n) }, b.len() - n);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    user_lib::close(f);
+    let mut nn = 0;
+    let mut i = 0;
+    while i < n && nn < out.len() {
+        let mut j = i;
+        while j < n && b[j] != b'\n' {
+            j += 1;
+        }
+        let mut e = i;
+        while e < j && b[e] != b' ' {
+            e += 1;
+        }
+        if e > i {
+            let m = (e - i).min(63);
+            out[nn][..m].copy_from_slice(&b[i..i + m]);
+            out[nn][m] = 0;
+            nn += 1;
+        }
+        i = j + 1;
+    }
+    nn
+}
+
+/// v3.3: shared remove body (unlink /bin links + delete store).
+/// No db touch, no prints, no exits -- callers own those.
+fn pkg_remove_files(pkg: &[u8]) -> bool {
+    let mut root = [0u8; 64];
+    root[..5].copy_from_slice(b"/pkg/");
+    root[5..5 + pkg.len()].copy_from_slice(pkg);
+    let rootn = 5 + pkg.len();
+    let mut binpath = [0u8; 64];
+    binpath[..rootn].copy_from_slice(&root[..rootn]);
+    binpath[rootn..rootn + 4].copy_from_slice(b"/bin");
+    let mut names = [[0u8; 64]; 32];
+    let nn = dir_names(&binpath, &mut names);
+    let mut k = 0usize;
+    while k < nn {
+        let mut nlen = 0;
+        while nlen < 64 && names[k][nlen] != 0 {
+            nlen += 1;
+        }
+        let mut dst = [0u8; 64];
+        dst[..5].copy_from_slice(b"/bin/");
+        dst[5..5 + nlen].copy_from_slice(&names[k][..nlen]);
+        user_lib::unlink(dst.as_ptr());
+        k += 1;
+    }
+    rm_all(&root)
 }
 
 /// `ctr remove <pkg>`: unlink the /bin links, delete the store,
@@ -1879,28 +2578,7 @@ fn cmd_pkg_remove(pkg: &[u8]) {
         user_lib::print("\n");
         user_lib::exit(1);
     }
-    let mut root = [0u8; 64];
-    root[..5].copy_from_slice(b"/pkg/");
-    root[5..5 + pkg.len()].copy_from_slice(pkg);
-    let rootn = 5 + pkg.len();
-    let mut binpath = [0u8; 64];
-    binpath[..rootn].copy_from_slice(&root[..rootn]);
-    binpath[rootn..rootn + 4].copy_from_slice(b"/bin");
-    let mut names = [[0u8; 64]; 32];
-    let nn = dir_names(&binpath, &mut names);
-    let mut k = 0usize;
-    while k < nn {
-        let mut nlen = 0;
-        while nlen < 64 && names[k][nlen] != 0 {
-            nlen += 1;
-        }
-        let mut dst = [0u8; 64];
-        dst[..5].copy_from_slice(b"/bin/");
-        dst[5..5 + nlen].copy_from_slice(&names[k][..nlen]);
-        user_lib::unlink(dst.as_ptr());
-        k += 1;
-    }
-    if !rm_all(&root) {
+    if !pkg_remove_files(pkg) {
         user_lib::print("ctr: rm failed\n");
         user_lib::exit(1);
     }
@@ -1914,8 +2592,546 @@ fn cmd_pkg_remove(pkg: &[u8]) {
     user_lib::exit(0);
 }
 
+/// v3.3: download one layer tarball to /tmp/p<idx>.tar. True on success.
+fn fetch_layer(
+    host: &[u8],
+    port: &[u8],
+    pkg: &[u8],
+    ver: &[u8],
+    layer: &[u8],
+    idx: usize,
+) -> bool {
+    let mut rpath = [0u8; 128];
+    rpath[..5].copy_from_slice(b"/pkg/");
+    rpath[5..5 + pkg.len()].copy_from_slice(pkg);
+    let rpn = 5 + pkg.len();
+    rpath[rpn] = b'/';
+    rpath[rpn + 1..rpn + 1 + ver.len()].copy_from_slice(ver);
+    let rpn = rpn + 1 + ver.len();
+    rpath[rpn] = b'/';
+    rpath[rpn + 1..rpn + 1 + layer.len()].copy_from_slice(layer);
+    let mut ob = [0u8; 32];
+    ob[..7].copy_from_slice(b"/tmp/p0");
+    ob[6] = b'0' + idx as u8;
+    ob[7..11].copy_from_slice(b".tar");
+    run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..11])
+}
+
+/// v3.3: NUL-terminated path equality.
+fn path_eq(a: &[u8; 128], b: &[u8; 128]) -> bool {
+    let mut i = 0;
+    loop {
+        if a[i] != b[i] {
+            return false;
+        }
+        if a[i] == 0 {
+            return true;
+        }
+        i += 1;
+        if i >= 128 {
+            return true;
+        }
+    }
+}
+
+/// v3.3: delete store files in `old` but absent from `new`
+/// (plus their /bin links for bin/ paths).
+fn gc_stale_files(root: &[u8; 64], rootn: usize, old: &[[u8; 128]; 64], oldn: usize, new: &[[u8; 128]; 64], newn: usize) {
+    let mut k = 0;
+    while k < oldn {
+        let mut found = false;
+        let mut q = 0;
+        while q < newn {
+            if path_eq(&old[k], &new[q]) {
+                found = true;
+                break;
+            }
+            q += 1;
+        }
+        if !found {
+            let mut nlen = 0;
+            while nlen < 128 && old[k][nlen] != 0 {
+                nlen += 1;
+            }
+            if rootn + 1 + nlen < 63 {
+                let mut sp = [0u8; 64];
+                sp[..rootn].copy_from_slice(&root[..rootn]);
+                sp[rootn] = b'/';
+                sp[rootn + 1..rootn + 1 + nlen].copy_from_slice(&old[k][..nlen]);
+                user_lib::unlink(sp.as_ptr());
+            }
+            // bin/<f> -> drop the /bin/<f> link too.
+            if nlen > 4 && &old[k][..4] == b"bin/" {
+                let rest = &old[k][4..nlen];
+                if 5 + rest.len() < 63 {
+                    let mut dst = [0u8; 64];
+                    dst[..5].copy_from_slice(b"/bin/");
+                    dst[5..5 + rest.len()].copy_from_slice(rest);
+                    user_lib::unlink(dst.as_ptr());
+                }
+            }
+        }
+        k += 1;
+    }
+}
+
+/// v3.3: refresh every /bin link from store/bin (unlink + link each).
+/// Overwrites via O_TRUNC mint new inodes, so pre-upgrade links are
+/// stale and must all be re-pointed. False on any failure.
+fn relink_bin(root: &[u8; 64], rootn: usize) -> bool {
+    let mut binpath = [0u8; 64];
+    binpath[..rootn].copy_from_slice(&root[..rootn]);
+    binpath[rootn..rootn + 4].copy_from_slice(b"/bin");
+    let mut names = [[0u8; 64]; 32];
+    let nn = dir_names(&binpath, &mut names);
+    let mut k = 0usize;
+    while k < nn {
+        let mut nlen = 0;
+        while nlen < 64 && names[k][nlen] != 0 {
+            nlen += 1;
+        }
+        let mut src = [0u8; 64];
+        src[..rootn + 4].copy_from_slice(&binpath[..rootn + 4]);
+        src[rootn + 4] = b'/';
+        src[rootn + 5..rootn + 5 + nlen].copy_from_slice(&names[k][..nlen]);
+        let mut dst = [0u8; 64];
+        dst[..5].copy_from_slice(b"/bin/");
+        dst[5..5 + nlen].copy_from_slice(&names[k][..nlen]);
+        user_lib::unlink(dst.as_ptr());
+        if user_lib::link(src.as_ptr(), dst.as_ptr()) != 0 {
+            return false;
+        }
+        k += 1;
+    }
+    true
+}
+
+/// v3.3: upgrade one installed package to the index maximum.
+/// Prints `pkg-upgraded <name> <newver>`, or `already latest <name>`
+/// (exit 0 either way; failures exit loud). Flow: new deps first
+/// (old store intact on dep failure), then download + overwrite +
+/// GC stale files + relink + manifest/files/db refresh.
+/// Known gap: dependents' pins are NOT re-verified (see _doc/v3.3.md).
+fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
+    let mut cur = [0u8; 32];
+    let curn = pkg_db_ver(pkg, &mut cur);
+    if curn == usize::MAX {
+        user_lib::print("ctr: not installed\n");
+        user_lib::exit(1);
+    }
+    let manual = pkg_db_manual(pkg);
+    let mut vers = [[0u8; 32]; 8];
+    let mut versn = [0usize; 8];
+    let nv = fetch_index(host, port, pkg, &mut vers, &mut versn);
+    if nv == 0 {
+        user_lib::print("ctr: no versions\n");
+        user_lib::exit(1);
+    }
+    let mut best = 0;
+    let mut vi = 1;
+    while vi < nv {
+        if vercmp(&vers[vi][..versn[vi]], &vers[best][..versn[best]]) > 0 {
+            best = vi;
+        }
+        vi += 1;
+    }
+    if vercmp(&vers[best][..versn[best]], &cur[..curn]) <= 0 {
+        user_lib::print("already latest ");
+        let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
+        user_lib::print("\n");
+        return;
+    }
+    let nb = best;
+    // new manifest at the resolved route; must equal the selection.
+    let mut mpath = [0u8; 128];
+    mpath[..5].copy_from_slice(b"/pkg/");
+    mpath[5..5 + pkg.len()].copy_from_slice(pkg);
+    let mpn = 5 + pkg.len();
+    mpath[mpn] = b'/';
+    mpath[mpn + 1..mpn + 1 + versn[nb]].copy_from_slice(&vers[nb][..versn[nb]]);
+    let mpn = mpn + 1 + versn[nb];
+    mpath[mpn..mpn + 9].copy_from_slice(b"/manifest");
+    if !run_wget(host, port, &mpath[..mpn + 9], b"/tmp/manifest") {
+        user_lib::print("ctr: pkg fetch failed (manifest)\n");
+        user_lib::exit(1);
+    }
+    let mf = user_lib::open(b"/tmp/manifest\0".as_ptr(), 0);
+    if mf < 0 {
+        user_lib::print("ctr: pkg fetch failed (manifest-open)\n");
+        user_lib::exit(1);
+    }
+    let mut mb = [0u8; 2048];
+    let mut mn = 0usize;
+    loop {
+        if mn >= mb.len() {
+            break;
+        }
+        let r = user_lib::read(mf, unsafe { mb.as_mut_ptr().add(mn) }, mb.len() - mn);
+        if r <= 0 {
+            break;
+        }
+        mn += r as usize;
+    }
+    user_lib::close(mf);
+    let mut ver = [0u8; 32];
+    let mut layers = [[0u8; 64]; 8];
+    let mut layern = [0usize; 8];
+    let mut deps = [[0u8; 64]; 8];
+    let mut depn = [0usize; 8];
+    let mut usha = [0u8; 64];
+    let (vern, nl, ndeps, ushan) =
+        parse_manifest(&mb, mn, &mut ver, &mut layers, &mut layern, &mut deps, &mut depn, &mut usha);
+    if nl == 0 {
+        user_lib::print("ctr: pkg fetch failed (no-layers)\n");
+        user_lib::exit(1);
+    }
+    if vern != versn[nb] || &ver[..vern] != &vers[nb][..versn[nb]] {
+        user_lib::print("ctr: version skew (");
+        let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
+        user_lib::print(")\n");
+        user_lib::exit(1);
+    }
+    // new deps first (their constraints rule; old store untouched).
+    let mut stack = [[0u8; 64]; 8];
+    let mut stklen = [0usize; 8];
+    {
+        let m = pkg.len().min(63);
+        stack[0][..m].copy_from_slice(&pkg[..m]);
+        stklen[0] = m;
+    }
+    let mut d = 0;
+    while d < ndeps {
+        let (dn, dw) = split_vreq(&deps[d][..depn[d]]);
+        if dn.is_empty() || !valid_name(dn) {
+            user_lib::print("ctr: bad dependency\n");
+            user_lib::exit(1);
+        }
+        if let Some((w, _)) = dw {
+            if !ver_valid(w) {
+                user_lib::print("ctr: bad dependency version\n");
+                user_lib::exit(1);
+            }
+        }
+        install_one(host, port, dn, dw, &mut stack, &mut stklen, 1, false);
+        d += 1;
+    }
+    // download into /tmp (kept), verify, then overwrite the live store.
+    let mut root = [0u8; 64];
+    root[..5].copy_from_slice(b"/pkg/");
+    root[5..5 + pkg.len()].copy_from_slice(pkg);
+    let rootn = 5 + pkg.len();
+    let up_fail = |msg: &str| -> ! {
+        user_lib::print(msg);
+        user_lib::exit(1);
+    };
+    let mut li = 0usize;
+    while li < nl {
+        if !fetch_layer(host, port, pkg, &ver[..vern], &layers[li][..layern[li]], li) {
+            up_fail("ctr: pkg fetch failed (layer)\n");
+        }
+        li += 1;
+    }
+    // v3.4: verify BEFORE unpacking (tampered bytes never touch the store).
+    // usha/ushan came from this manifest's own parse above.
+    if !verify_tars(nl, &usha[..ushan]) {
+        up_fail("ctr: upgrade failed (sha)\n");
+    }
+    let mut li = 0usize;
+    while li < nl {
+        let mut ob = [0u8; 32];
+        ob[..7].copy_from_slice(b"/tmp/p0");
+        ob[6] = b'0' + li as u8;
+        ob[7..11].copy_from_slice(b".tar");
+        let tf = user_lib::open(ob.as_ptr(), 0);
+        if tf < 0 {
+            up_fail("ctr: pkg fetch failed (layer-open)\n");
+        }
+        let f = untar(tf, &root[..rootn], rootn);
+        user_lib::close(tf);
+        if f <= 0 {
+            up_fail("ctr: pkg fetch failed (untar)\n");
+        }
+        li += 1;
+    }
+    // GC: new file set from the kept tars vs old store list.
+    let mut newset = [[0u8; 128]; 64];
+    let mut newn = 0usize;
+    let mut ok = true;
+    let mut li = 0usize;
+    while li < nl && ok {
+        let mut ob = [0u8; 32];
+        ob[..7].copy_from_slice(b"/tmp/p0");
+        ob[6] = b'0' + li as u8;
+        ob[7..11].copy_from_slice(b".tar");
+        if newn >= 64 {
+            ok = false;
+        } else {
+            let got = tar_files(&ob, &mut newset[newn..]);
+            if got == usize::MAX || newn + got > 64 {
+                ok = false;
+            } else {
+                newn += got;
+            }
+        }
+        user_lib::unlink(ob.as_ptr());
+        li += 1;
+    }
+    if !ok {
+        up_fail("ctr: upgrade failed (scan)\n");
+    }
+    let mut oldset = [[0u8; 128]; 64];
+    let oldn = store_read_files(&root, rootn, &mut oldset);
+    gc_stale_files(&root, rootn, &oldset, oldn, &newset, newn);
+    if !relink_bin(&root, rootn) {
+        up_fail("ctr: upgrade failed (relink)\n");
+    }
+    if !store_write_files(&root, rootn, &newset, newn) {
+        up_fail("ctr: upgrade failed (files)\n");
+    }
+    // manifest refresh.
+    {
+        let mut mp = [0u8; 64];
+        mp[..rootn].copy_from_slice(&root[..rootn]);
+        mp[rootn..rootn + 9].copy_from_slice(b"/manifest");
+        let f = user_lib::open(mp.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
+        if f < 0 {
+            up_fail("ctr: upgrade failed (manifest)\n");
+        }
+        let mut w = 0;
+        let mut okw = true;
+        while w < mn {
+            let r = user_lib::write(f, unsafe { mb.as_ptr().add(w) }, mn - w);
+            if r <= 0 {
+                okw = false;
+                break;
+            }
+            w += r as usize;
+        }
+        user_lib::close(f);
+        if !okw {
+            up_fail("ctr: upgrade failed (manifest)\n");
+        }
+    }
+    user_lib::unlink(b"/tmp/manifest\0".as_ptr());
+    if !pkg_db_del(pkg) || !pkg_db_add(pkg, &ver[..vern], manual) {
+        up_fail("ctr: db update failed\n");
+    }
+    user_lib::print("pkg-upgraded ");
+    let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
+    user_lib::print(" ");
+    let _ = user_lib::write(1, ver.as_ptr(), vern);
+    user_lib::print("\n");
+}
+
+/// v3.3: `ctr upgrade <host> <port> [<pkg>]` -- single package or all.
+fn cmd_upgrade(host: &[u8], port: &[u8], pkg_opt: Option<&[u8]>) {
+    match pkg_opt {
+        Some(pkg) => {
+            if !valid_name(pkg) {
+                user_lib::print("ctr: bad name\n");
+                user_lib::exit(1);
+            }
+            upgrade_one(host, port, pkg);
+        }
+        None => {
+            let mut names = [[0u8; 64]; 32];
+            let nn = pkg_db_names(&mut names);
+            let mut k = 0;
+            while k < nn {
+                let mut nlen = 0;
+                while nlen < 64 && names[k][nlen] != 0 {
+                    nlen += 1;
+                }
+                upgrade_one(host, port, &names[k][..nlen]);
+                k += 1;
+            }
+        }
+    }
+    user_lib::exit(0);
+}
+
+/// v3.3: `ctr autoremove` -- delete AUTO-installed packages no other
+/// installed package depends on (fixpoint: chains collapse pass by
+/// pass, cap 16). Manually installed packages are roots and never
+/// collected. Prints `autoremove <name>` per removal; silent with
+/// exit 0 when there is nothing to do.
+fn cmd_autoremove() {
+    let mut pass = 0;
+    loop {
+        let mut names = [[0u8; 64]; 32];
+        let nn = pkg_db_names(&mut names);
+        let mut needer = [0u8; 32];
+        let mut removed = false;
+        let mut k = 0usize;
+        while k < nn {
+            let mut nlen = 0;
+            while nlen < 64 && names[k][nlen] != 0 {
+                nlen += 1;
+            }
+            let nm = &names[k][..nlen];
+            if pkg_db_manual(nm) {
+                k += 1;
+                continue;
+            }
+            if !pkg_needed_by(nm, &mut needer) {
+                if !pkg_remove_files(nm) || !pkg_db_del(nm) {
+                    user_lib::print("ctr: autoremove failed (");
+                    let _ = user_lib::write(1, nm.as_ptr(), nlen);
+                    user_lib::print(")\n");
+                    user_lib::exit(1);
+                }
+                user_lib::print("autoremove ");
+                let _ = user_lib::write(1, nm.as_ptr(), nlen);
+                user_lib::print("\n");
+                removed = true;
+            }
+            k += 1;
+        }
+        pass += 1;
+        if !removed || pass >= 16 {
+            break;
+        }
+    }
+    user_lib::exit(0);
+}
+
+/// v3.4: `ctr login <token>` -- store a registry token at /pkg/token
+/// (attached as a bearer header by run_wget). Token charset
+/// [A-Za-z0-9-_], 1-63 bytes (no CRLF smuggling into HTTP headers).
+/// Prints `login ok`.
+fn cmd_login(tok: &[u8]) {
+    if tok.is_empty() || tok.len() > 63 {
+        user_lib::print("ctr: bad token\n");
+        user_lib::exit(1);
+    }
+    for &c in tok {
+        let ok = (c >= b'0' && c <= b'9')
+            || (c >= b'A' && c <= b'Z')
+            || (c >= b'a' && c <= b'z')
+            || c == b'-'
+            || c == b'_';
+        if !ok {
+            user_lib::print("ctr: bad token\n");
+            user_lib::exit(1);
+        }
+    }
+    mkdir_p(b"/pkg\0");
+    let f = user_lib::open(b"/pkg/token\0".as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
+    if f < 0 {
+        user_lib::print("ctr: login failed\n");
+        user_lib::exit(1);
+    }
+    let mut w = 0;
+    while w < tok.len() {
+        let r = user_lib::write(f, unsafe { tok.as_ptr().add(w) }, tok.len() - w);
+        if r <= 0 {
+            user_lib::close(f);
+            user_lib::print("ctr: login failed\n");
+            user_lib::exit(1);
+        }
+        w += r as usize;
+    }
+    user_lib::close(f);
+    user_lib::print("login ok\n");
+    user_lib::exit(0);
+}
+
+/// v3.5: `ctr volume create|rm|ls` + `run -v` (bind host dirs into
+/// the jail; see _doc/v3.5.md). Volumes are plain `/vol/<v>/` dirs.
+
+/// build `/vol/<v>` (NUL-terminated) into `out`.
+fn vol_path(v: &[u8], out: &mut [u8; 64]) {
+    out[..5].copy_from_slice(b"/vol/");
+    out[5..5 + v.len()].copy_from_slice(v);
+    out[5 + v.len()] = 0;
+}
+
+/// v3.5: volume existence via the PARENT listing (getdents returns 0,
+/// not -1, for missing paths -- it cannot tell "missing dir" from
+/// "empty dir", so probe /vol for the name instead).
+fn vol_exists(v: &[u8]) -> bool {
+    let mut names = [[0u8; 64]; 32];
+    let nn = dir_names(b"/vol\0", &mut names);
+    let mut k = 0usize;
+    while k < nn {
+        let mut nlen = 0;
+        while nlen < 64 && names[k][nlen] != 0 {
+            nlen += 1;
+        }
+        if nlen == v.len() && &names[k][..nlen] == v {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
+
+fn cmd_vol_create(v: &[u8]) {
+    mkdir_p(b"/vol\0");
+    if vol_exists(v) {
+        user_lib::print("ctr: volume exists\n");
+        user_lib::exit(1);
+    }
+    let mut root = [0u8; 64];
+    vol_path(v, &mut root);
+    mkdir_p(&root);
+    if !vol_exists(v) {
+        user_lib::print("ctr: volume create failed\n");
+        user_lib::exit(1);
+    }
+    user_lib::print("vol-created ");
+    let _ = user_lib::write(1, v.as_ptr(), v.len());
+    user_lib::print("\n");
+    user_lib::exit(0);
+}
+
+fn cmd_vol_rm(v: &[u8]) {
+    if !vol_exists(v) {
+        user_lib::print("ctr: no such volume\n");
+        user_lib::exit(1);
+    }
+    let mut root = [0u8; 64];
+    vol_path(v, &mut root);
+    if !rm_all(&root) {
+        user_lib::print("ctr: rm failed\n");
+        user_lib::exit(1);
+    }
+    user_lib::print("vol-removed ");
+    let _ = user_lib::write(1, v.as_ptr(), v.len());
+    user_lib::print("\n");
+    user_lib::exit(0);
+}
+
+fn cmd_vol_ls() {
+    user_lib::print("VOL NAME\n");
+    let mut names = [[0u8; 64]; 32];
+    let nn = dir_names(b"/vol\0", &mut names);
+    let mut k = 0usize;
+    while k < nn {
+        let mut nlen = 0;
+        while nlen < 64 && names[k][nlen] != 0 {
+            nlen += 1;
+        }
+        if nlen > 0 {
+            user_lib::print("VOL ");
+            let _ = user_lib::write(1, names[k].as_ptr(), nlen);
+            user_lib::print("\n");
+        }
+        k += 1;
+    }
+    user_lib::exit(0);
+}
+
+/// v3.5: one `-v` bind (NUL-terminated sides).
+#[derive(Clone, Copy)]
+pub struct VolBind {
+    pub vol: [u8; 64],   // volume name (for /vol/<v>)
+    pub cpath: [u8; 64], // jail-absolute target (starts with /)
+}
+
 /// `ctr list`: installed packages (`PKGLS NAME VERSION` + rows).
 /// A missing db is an empty list, exit 0.
+/// v3.3: prints name + version only (the manual/auto flag stays hidden).
 fn cmd_pkg_list() {
     user_lib::print("PKGLS NAME VERSION\n");
     let f = user_lib::open(b"/pkg/db\0".as_ptr(), 0);
@@ -1941,12 +3157,23 @@ fn cmd_pkg_list() {
         while j < n && b[j] != b'\n' {
             j += 1;
         }
-        let e = if j < n { j + 1 } else { j };
         if j > i {
-            user_lib::print("PKGLS ");
-            let _ = user_lib::write(1, unsafe { b.as_ptr().add(i) }, e - i);
+            // first two fields only.
+            let mut e = i;
+            while e < j && b[e] != b' ' {
+                e += 1;
+            }
+            let mut e2 = if e < j { e + 1 } else { j };
+            while e2 < j && b[e2] != b' ' {
+                e2 += 1;
+            }
+            if e2 > i {
+                user_lib::print("PKGLS ");
+                let _ = user_lib::write(1, unsafe { b.as_ptr().add(i) }, e2 - i);
+                user_lib::print("\n");
+            }
         }
-        i = e;
+        i = j + 1;
     }
     user_lib::exit(0);
 }
@@ -2052,7 +3279,7 @@ fn cmd_exec(name: &[u8], prog: &[u8], args: &[&[u8]]) {
 #[no_mangle]
 pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     if argc < 2 {
-        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm <name> | ctr logs <name> | ctr exec <name> <prog> [args...] | ctr install <host> <port> <pkg> | ctr remove <pkg> | ctr list\n");
+        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm <name> | ctr logs <name> | ctr exec <name> <prog> [args...] | ctr install <host> <port> <pkg>[=ver] | ctr remove <pkg> | ctr list | ctr upgrade <host> <port> [<pkg>] | ctr autoremove | ctr login <token> | ctr volume create <v> | ctr volume rm <v> | ctr volume ls\n");
         user_lib::exit(1);
     }
     let a1 = match unsafe { user_lib::argv_str(argv, 1, argc) } {
@@ -2078,11 +3305,51 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         };
         // take a flag value: `--memory=N` suffix wins, else next argv.
         // Returns (value-bytes, next-k) or exits loudly.
+        // v3.5: `-v SPEC` / `-v=SPEC` (volumes, SPEC = V:C, cap 4).
+        let mut vols = [VolBind { vol: [0u8; 64], cpath: [0u8; 64] }; 4];
+        let mut nvols = 0usize;
         while k < argc {
             let s = unsafe { user_lib::argv_str(argv, k, argc).unwrap_or(b"") };
             if s == b"-d" {
                 detached = true;
                 k += 1;
+                continue;
+            }
+            if s == b"-v" || starts_with(s, b"-v=") {
+                let inline = strip_prefix_eq(s, b"-v=");
+                let vs = if !inline.is_empty() {
+                    k += 1;
+                    inline
+                } else {
+                    if k + 1 >= argc {
+                        bad_flag();
+                    }
+                    let v = unsafe { user_lib::argv_str(argv, k + 1, argc).unwrap_or(b"") };
+                    k += 2;
+                    v
+                };
+                // split FIRST ':' (cpath may not contain another? it may
+                // not matter -- first split is the documented rule).
+                let mut e = 0;
+                while e < vs.len() && vs[e] != b':' {
+                    e += 1;
+                }
+                if nvols >= 4 || e == 0 || e >= vs.len() {
+                    user_lib::print("ctr: bad -v (want V:/cpath)\n");
+                    user_lib::exit(1);
+                }
+                let (vn, cn) = (&vs[..e], &vs[e + 1..]);
+                if !valid_name(vn) || cn.is_empty() || cn[0] != b'/' {
+                    user_lib::print("ctr: bad -v (want V:/cpath)\n");
+                    user_lib::exit(1);
+                }
+                let m = vn.len().min(63);
+                vols[nvols].vol[..m].copy_from_slice(&vn[..m]);
+                vols[nvols].vol[m] = 0;
+                let m = cn.len().min(63);
+                vols[nvols].cpath[..m].copy_from_slice(&cn[..m]);
+                vols[nvols].cpath[m] = 0;
+                nvols += 1;
                 continue;
             }
             let which: u8; // 1=mem 2=cpu 3=weight
@@ -2147,7 +3414,7 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             }
         }
         if argc < k + 2 {
-            user_lib::print("usage: ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...]\n");
+            user_lib::print("usage: ctr run [-d] [--memory N] [--cpu P] [--weight W] [-v V:/cpath] <name> <prog> [args...]\n");
             user_lib::exit(1);
         }
         let name = unsafe { user_lib::argv_str(argv, k, argc).unwrap_or(b"") };
@@ -2164,7 +3431,7 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             ne += 1;
             q += 1;
         }
-        cmd_run(name, prog, &extra[..ne], detached, &quota);
+        cmd_run(name, prog, &extra[..ne], detached, &quota, &vols, nvols);
     } else if a1 == b"ps" {
         // ctr ps (no args)
         if argc != 2 {
@@ -2197,6 +3464,38 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             user_lib::exit(1);
         }
         cmd_rm(name);
+    } else if a1 == b"volume" {
+        // v3.5: ctr volume create <v> | ctr volume rm <v> | ctr volume ls
+        if argc < 3 {
+            user_lib::print("usage: ctr volume create <v> | ctr volume rm <v> | ctr volume ls\n");
+            user_lib::exit(1);
+        }
+        let sub = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        if sub == b"ls" {
+            if argc != 3 {
+                user_lib::print("usage: ctr volume ls\n");
+                user_lib::exit(1);
+            }
+            cmd_vol_ls();
+        } else if sub == b"create" || sub == b"rm" {
+            if argc != 4 {
+                user_lib::print("usage: ctr volume create <v> | ctr volume rm <v>\n");
+                user_lib::exit(1);
+            }
+            let v = unsafe { user_lib::argv_str(argv, 3, argc).unwrap_or(b"") };
+            if !valid_name(v) {
+                user_lib::print("ctr: bad name\n");
+                user_lib::exit(1);
+            }
+            if sub == b"create" {
+                cmd_vol_create(v);
+            } else {
+                cmd_vol_rm(v);
+            }
+        } else {
+            user_lib::print("usage: ctr volume create <v> | ctr volume rm <v> | ctr volume ls\n");
+            user_lib::exit(1);
+        }
     } else if a1 == b"logs" {
         // v2.9: ctr logs <name>
         if argc != 3 {
@@ -2245,19 +3544,43 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         }
         cmd_pull(host, port, image);
     } else if a1 == b"install" {
-        // v3.0: ctr install <host> <port> <pkg> (argv order mirrors pull)
+        // v3.0: ctr install <host> <port> <pkg>; v3.3: <pkg> takes
+        // an optional =ver / >=ver pin (unconstrained = latest).
         if argc != 5 {
-            user_lib::print("usage: ctr install <host> <port> <pkg>\n");
+            user_lib::print("usage: ctr install <host> <port> <pkg>[=ver]\n");
             user_lib::exit(1);
         }
         let host = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
         let port = unsafe { user_lib::argv_str(argv, 3, argc).unwrap_or(b"") };
-        let pkg = unsafe { user_lib::argv_str(argv, 4, argc).unwrap_or(b"") };
-        if host.is_empty() || port.is_empty() || !valid_name(pkg) {
+        let arg = unsafe { user_lib::argv_str(argv, 4, argc).unwrap_or(b"") };
+        if host.is_empty() || port.is_empty() {
             user_lib::print("ctr: bad host/port/pkg\n");
             user_lib::exit(1);
         }
-        cmd_install(host, port, pkg);
+        let (pkg, want) = split_vreq(arg);
+        if !valid_name(pkg) {
+            user_lib::print("ctr: bad host/port/pkg\n");
+            user_lib::exit(1);
+        }
+        if let Some((w, _)) = want {
+            if !ver_valid(w) {
+                user_lib::print("ctr: bad pkg version\n");
+                user_lib::exit(1);
+            }
+        }
+        // (a bare `>` without `=` degrades to unconstrained in
+        // split_vreq -- reject it loudly here instead.)
+        {
+            let mut q = 0;
+            while q < arg.len() {
+                if arg[q] == b'>' && (q + 1 >= arg.len() || arg[q + 1] != b'=') {
+                    user_lib::print("ctr: bad pkg version\n");
+                    user_lib::exit(1);
+                }
+                q += 1;
+            }
+        }
+        cmd_install(host, port, pkg, want);
     } else if a1 == b"remove" {
         // v3.0: ctr remove <pkg> (packages, not containers -- see cmd_rm)
         if argc != 3 {
@@ -2277,6 +3600,38 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             user_lib::exit(1);
         }
         cmd_pkg_list();
+    } else if a1 == b"upgrade" {
+        // v3.3: ctr upgrade <host> <port> [<pkg>]
+        if argc != 4 && argc != 5 {
+            user_lib::print("usage: ctr upgrade <host> <port> [<pkg>]\n");
+            user_lib::exit(1);
+        }
+        let host = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        let port = unsafe { user_lib::argv_str(argv, 3, argc).unwrap_or(b"") };
+        if host.is_empty() || port.is_empty() {
+            user_lib::print("ctr: bad host/port\n");
+            user_lib::exit(1);
+        }
+        if argc == 5 {
+            cmd_upgrade(host, port, Some(unsafe { user_lib::argv_str(argv, 4, argc).unwrap_or(b"") }));
+        } else {
+            cmd_upgrade(host, port, None);
+        }
+    } else if a1 == b"autoremove" {
+        // v3.3: ctr autoremove (no args)
+        if argc != 2 {
+            user_lib::print("usage: ctr autoremove\n");
+            user_lib::exit(1);
+        }
+        cmd_autoremove();
+    } else if a1 == b"login" {
+        // v3.4: ctr login <token>
+        if argc != 3 {
+            user_lib::print("usage: ctr login <token>\n");
+            user_lib::exit(1);
+        }
+        let tok = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        cmd_login(tok);
     } else {
         if !valid_name(a1) {
             user_lib::print("ctr: bad name\n");

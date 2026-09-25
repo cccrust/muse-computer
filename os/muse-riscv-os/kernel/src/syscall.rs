@@ -71,6 +71,8 @@ pub const SYS_CGKILL: usize = 53;
 pub const SYS_CGSETSHARE: usize = 54;
 // v2.9: join an existing (non-root) pid namespace (ctr exec).
 pub const SYS_NSENTER: usize = 55;
+// v3.5: bind a host dir into the caller's view (ctr volume -v).
+pub const SYS_MOUNTVOL: usize = 56;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -170,6 +172,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_CGKILL => crate::task::cg_kill(a0) as isize,
         SYS_CGSETSHARE => sys_cgsetshare(a0, a1 as u64) as isize,
         SYS_NSENTER => sys_nsenter(a0) as isize,
+        SYS_MOUNTVOL => sys_mountvol(a0, a1) as isize,
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,
@@ -967,6 +970,31 @@ fn sys_nsenter(pid: usize) -> isize {
         0
     } else {
         -1
+    }
+}
+
+/// v3.5: bind host dir `tgt` at `mp` for the caller (both user
+/// pointers; resolved in the caller's CURRENT view first, so ctr
+/// passes pre-chroot absolute paths). 0 ok, -1 on any failure
+/// (missing/non-dir target, bad mountpoint, table full).
+fn sys_mountvol(mp_ptr: usize, tgt_ptr: usize) -> isize {
+    unsafe {
+        let mp_raw = match crate::fs::user_str(mp_ptr) {
+            Some(s) => s,
+            None => return -1,
+        };
+        let tgt_raw = match crate::fs::user_str(tgt_ptr) {
+            Some(s) => s,
+            None => return -1,
+        };
+        let pid = crate::task::current_pid();
+        let mp = crate::task::resolve_for(pid, &mp_raw);
+        let tgt = crate::task::resolve_for(pid, &tgt_raw);
+        if crate::task::mount_vol(&mp, &tgt) {
+            0
+        } else {
+            -1
+        }
     }
 }
 

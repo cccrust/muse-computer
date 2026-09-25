@@ -125,9 +125,45 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         user_lib::print("[TEST] wget FAIL (connect)\n");
         user_lib::exit(1);
     }
-    let mut req = [0u8; 256];
+    let mut req = [0u8; 384];
     let rn = user_lib::http_req(&mut req, host, path);
-    if rn == 0 || !send_all(fd, &req[..rn]) {
+    if rn == 0 {
+        user_lib::print("[TEST] wget FAIL (send)\n");
+        user_lib::exit(1);
+    }
+    // v3.4: optional argv[5] = bearer token -> splice an Authorization
+    // header before the closing blank line (registry private routes).
+    let mut rn = rn;
+    if argc > 5 {
+        let tok = unsafe { user_lib::argv_str(argv, 5, argc).unwrap_or(b"") };
+        if !tok.is_empty() {
+            // req ends with "\r\n\r\n": overwrite the last blank line.
+            if rn < 4 || tok.len() > 63 {
+                user_lib::print("[TEST] wget FAIL (args)\n");
+                user_lib::exit(1);
+            }
+            let pre = b"Authorization: Bearer ";
+            let need = rn - 2 + pre.len() + tok.len() + 2;
+            if need > req.len() {
+                user_lib::print("[TEST] wget FAIL (args)\n");
+                user_lib::exit(1);
+            }
+            let mut nb = [0u8; 384];
+            nb[..rn - 2].copy_from_slice(&req[..rn - 2]);
+            let mut w = rn - 2;
+            nb[w..w + pre.len()].copy_from_slice(pre);
+            w += pre.len();
+            nb[w..w + tok.len()].copy_from_slice(tok);
+            w += tok.len();
+            nb[w..w + 2].copy_from_slice(b"\r\n");
+            w += 2;
+            nb[w..w + 2].copy_from_slice(b"\r\n");
+            w += 2;
+            req[..w].copy_from_slice(&nb[..w]);
+            rn = w;
+        }
+    }
+    if !send_all(fd, &req[..rn]) {
         user_lib::print("[TEST] wget FAIL (send)\n");
         user_lib::exit(1);
     }

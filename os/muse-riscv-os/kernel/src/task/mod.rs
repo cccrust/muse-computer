@@ -63,6 +63,11 @@ pub struct Proc {
     // table root -- different thing, hence the longer name.
     pub fsroot: [u8; 128],
     pub fsroot_len: usize,
+    // v3.5: volume binds, per-proc (mountpoint[64], target[64]) pairs,
+    // NUL-terminated, fork-inherited, exec-kept. Die with the proc:
+    // no umount, no leaks, by construction.
+    pub mounts: [([u8; 64], [u8; 64]); 4],
+    pub nmounts: usize,
     pub fd_cloexec: [bool; 16],
     pub mmap_base: usize, // v0.8: top-down anonymous mmap frontier
     pub brk_min: usize,   // v0.8: sbrk may not shrink below this
@@ -955,6 +960,10 @@ fn finish_spawn(
             c
         },
         fsroot_len: 1,
+        // v3.5: fresh procs start unmounted (spawn inherit below for
+        // parent != 0, fork copies after insert).
+        mounts: [([0u8; 64], [0u8; 64]); 4],
+        nmounts: 0,
         fd_cloexec: [false; 16],
         // v0.8: mmap grows down from below the user stack; brk floor =
         // initial brk (brk is finish_spawn's param, in scope here)
@@ -990,11 +999,17 @@ fn finish_spawn(
                 (c, 1)
             }
         };
+        let (mc, mn) = match s.procs.get(parent).and_then(|o| o.as_ref()) {
+            Some(p) => (p.mounts, p.nmounts.min(4)),
+            None => ([([0u8; 64], [0u8; 64]); 4], 0),
+        };
         if let Some(Some(me)) = s.procs.get_mut(pid) {
             me.cwd = cc;
             me.cwd_len = cl;
             me.fsroot = rc;
             me.fsroot_len = rl;
+            me.mounts = mc;
+            me.nmounts = mn;
         }
         if let Some(Some(pp)) = s.procs.get_mut(parent) {
             pp.children.push(pid);
@@ -1254,8 +1269,22 @@ pub fn fork(parent_pid: usize) -> usize {
         cg: p_cg,
         // v2.4: fork tick (PIDINFO identity; see start_ms on the struct).
         start_ms: crate::timer::ticks() as u64,
+        // v3.5: mounts start empty here; inherited from the parent below
+        // (a child cannot escape by forking: jail-relative full paths).
+        mounts: [([0u8; 64], [0u8; 64]); 4],
+        nmounts: 0,
     };
     s.procs[child] = Some(proc);
+    // v3.5: volume binds follow the parent (copied out first: shared
+    // then exclusive borrow of the table cannot overlap).
+    let (pm, pn) = match s.procs.get(parent_pid).and_then(|o| o.as_ref()) {
+        Some(p) => (p.mounts, p.nmounts.min(4)),
+        None => ([([0u8; 64], [0u8; 64]); 4], 0),
+    };
+    if let Some(Some(ch)) = s.procs.get_mut(child) {
+        ch.mounts = pm;
+        ch.nmounts = pn;
+    }
     // v2.9: the child occupies its (inherited) cgroup from birth --
     // occupancy for future reuse scans (a group that never holds a proc
     // is never reusable: create-then-enter must not merge).
@@ -2603,19 +2632,123 @@ pub fn resolve_path(root: &str, cwd: &str, path: &str) -> alloc::string::String 
 
 pub fn resolve_for(pid: usize, path: &str) -> alloc::string::String {
     let s = sched_lock();
-    let (root, cwd) = match s.procs.get(pid).and_then(|o| o.as_ref()) {
+    let (root, cwd, mounts, nmounts) = match s.procs.get(pid).and_then(|o| o.as_ref()) {
         Some(p) => {
             let rn = p.fsroot_len.min(128);
             let cn = p.cwd_len.min(128);
             (
                 alloc::string::String::from_utf8_lossy(&p.fsroot[..rn]).into_owned(),
                 alloc::string::String::from_utf8_lossy(&p.cwd[..cn]).into_owned(),
+                p.mounts,
+                p.nmounts.min(4),
             )
         }
-        None => (alloc::string::String::from("/"), alloc::string::String::from("/")),
+        None => (
+            alloc::string::String::from("/"),
+            alloc::string::String::from("/"),
+            [([0u8; 64], [0u8; 64]); 4],
+            0,
+        ),
     };
     drop(s);
-    resolve_path(&root, &cwd, path)
+    let base = resolve_path(&root, &cwd, path);
+    apply_mounts(&base, &mounts[..nmounts])
+}
+
+/// v3.5: longest-prefix mount rewrite (post-jail). A mount matches on
+/// exact equality or a `/` boundary (`/data` never matches `/data2`).
+/// nmounts == 0 returns the input untouched (hot path: one length
+/// check, then the identical string back).
+fn apply_mounts(path: &str, mounts: &[([u8; 64], [u8; 64])]) -> alloc::string::String {
+    if mounts.is_empty() {
+        return alloc::string::String::from(path);
+    }
+    let pb = path.as_bytes();
+    let mut best_mp = 0usize;
+    let mut best_tgt: &[u8] = b"";
+    for (mp, tgt) in mounts {
+        let mut ml = 0;
+        while ml < 64 && mp[ml] != 0 {
+            ml += 1;
+        }
+        if ml == 0 || ml > pb.len() {
+            continue;
+        }
+        if &pb[..ml] != &mp[..ml] {
+            continue;
+        }
+        if pb.len() != ml && pb[ml] != b'/' {
+            continue;
+        }
+        if ml > best_mp {
+            let mut tl = 0;
+            while tl < 64 && tgt[tl] != 0 {
+                tl += 1;
+            }
+            best_mp = ml;
+            best_tgt = &tgt[..tl];
+        }
+    }
+    if best_mp == 0 {
+        return alloc::string::String::from(path);
+    }
+    let mut out =
+        alloc::string::String::from_utf8_lossy(best_tgt).into_owned();
+    out.push_str(&path[best_mp..]);
+    out
+}
+
+/// v3.5: bind `tgt` at `mp` for the current proc (both already
+/// caller-resolved absolute host paths). tgt must exist as a dir;
+/// mp is auto-mkdir'd one level (parents must exist). Table cap 4.
+/// NUL-pads both sides; strips mp trailing slashes (root "/" keeps one).
+pub fn mount_vol(mp: &str, tgt: &str) -> bool {
+    if !mp.starts_with('/') || !tgt.starts_with('/') || mp.len() > 63 || tgt.len() > 63 {
+        return false;
+    }
+    // target: must exist and be a dir (stat kind 2; 0 = missing, 1 = file).
+    if crate::fs::stat(tgt).0 != 2 {
+        return false;
+    }
+    // normalize mountpoint (strip trailing slashes, keep at least "/").
+    let mut mpb = mp.as_bytes();
+    while mpb.len() > 1 && mpb[mpb.len() - 1] == b'/' {
+        mpb = &mpb[..mpb.len() - 1];
+    }
+    // auto-create the mountpoint dir (single level is enough: jail
+    // roots exist by construction; deeper nesting is the caller's job).
+    // A mountpoint that exists as a FILE is refused (dirs only).
+    let mps = core::str::from_utf8(mpb).unwrap_or("");
+    if mps.is_empty() {
+        return false;
+    }
+    match crate::fs::stat(mps).0 {
+        0 => {
+            if !crate::fs::mkdir(mps) {
+                return false;
+            }
+        }
+        2 => {}
+        _ => return false,
+    }
+    let mut s = sched_lock();
+    let cur = s.current[hartid() % crate::MAX_HART];
+    match s.procs.get_mut(cur).and_then(|o| o.as_mut()) {
+        Some(p) => {
+            if p.nmounts >= 4 {
+                return false;
+            }
+            let mut a = [0u8; 64];
+            a[..mpb.len()].copy_from_slice(mpb);
+            let tb = tgt.as_bytes();
+            let mut b = [0u8; 64];
+            b[..tb.len()].copy_from_slice(tb);
+            p.mounts[p.nmounts] = (a, b);
+            p.nmounts += 1;
+            true
+        }
+        None => false,
+    }
 }
 
 /// v2.0: read/write the fs jail root. set_root takes an ALREADY-RESOLVED

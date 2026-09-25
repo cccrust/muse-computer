@@ -1278,9 +1278,10 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     // v3.0: package suite (install -> list -> run -> cat store -> remove).
     // `hello` is the registry's first package (echo ELF under a
     // collision-free name + hello.txt payload); see _doc/v3.0.md §2.
+    // v3.3: pinned to =1.0 (unpinned now means latest, see _doc/v3.3.md).
     run_args(
         b"/bin/ctr\0",
-        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"hello"],
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"hello=1.0"],
         &mut jobs,
     );
     run_args(
@@ -1353,6 +1354,142 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     run_args(
         b"/bin/ctr\0",
         &[b"ctr", b"remove", b"fortune"],
+        &mut jobs,
+    );
+    // v3.3: upgrade chain (db is clean: v3.1/v3.2 removed everything).
+    // hello 1.0 -> 2.0, then a farewell install proving the dep pin
+    // still bites (db hello is 2.0, need is =1.0).
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"hello=1.0"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"upgrade", b"10.0.2.2", b"8091", b"hello"],
+        &mut jobs,
+    );
+    run_args(b"/bin/cat\0", &[b"cat", b"/pkg/hello/hello.txt"], &mut jobs);
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"list"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"farewell"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"hello"],
+        &mut jobs,
+    );
+    // v3.3: autoremove orphan (install pulls hello=1.0 as a dep;
+    // removing farewell orphans it).
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"farewell"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"farewell"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"autoremove"],
+        &mut jobs,
+    );
+    // v3.4: trust chain (db is clean: autoremove above emptied it).
+    // secret is 401 without a token; login unlocks it; tampered dies
+    // on sha256 mismatch. See _doc/v3.4.md §2.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"secret"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"login", b"test-token"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"secret"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"list"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/secret\0",
+        &[b"secret", b"secret-marker"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"secret"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"tampered"],
+        &mut jobs,
+    );
+    // v3.5: volume suite (bind proof: written outside, read inside).
+    // greet.txt is created inline (/WD/F precedent below); the volc
+    // root is assembled; cat runs jailed with -v data1:/data.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"volume", b"create", b"data1"],
+        &mut jobs,
+    );
+    {
+        let fd = user_lib::open(
+            b"/vol/data1/greet.txt\0".as_ptr(),
+            user_lib::O_CREATE | user_lib::O_TRUNC | 1,
+        );
+        if fd >= 0 {
+            let d = b"hi-vol\n";
+            user_lib::write(fd, d.as_ptr(), d.len());
+            user_lib::close(fd);
+        }
+    }
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"volc"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[
+            b"ctr",
+            b"run",
+            b"-v",
+            b"data1:/data",
+            b"volc",
+            b"/bin/cat",
+            b"/data/greet.txt",
+        ],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"volume", b"ls"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"rm", b"volc"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"volume", b"rm", b"data1"],
         &mut jobs,
     );
     run_one(b"/bin/persist\0", &mut jobs);

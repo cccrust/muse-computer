@@ -25,6 +25,12 @@ v3.0  安裝三件套      ctr install/remove/list + registry 包路由 +
                       manifest（name/version）+ 第一批包（內建程式重包）
 v3.1  依賴            manifest depends: + guest 拓撲安裝 + 版本 `=`
 v3.2  crates.io 管線  user-lib 發布 + tools/pkgbuild（fetch→交叉編譯→打包）
+v3.3  升級鏈          registry 多版本路由 + index + 版本範圍 +
+                      upgrade + autoremove（見 §5）
+v3.4  信任鏈          sha256 完整性 + registry 認證（見 §6）
+v3.5  volume          持久數據進出容器的正規路（見 §7）
+v3.6  容器小件收尾    ps 限額 + rm -f + restart（見 §9）
+v3.7+ 候選池          按需排序，不預排版號（見 §8）
 ```
 
 - v3.0 是「能用」：單包安裝閉環，不碰依賴。
@@ -45,6 +51,7 @@ user/sh                 # autorun 加 install→run→remove（v3.0）
 run.sh/test.sh          # test.sh 項數見各版；registry 樁啟停沿用 v2.3
 user-lib                # 發布到 crates.io（v3.2 前提；v3.0 不動）
 ```
+v3.3+ 增量見 §5–§8（registry 多版本路由、guest sha256、`/vol/`）。
 
 ## 3. 包格式（v3.0 定，後版只加行）
 
@@ -65,5 +72,85 @@ user-lib                # 發布到 crates.io（v3.2 前提；v3.0 不動）
   **連跑 2 輪**（v2.x 紀律沿用）。
 - test 樁風格：host python 樁、guest 主動、確定斷言（v2.x 紀律沿用）。
 - suite 只增不減：舊測項零退化是每版驗收第一條。
-- 非目標重申（除非另立大版）：版本並存、`upgrade`、簽名驗證、
-  delta 更新、私有 registry 認證、guest 側編譯器。
+- 非目標重申（除非另立大版）：版本並存（v3.3 解決）、`upgrade`
+  （v3.3）、簽名驗證（v3.4）、delta 更新、私有 registry 認證
+  （v3.4）、guest 側編譯器（永不）。
+
+## 5. v3.3：升級鏈（registry 多版本 + 版本範圍 + upgrade）
+
+動機：v3.0–v3.2 只會裝不會升；`already installed` 一擋了事。
+升級的前提是多版本並存——registry 端用「啟動現包」直接加
+`/pkg/<name>/<ver>/` 路由（v3.0 同招；曾考慮 `tools/packages/`
+磁碟目錄，已斃：blob 進版控 + 重打包流程，收益為負），
+另加 `/pkg/<name>/index` 版本列表。
+
+- registry：`/pkg/<name>/<ver>/manifest` + layer 路由改讀磁碟；
+  另加 `/pkg/<name>/index`（版本列表，一行一版，guest 選版用）。
+  舊無版號路由保留（指最新版，test 舊測項不用改）。
+- manifest：`version:` 語意收緊為三段式（`x.y.z`，數字比較；
+  不合規 → loud 拒收）。依賴 token 支援 `name>=v`（`=` 沿用；
+  `>`/`<`/`~` 不做——夠用就好）。
+- `ctr upgrade [<pkg>]`: 無參數 = 全升，有參數 = 單升。對每個包：
+  查 index 取最大滿足約束的版本 → 與 db 比 → 新則「裝新版 +
+  刪舊版」原子視角（先裝後刪：中間態雙 store 並存，失敗留舊版，
+  不變量：db 永遠指一個完整版）。依賴重解（新版的 depends 為準）。
+- `ctr autoremove`：刪「不在任何 depends 閉包裡」的包
+  （db + 各 store manifest 反查，v3.1 needed-by 的反方向）。
+  先印清單再刪（`autoremove <name>...` 行，確定斷言用）。
+- suite 方向：registry 放 `hello 1.0 + 2.0`（2.0 改一行 txt）；
+  `install hello`（得 1.0？不——新裝直接取最新，這點要在 doc 釘死：
+  install 無約束 = 最新版）→ `upgrade` → 版本行變 2.0 →
+  `autoremove`（視 suite 安排）。約 6–8 個 marker。
+- 非目標：downgrade（`install =ver` 指定舊版？v3.4 再議）、
+  並行下載、delta。
+
+## 6. v3.4：信任鏈（完整性 + registry 認證）
+
+動機：v3.3 之後包會越裝越多，來源必須可驗。兩層，各自獨立：
+
+- 完整性：manifest `sha256:` 行（layer bytes 串接 hash），guest
+  先驗後解。擋傳輸損壞/調包；**不是非對稱簽名**（ed25519 要先有
+  SHA-512，~500 行 crypto——進 §8 候選池，不在本版展開）。
+  guest sha256 住 `user-lib`（core-only，host-tests NIST 向量先行）。
+- registry 認證：私仓 token（`Authorization: Bearer`；guest wget
+  加 header 位，token 落 `/pkg/token`，`ctr login` 寫入）。
+- 順序：完整性先（不依賴 registry 改動，本地驗），認證後。
+- suite 方向：篡改 tar → mismatch marker；無 token 抓私包 → 401
+  marker。registry 樁加 401 分支。
+- 非目標：ed25519、吊銷/過期、TLS（guest 側 handshake 太重；
+  user-net 本來就只信本地）、key 輪換。
+
+## 7. v3.5：volume（容器數據正規路）
+
+動機：plan2.x §8 原話——「持久數據進出容器的正規路；目前靠
+hardlink 與整盤持久」。包（v3.x）和容器（v2.x）都齊了，數據卷
+是最後一塊拼圖。
+
+- `ctr volume create <v>`：`/vol/<v>/`（host 視角目錄，與 `/ctr`
+  平級，不隨容器生死）。
+- `ctr run [-d] -v <v>:<cpath> ...`：子 chroot **之前**把 vol
+  bind 進 jail（實現選型二選一，v3.5 定案時選：a) VFS mount 表
+  （真 bind mount，動 FS 核心）；b) 目標路徑預建 hardlink 樹
+  （assemble 招式，無 FS 改動，但語義是快照不是共享）。
+  傾向 a)，但 b) 是可接受的過渡——寫 doc 時誠實註明。
+- 生命週期：volume 與容器正交（`rm` 容器不刪卷，docker 同款）；
+  `ctr volume ls/rm`（rm 拒非空？還是遞迴——定案時選）。
+- suite 方向：卷內寫檔 → 容器內可見 → 容器刪後卷還在。
+- 非目標：quota on volume（cgroup 配額是容器側的）、跨宿主遷移、
+  volume driver。
+
+## 9. v3.6：容器小件收尾（ps 限額 + rm -f + restart）
+
+動機：v2.x 留的三個小件，一次收完（唯讀/組裝既有原語）。
+落點見 `v3.6.md`（SYS_CGSTAT + `.run` sidecar + stop 共用 helper）。
+
+- 容器小件：`ps` 顯示限額（v2.8 欠賬）、`rm -f`、`restart`、
+  `KB/MB` 別名（v2.8 說不加，要加也是小版）。
+- 包小件：`install =ver` 指定舊版（downgrade 語意）、並行下載、
+  delta 更新。
+- 運行時大件（plan2.x §8 遺產）：overlayfs、netns/veth（最大版，
+  放最後）、IO 權重、層級配額 enforced、cgroupfs、OOM-killer、
+  `pivot_root`。
+- 包信任大件：ed25519 非對稱簽名（含 guest SHA-512）、key 輪換/吊銷。
+- 永不（除非另立大版）：guest 側編譯器、users/capabilities 驅動的
+  權限檢查。

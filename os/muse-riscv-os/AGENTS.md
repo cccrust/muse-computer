@@ -39,7 +39,7 @@ qemu-system-riscv64 -machine virt -smp 4 -nographic -bios default -kernel kernel
 
 ## Verify
 
-- Fast gate first: `cargo test -p kernel -p host-tests -p mkfs`
+- Fast gate first: `cargo test -p kernel -p host-tests -p mkfs -p user-lib`
 - Full suite `./test.sh` is expensive (11 QEMU boots, 10+ min, `qemu.log`-`qemu7.log` assertions). Needs `qemu-system-riscv64`, `rust-objcopy`, `python3` (stub servers in `tools/`), `timeout`/`gtimeout`. Same-spot wedge twice under light load = real bug; do not just raise timeouts.
 
 ## Add a user program — 3 touches
