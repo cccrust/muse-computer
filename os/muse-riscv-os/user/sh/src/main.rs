@@ -1220,6 +1220,13 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"ctr", b"run", b"--memory", b"5", b"life", b"/bin/sleeper", b"1"],
         &mut jobs,
     );
+    // v2.9: exec into the live container (life's linger still runs;
+    // must precede `stop life`). Marker: echo output on our console.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"exec", b"life", b"/bin/echo", b"hello-from-exec"],
+        &mut jobs,
+    );
     run_args(
         b"/bin/ctr\0",
         &[b"ctr", b"ps"],
@@ -1238,6 +1245,34 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     run_args(
         b"/bin/ctr\0",
         &[b"ctr", b"rm", b"life"],
+        &mut jobs,
+    );
+    // v2.9: logs suite (fresh name; linger/sleeper print nothing, so
+    // the detached prog is /bin/echo -- its line lands in the log file,
+    // `ctr logs` reads it back even after the container exited).
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"logtest"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"run", b"-d", b"logtest", b"/bin/echo", b"hello-from-log"],
+        &mut jobs,
+    );
+    // v2.9: the detached echo may not have been scheduled yet when run
+    // -d returns (its parent is reaped, it is reparented to init). Give
+    // it 2s to exec+write before reading the log back -- echo needs ms;
+    // the margin is for loaded-host MTTCG, same spirit as §11's margins.
+    user_lib::sleep(200);
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"logs", b"logtest"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"rm", b"logtest"],
         &mut jobs,
     );
     run_one(b"/bin/persist\0", &mut jobs);

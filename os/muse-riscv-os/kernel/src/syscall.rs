@@ -69,6 +69,8 @@ pub const SYS_REAPSTAT: usize = 52;
 pub const SYS_CGKILL: usize = 53;
 // v2.7: CPU share weight for a cgroup (vruntime fairness).
 pub const SYS_CGSETSHARE: usize = 54;
+// v2.9: join an existing (non-root) pid namespace (ctr exec).
+pub const SYS_NSENTER: usize = 55;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -167,6 +169,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_REAPSTAT => crate::task::reapstat(a0) as isize,
         SYS_CGKILL => crate::task::cg_kill(a0) as isize,
         SYS_CGSETSHARE => sys_cgsetshare(a0, a1 as u64) as isize,
+        SYS_NSENTER => sys_nsenter(a0) as isize,
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,
@@ -949,6 +952,18 @@ fn sys_chroot(path_ptr: usize) -> isize {
 /// a new ns; other flags rejected.
 fn sys_unshare(flags: usize) -> isize {
     if crate::task::unshare(flags) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// v2.9: join the pid namespace of a live task (ctr exec). Refuses
+/// missing targets and the root ns (joining ns 0 from a container
+/// would be an escape hatch; the only in-tree user joins container
+/// namespaces from the root ns).
+fn sys_nsenter(pid: usize) -> isize {
+    if crate::task::nsenter(pid) {
         0
     } else {
         -1

@@ -113,8 +113,16 @@ struct Sched {
 
 /// v2.2: cgroup descriptor (metadata only; usage+limits live in frame.rs
 /// under the ALLOC lock -- see _doc/v2.2.md for why they must not live here).
+/// v2.9: `used` = occupied since last (re)assignment (fork-inherit or
+/// cgenter sets it; handoff clears it). Only a used-then-emptied slot is
+/// reusable -- a fresh never-entered slot must NOT be handed out twice
+/// (create-then-children-enter would collapse two groups into one; this
+/// is why the v2.4 cg-reuse attempt was reverted). `reserved` = handoff
+/// in progress (mid-reset; cgenter refuses these).
 pub struct Cg {
     pub parent: usize,
+    pub used: bool,
+    pub reserved: bool,
 }
 
 // v1.1: successful cross-hart steals (informational; printed at halt).
@@ -262,6 +270,10 @@ pub fn print_stats() {
     // v2.3: cgroup count (v2.2 doc promised this line; existence only).
     let ngroups = sched_lock().cg.len();
     crate::println!("[CG] groups={}", ngroups);
+    // v2.9: pid-namespace high-water (v2.4 reuses dead slots; like groups,
+    // this is a count, not liveness -- existence only).
+    let nns = sched_lock().ns.len();
+    crate::println!("[NS] ns={}", nns);
 }
 
 static mut SCHED: Option<crate::sync::SpinMutex<Sched>> = None;
@@ -420,10 +432,91 @@ pub fn reapstat(pid: usize) -> isize {
 /// syscalls, so "unreferenced right now" cannot see future intent -- the
 /// standard create-then-children-enter pattern would collapse two groups
 /// into one slot (observed: cgtest's cap/free groups merged, cpu-order
-/// FAIL). Slots stay push-only like v2.2/v2.3; growth is bounded in
-/// practice (one create per test, containers inherit instead of creating).
-/// Namespace slots ARE reused (see fork): alloc+occupancy are atomic there.
+/// FAIL). v2.9 reuses slots, but ONLY used-then-emptied ones (never a
+/// fresh never-entered slot), plus a `reserved` handoff flag so two
+/// concurrent creators cannot take the same slot and cgenter cannot slip
+/// in mid-reset. See _doc/v2.9.md §1.3 for the protocol.
 pub fn cgcreate(limit: u64) -> usize {
+    // Phase 1 (sched lock): reserve a used-then-emptied slot, if any.
+    // 0 = root is never reused.
+    let reuse = {
+        let mut s = sched_lock();
+        let mut id = usize::MAX;
+        for i in 1..s.cg.len() {
+            if s.cg[i].reserved || !s.cg[i].used {
+                continue;
+            }
+            let mut occupied = false;
+            for slot in s.procs.iter() {
+                if let Some(p) = slot {
+                    if p.cg == i {
+                        occupied = true;
+                        break;
+                    }
+                }
+            }
+            if !occupied {
+                s.cg[i].reserved = true;
+                id = i;
+                break;
+            }
+        }
+        id
+    };
+    if reuse != usize::MAX {
+        // Phase 2 (no sched lock held): the slot must be frame-clean --
+        // a proc that cgenter()ed away can leave charged frames behind
+        // (charges stick to the allocating group). Nonzero use_ means
+        // the slot is NOT really empty: release it and fall to push.
+        // cg_use() takes the ALLOC lock itself; never nest sched->ALLOC.
+        if crate::mem::frame::cg_use(reuse) != 0 {
+            let mut s = sched_lock();
+            if reuse < s.cg.len() {
+                s.cg[reuse].reserved = false;
+            }
+            return cgcreate_push(limit);
+        }
+        // Reset accounting to fresh (atomics are lock-free; lim mirrors
+        // through the frame layer like the push path below).
+        cg_reset_acct(reuse);
+        crate::mem::frame::set_cg_limit(reuse, 0);
+        // Phase 3 (sched lock): re-verify emptiness (a cgenter could only
+        // have arrived via the reserved guard -- which refuses -- but
+        // never trust a cross-lock handoff without re-checking), then
+        // install parentage and clear the handoff flags.
+        {
+            let mut s = sched_lock();
+            if reuse >= s.cg.len() || !s.cg[reuse].reserved {
+                return cgcreate_push(limit);
+            }
+            for slot in s.procs.iter() {
+                if let Some(p) = slot {
+                    if p.cg == reuse {
+                        s.cg[reuse].reserved = false;
+                        return cgcreate_push(limit);
+                    }
+                }
+            }
+            let cur = s.current[hartid() % crate::MAX_HART];
+            let parent = s
+                .procs
+                .get(cur)
+                .and_then(|o| o.as_ref())
+                .map(|p| p.cg)
+                .unwrap_or(0);
+            s.cg[reuse].parent = parent;
+            s.cg[reuse].used = false;
+            s.cg[reuse].reserved = false;
+        }
+        crate::mem::frame::set_cg_limit(reuse, limit);
+        return reuse;
+    }
+    cgcreate_push(limit)
+}
+
+/// v2.2 push path (unchanged): fresh slots are never `used`, so the
+/// create-then-children-enter pattern can never merge two groups.
+fn cgcreate_push(limit: u64) -> usize {
     let id = {
         let mut s = sched_lock();
         let cur = s.current[hartid() % crate::MAX_HART];
@@ -437,24 +530,41 @@ pub fn cgcreate(limit: u64) -> usize {
             return usize::MAX;
         }
         let id = s.cg.len();
-        s.cg.push(Cg { parent });
+        s.cg.push(Cg { parent, used: false, reserved: false });
         id
     };
     crate::mem::frame::set_cg_limit(id, limit);
     id
 }
 
+/// v2.9: zero the lock-free CPU/share accounting of a group being
+/// recycled (all atomics; callable with no locks held).
+fn cg_reset_acct(id: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if id >= 256 {
+        return;
+    }
+    CG_CPU[id].store(0, Relaxed);
+    CG_CAP[id].store(0, Relaxed);
+    CG_WIN[id].store(0, Relaxed);
+    CG_WIN_USE[id].store(0, Relaxed);
+    CG_SHARE[id].store(0, Relaxed);
+}
+
 /// v2.2: move self into cgroup `id` (must exist). Flat permission model
 /// (no users): existence is the only check.
+/// v2.9: refuses `reserved` slots (a reuse handoff mid-reset) and marks
+/// the group `used` (occupancy for future reuse scans).
 pub fn cgenter(id: usize) -> bool {
     let mut s = sched_lock();
-    if id >= s.cg.len() {
+    if id >= s.cg.len() || s.cg[id].reserved {
         return false;
     }
     let cur = s.current[hartid() % crate::MAX_HART];
     match s.procs.get_mut(cur).and_then(|o| o.as_mut()) {
         Some(p) => {
             p.cg = id;
+            s.cg[id].used = true;
             true
         }
         None => false,
@@ -488,6 +598,33 @@ pub fn unshare(flags: usize) -> bool {
     match s.procs.get_mut(cur).and_then(|o| o.as_mut()) {
         Some(p) => {
             p.pending_ns = true;
+            true
+        }
+        None => false,
+    }
+}
+
+/// v2.9: join the pid namespace of task `target` (global pid). The
+/// caller keeps its global pid; its in-namespace identity becomes a
+/// fresh lpid (same rule as fork-into-ns). Refuses missing targets and
+/// the root ns (ns 0). Borrow discipline: the target's ns is copied
+/// out before any mutation below.
+pub fn nsenter(target: usize) -> bool {
+    let mut s = sched_lock();
+    let tns = match s.procs.get(target).and_then(|o| o.as_ref()) {
+        Some(p) => p.ns,
+        None => return false,
+    };
+    if tns == 0 || tns >= s.ns.len() {
+        return false;
+    }
+    let nlpid = s.ns[tns].next;
+    s.ns[tns].next += 1;
+    let cur = s.current[hartid() % crate::MAX_HART];
+    match s.procs.get_mut(cur).and_then(|o| o.as_mut()) {
+        Some(p) => {
+            p.ns = tns;
+            p.lpid = nlpid;
             true
         }
         None => false,
@@ -679,7 +816,7 @@ pub fn init() {
             // v2.1: root pid namespace pre-created (id 0).
             ns: alloc::vec![Ns { parent: 0, next: 1 }],
             // v2.2: root cgroup pre-created (id 0, unlimited).
-            cg: alloc::vec![Cg { parent: 0 }],
+            cg: alloc::vec![Cg { parent: 0, used: true, reserved: false }],
         }));
     }
     // create init from embedded ELF
@@ -1119,6 +1256,12 @@ pub fn fork(parent_pid: usize) -> usize {
         start_ms: crate::timer::ticks() as u64,
     };
     s.procs[child] = Some(proc);
+    // v2.9: the child occupies its (inherited) cgroup from birth --
+    // occupancy for future reuse scans (a group that never holds a proc
+    // is never reusable: create-then-enter must not merge).
+    if p_cg < s.cg.len() {
+        s.cg[p_cg].used = true;
+    }
     if let Some(Some(pp)) = s.procs.get_mut(parent_pid) {
         pp.children.push(child);
     }

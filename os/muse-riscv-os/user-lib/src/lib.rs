@@ -199,6 +199,13 @@ pub fn cgkill(cg: isize) -> isize {
 pub fn cgsetshare(id: isize, weight: usize) -> isize {
     ecall(54, id as usize, weight, 0)
 }
+/// v2.9: join the pid namespace of task `pid` (SYS_NSENTER=55). Keeps the
+/// caller's global pid; the in-namespace identity becomes a fresh lpid.
+/// Returns 0 or -1 (missing target, or the root ns -- joining ns 0 from
+/// a container would be an escape hatch).
+pub fn nsenter(pid: isize) -> isize {
+    ecall(55, pid as usize, 0, 0)
+}
 pub fn getcwd(buf: *mut u8, len: usize) -> isize {
     ecall(25, buf as usize, len, 0)
 }

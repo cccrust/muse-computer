@@ -163,6 +163,10 @@ check "mem=100000"
 check "cpu=50"
 check "weight=8"
 check "ctr: exec failed"
+check "hello-from-exec"
+check "hello-from-log"
+check "removed logtest"
+check "cgreuse PASS"
 check "CTRPS life"
 check "Up"
 check "stopped life"
@@ -330,6 +334,13 @@ else
     echo "OK: cgroup line (run3)"
   else
     echo "FAIL: missing CG groups line in qemu3.log";
+    PASS=0
+  fi
+  # v2.9: pid-namespace high-water on clean shutdown (presence only)
+  if grep -q "NS] ns=" qemu3.log; then
+    echo "OK: ns line (run3)"
+  else
+    echo "FAIL: missing NS line in qemu3.log";
     PASS=0
   fi
   # v0.6: THRE delivery is only observable when an external trap claims it;

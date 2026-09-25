@@ -283,6 +283,47 @@ fn share_phase() {
     }
 }
 
+/// v2.9: slot-reuse cycle (see _doc/v2.9.md §1.3/§2). 300x
+/// { cgcreate -> fork child cgenter+exit -> waitpid reap } must ALL
+/// succeed: without reuse the 256-slot bound fails closed (~id 256,
+/// cgcreate returns -1). The child must really ENTER (occupancy --
+/// a never-entered slot is never reusable, or create-then-enter
+/// patterns would merge) and the parent must really REAP (a zombie
+/// still occupies its slot). Prints its own PASS for the suite.
+fn reuse_phase() {
+    let mut i = 0;
+    while i < 300 {
+        let g = user_lib::cgcreate(0);
+        if g < 0 {
+            fail("reuse-create");
+        }
+        let pid = user_lib::fork();
+        if pid == 0 {
+            if user_lib::cgenter(g) != 0 {
+                fail("reuse-enter");
+            }
+            user_lib::exit(0);
+        } else if pid > 0 {
+            let mut code: i32 = -1;
+            loop {
+                let w = user_lib::waitpid(pid, &mut code as *mut i32, 0);
+                if w == -2 {
+                    user_lib::yield_();
+                    continue;
+                }
+                if w != pid || code != 0 {
+                    fail("reuse-reap");
+                }
+                break;
+            }
+        } else {
+            fail("reuse-fork");
+        }
+        i += 1;
+    }
+    user_lib::print("[TEST] cgreuse PASS\n");
+}
+
 #[no_mangle]
 pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
     // bad ids rejected
@@ -371,6 +412,8 @@ pub extern "C" fn main(_argc: usize, _argv: *const *const u8) {
         // v2.7: CPU share ordering (vruntime fairness, order assertion
         // only -- ratios are never asserted, see _doc/v2.7.md §4).
         share_phase();
+        // v2.9: cgroup slot reuse (300 create/enter/exit cycles).
+        reuse_phase();
         user_lib::print("[TEST] cg PASS\n");
         user_lib::exit(0);
     } else {

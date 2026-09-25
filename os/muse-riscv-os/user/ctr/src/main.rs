@@ -151,6 +151,68 @@ fn cmd_assemble(name: &[u8]) {
 // ---- v2.3: `ctr run <name> <prog> [args...]` ----
 // v2.4: `detached` (from `run -d`) records /ctr/<name>/.pid and returns
 // immediately; the container is reparented to init on our exit.
+/// v2.9: resolve prog + build exec argv (argv[0] = prog as typed).
+/// Shared by run and exec. Cap 16 matches the kernel argv limit
+/// (see the v2.8 argv lesson -- never truncate silently below it).
+/// prog resolution mirrors the shell: contains `/` -> as-is (jailed by
+/// chroot after), bare name -> /bin/<prog>.
+fn build_argv(
+    prog: &[u8],
+    args: &[&[u8]],
+    progpath: &mut [u8; 64],
+    toks: &mut [[u8; 64]; 16],
+    av: &mut [*const u8; 17],
+) -> usize {
+    let mut slash = false;
+    for &c in prog.iter() {
+        if c == b'/' {
+            slash = true;
+            break;
+        }
+    }
+    if slash {
+        if prog.len() > 62 {
+            user_lib::print("ctr: prog too long\n");
+            user_lib::exit(1);
+        }
+        nul_copy(progpath, prog);
+    } else {
+        if prog.len() > 57 {
+            user_lib::print("ctr: prog too long\n");
+            user_lib::exit(1);
+        }
+        progpath[..5].copy_from_slice(b"/bin/");
+        progpath[5..5 + prog.len()].copy_from_slice(prog);
+        progpath[5 + prog.len()] = 0;
+    }
+    nul_copy(&mut toks[0], prog);
+    let mut n = 1usize;
+    for &a in args {
+        if n >= 16 {
+            break;
+        }
+        nul_copy(&mut toks[n], &a[..a.len().min(63)]);
+        n += 1;
+    }
+    let mut i = 0;
+    while i < n {
+        av[i] = toks[i].as_ptr();
+        i += 1;
+    }
+    av[n] = core::ptr::null();
+    n
+}
+
+/// v2.9: build `/ctr/<name>/log` (NUL-terminated) into `out`.
+/// (Caller guarantees a valid name: 5 + len + 4 + 1 fits easily.)
+fn log_path(name: &[u8], out: &mut [u8; 64]) {
+    out[..5].copy_from_slice(b"/ctr/");
+    out[5..5 + name.len()].copy_from_slice(name);
+    let mut n = 5 + name.len();
+    out[n..n + 4].copy_from_slice(b"/log");
+    n += 4;
+    out[n] = 0;
+}
 /// v2.8: quota flags for `run` (all optional, all default-off).
 pub struct Quota {
     pub mem_frames: usize, // 0 = unlimited (skip cglimit)
@@ -172,47 +234,24 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool, q: &Quota) 
         user_lib::print("ctr: no such image (pull first)\n");
         user_lib::exit(1);
     }
-    // prog resolution (same as the shell): contains `/` -> as-is
-    // (jailed by chroot after), bare name -> /bin/<prog>.
+    // prog resolution + exec argv (shared with exec, v2.9).
     let mut progpath = [0u8; 64];
-    let mut slash = false;
-    for &c in prog.iter() {
-        if c == b'/' {
-            slash = true;
-            break;
-        }
-    }
-    if slash {
-        if prog.len() > 62 {
-            user_lib::print("ctr: prog too long\n");
+    let mut toks = [[0u8; 64]; 16];
+    let mut av: [*const u8; 17] = [core::ptr::null(); 17];
+    build_argv(prog, args, &mut progpath, &mut toks, &mut av);
+    // v2.9: detached output lands in /ctr/<name>/log (opened here, on
+    // the host side before chroot; fork-inherited, dup2ed after the
+    // jail is up). Open precedes cgcreate so a failure exits clean
+    // with no residue. Foreground runs open nothing (stdio inherited).
+    let mut logfd = -1isize;
+    if detached {
+        let mut lp = [0u8; 64];
+        log_path(name, &mut lp);
+        logfd = user_lib::open(lp.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
+        if logfd < 0 {
+            user_lib::print("ctr: log open failed\n");
             user_lib::exit(1);
         }
-        nul_copy(&mut progpath, prog);
-    } else {
-        if prog.len() > 57 {
-            user_lib::print("ctr: prog too long\n");
-            user_lib::exit(1);
-        }
-        progpath[..5].copy_from_slice(b"/bin/");
-        progpath[5..5 + prog.len()].copy_from_slice(prog);
-        progpath[5 + prog.len()] = 0;
-    }
-    // exec argv: argv[0] = prog as typed, then extra args (cap 6).
-    let mut toks = [[0u8; 64]; 7];
-    nul_copy(&mut toks[0], prog);
-    let mut n = 1usize;
-    for &a in args {
-        if n >= 7 {
-            break;
-        }
-        nul_copy(&mut toks[n], &a[..a.len().min(63)]);
-        n += 1;
-    }
-    let mut av: [*const u8; 8] = [core::ptr::null(); 8];
-    let mut i = 0;
-    while i < n {
-        av[i] = toks[i].as_ptr();
-        i += 1;
     }
     // v2.6: private cgroup for fate-sharing (see _doc/v2.6.md §1).
     // Created before fork so the child enters it as its first act.
@@ -258,10 +297,26 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool, q: &Quota) 
             user_lib::print("ctr: chdir failed\n");
             user_lib::exit(127);
         }
+        // v2.9: detached stdio goes to the log file (post-jail dup2;
+        // the fd was opened pre-chroot and inherited across fork).
+        // From here on even our own errors land in the log (docker-like).
+        if logfd >= 0 {
+            // (dup2 returns the new fd on success, -1 on failure.)
+            if user_lib::dup2(logfd, 1) < 0 || user_lib::dup2(logfd, 2) < 0 {
+                user_lib::print("ctr: log redirect failed\n");
+                user_lib::exit(127);
+            }
+            user_lib::close(logfd);
+        }
         let _ = user_lib::exec(progpath.as_ptr(), av.as_ptr() as usize);
         user_lib::print("ctr: exec failed\n");
         user_lib::exit(127);
     } else if pid > 0 {
+        // v2.9: the parent's copy of the log fd is done (the child
+        // holds its own across fork).
+        if logfd >= 0 {
+            user_lib::close(logfd);
+        }
         if detached {
             // v2.4: learn the child's start tick for the state file
             // (SYS_PIDINFO, +2 biased; must be > 0 here).
@@ -1165,10 +1220,108 @@ fn cmd_rm(name: &[u8]) {
     user_lib::exit(0);
 }
 
+/// v2.9: `ctr logs <name>` -- dump /ctr/<name>/log to stdout.
+/// Liveness is NOT required (stopped containers keep their log until
+/// rm, docker-style). Missing log -> loud, exit 1.
+fn cmd_logs(name: &[u8]) {
+    let mut lp = [0u8; 64];
+    log_path(name, &mut lp);
+    let f = user_lib::open(lp.as_ptr(), 0);
+    if f < 0 {
+        user_lib::print("ctr: no log\n");
+        user_lib::exit(1);
+    }
+    let mut b = [0u8; 64];
+    loop {
+        let r = user_lib::read(f, b.as_mut_ptr(), b.len());
+        if r <= 0 {
+            break;
+        }
+        let mut w = 0usize;
+        while w < r as usize {
+            let k = user_lib::write(1, unsafe { b.as_ptr().add(w) }, r as usize - w);
+            if k <= 0 {
+                user_lib::close(f);
+                user_lib::exit(1);
+            }
+            w += k as usize;
+        }
+    }
+    user_lib::close(f);
+    user_lib::exit(0);
+}
+
+/// v2.9: `ctr exec <name> <prog> [args...]` -- run a process inside a
+/// RUNNING container (its pid ns, rootfs, and cgroup), stdio inherited,
+/// exit code passed through like a foreground run. Refuses stopped or
+/// unknown containers (`ctr: not running`, distinct from run's
+/// `no such image` so the suite can tell them apart).
+fn cmd_exec(name: &[u8], prog: &[u8], args: &[&[u8]]) {
+    let (pid, start, cg) = match read_state(name) {
+        Some(t) => t,
+        None => {
+            user_lib::print("ctr: no such container\n");
+            user_lib::exit(1);
+        }
+    };
+    if !state_alive(pid, start) {
+        user_lib::print("ctr: not running\n");
+        user_lib::exit(1);
+    }
+    // same jail root as run (must exist; the container is alive, so it does).
+    let mut root = [0u8; 64];
+    root[..5].copy_from_slice(b"/ctr/");
+    root[5..5 + name.len()].copy_from_slice(name);
+    root[5 + name.len()] = 0;
+    let mut probe = [0u8; 64];
+    if user_lib::getdents(root.as_ptr(), probe.as_mut_ptr(), 64) < 0 {
+        user_lib::print("ctr: no such image (pull first)\n");
+        user_lib::exit(1);
+    }
+    let mut progpath = [0u8; 64];
+    let mut toks = [[0u8; 64]; 16];
+    let mut av: [*const u8; 17] = [core::ptr::null(); 17];
+    build_argv(prog, args, &mut progpath, &mut toks, &mut av);
+    let cpid = user_lib::fork();
+    if cpid == 0 {
+        // join first (ns from the live pid1, group from the state
+        // file), then jail + exec. Any failure is loud, exit 127.
+        if user_lib::nsenter(pid as isize) != 0 {
+            user_lib::print("ctr: nsenter failed\n");
+            user_lib::exit(127);
+        }
+        if user_lib::cgenter(cg as isize) != 0 {
+            user_lib::print("ctr: cgenter failed\n");
+            user_lib::exit(127);
+        }
+        if user_lib::chroot(root.as_ptr()) != 0 {
+            user_lib::print("ctr: chroot failed\n");
+            user_lib::exit(127);
+        }
+        if user_lib::chdir(b"/\0".as_ptr()) != 0 {
+            user_lib::print("ctr: chdir failed\n");
+            user_lib::exit(127);
+        }
+        let _ = user_lib::exec(progpath.as_ptr(), av.as_ptr() as usize);
+        user_lib::print("ctr: exec failed\n");
+        user_lib::exit(127);
+    } else if cpid > 0 {
+        // stdio inherited; exit code passed through (foreground semantics).
+        let code = wait_for(cpid);
+        if code < 0 {
+            user_lib::exit(1);
+        }
+        user_lib::exit(code);
+    } else {
+        user_lib::print("ctr: fork failed\n");
+        user_lib::exit(1);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     if argc < 2 {
-        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm <name>\n");
+        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm <name> | ctr logs <name> | ctr exec <name> <prog> [args...]\n");
         user_lib::exit(1);
     }
     let a1 = match unsafe { user_lib::argv_str(argv, 1, argc) } {
@@ -1272,10 +1425,10 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             user_lib::print("ctr: bad name or prog\n");
             user_lib::exit(1);
         }
-        let mut extra: [&[u8]; 6] = [b""; 6];
+        let mut extra: [&[u8]; 15] = [b""; 15];
         let mut ne = 0usize;
         let mut q = k + 2;
-        while q < argc && ne < 6 {
+        while q < argc && ne < 15 {
             extra[ne] = unsafe { user_lib::argv_str(argv, q, argc).unwrap_or(b"") };
             ne += 1;
             q += 1;
@@ -1313,6 +1466,39 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             user_lib::exit(1);
         }
         cmd_rm(name);
+    } else if a1 == b"logs" {
+        // v2.9: ctr logs <name>
+        if argc != 3 {
+            user_lib::print("usage: ctr logs <name>\n");
+            user_lib::exit(1);
+        }
+        let name = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        if !valid_name(name) {
+            user_lib::print("ctr: bad name\n");
+            user_lib::exit(1);
+        }
+        cmd_logs(name);
+    } else if a1 == b"exec" {
+        // v2.9: ctr exec <name> <prog> [args...]
+        if argc < 4 {
+            user_lib::print("usage: ctr exec <name> <prog> [args...]\n");
+            user_lib::exit(1);
+        }
+        let name = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        let prog = unsafe { user_lib::argv_str(argv, 3, argc).unwrap_or(b"") };
+        if !valid_name(name) || prog.is_empty() {
+            user_lib::print("ctr: bad name or prog\n");
+            user_lib::exit(1);
+        }
+        let mut extra: [&[u8]; 15] = [b""; 15];
+        let mut ne = 0usize;
+        let mut q = 4usize;
+        while q < argc && ne < 15 {
+            extra[ne] = unsafe { user_lib::argv_str(argv, q, argc).unwrap_or(b"") };
+            ne += 1;
+            q += 1;
+        }
+        cmd_exec(name, prog, &extra[..ne]);
     } else if a1 == b"pull" {
         // ctr pull <host> <port> <image>
         if argc != 5 {
