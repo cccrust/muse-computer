@@ -943,9 +943,9 @@ fn write_u64_to(root: usize, va: usize, v: u64) {
 /// capture -- never revert one without the other (a v0.11 _start on the
 /// old layout reads envc from unmapped 0x70000000 and faults at entry).
 fn push_args(root: usize, args: &[Vec<u8>], env: &[Vec<u8>]) -> usize {
-    let argc = args.len().min(8);
+    let argc = args.len().min(16);
     let envc = env.len().min(16);
-    let mut addrs = [0usize; 8];
+    let mut addrs = [0usize; 16];
     let mut envs = [0usize; 16];
     let mut p = USER_STACK_TOP;
     for i in 0..argc {

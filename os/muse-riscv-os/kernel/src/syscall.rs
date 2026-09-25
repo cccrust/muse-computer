@@ -655,7 +655,7 @@ fn sys_exec(path_ptr: usize, argv_ptr: usize) -> isize {
         // copy argv out of (soon replaced) user memory first
         let mut args: Vec<Vec<u8>> = Vec::new();
         if argv_ptr != 0 {
-            for i in 0..8 {
+            for i in 0..16 {
                 let p = *(argv_ptr as *const usize).add(i);
                 if p == 0 {
                     break;
@@ -691,7 +691,7 @@ fn sys_execve(path_ptr: usize, argv_ptr: usize, envp_ptr: usize) -> isize {
             Some(s) => s,
             None => return -1,
         };
-        let args = copy_strvec(argv_ptr, 8);
+        let args = copy_strvec(argv_ptr, 16);
         let env = copy_strvec(envp_ptr, 16);
         let pid = crate::task::current_pid();
         let path = crate::task::resolve_for(pid, &raw);

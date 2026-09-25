@@ -119,13 +119,13 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8], env: &Env) {
     }
     let core = trim(&cmd[..core_end]);
     // tokenize core into argv (+quote mask), then glob-expand
-    let mut toks = [[0u8; 64]; 8];
-    let mut lit = [[false; 64]; 8];
+    let mut toks = [[0u8; 64]; 16];
+    let mut lit = [[false; 64]; 16];
     let ntok = tokenize_env(core, &mut toks, &mut lit, env);
     if ntok == 0 {
         return;
     }
-    let mut xtoks = [[0u8; 64]; 8];
+    let mut xtoks = [[0u8; 64]; 16];
     let ntok = expand_globs(&toks, ntok, &lit, &mut xtoks);
     if ntok == 0 {
         return;
@@ -133,7 +133,7 @@ fn exec_cmd(line: &[u8], n: usize, jobs: &mut [isize; 8], env: &Env) {
     let toks = xtoks;
     let mut path = [0u8; 64];
     resolve(&toks[0], &mut path);
-    let mut av: [*const u8; 9] = [core::ptr::null(); 9];
+    let mut av: [*const u8; 17] = [core::ptr::null(); 17];
     mkargv(&toks, ntok, &mut av);
     let pid = user_lib::fork();
     if pid == 0 {
@@ -340,7 +340,7 @@ fn find_unquoted(s: &[u8], target: u8) -> Option<usize> {
 fn tokenize_env(s: &[u8], toks: &mut [[u8; 64]], lit: &mut [[bool; 64]], env: &Env) -> usize {
     let mut n = 0;
     let mut i = 0;
-    while i < s.len() && n < 8 {
+    while i < s.len() && n < toks.len() {
         while i < s.len() && s[i] == b' ' {
             i += 1;
         }
@@ -464,7 +464,7 @@ fn expand_var(s: &[u8], i: usize, toks: &mut [[u8; 64]], n: usize, l: &mut usize
 }
 
 // argv pointers for exec (toks must outlive the call).
-fn mkargv(toks: &[[u8; 64]], n: usize, av: &mut [*const u8; 9]) {
+fn mkargv(toks: &[[u8; 64]], n: usize, av: &mut [*const u8]) {
     for i in 0..n {
         av[i] = toks[i].as_ptr();
     }
@@ -607,19 +607,19 @@ fn fnmatch(pat: &[u8], name: &[u8]) -> bool {
     px == pat.len()
 }
 
-// expand unquoted globs via getdents. out[] capped at 8 argv entries;
-// overflow tokens are dropped; zero-match keeps the literal token.
+// expand unquoted globs via getdents. out[] capped at out.len() argv
+// entries; overflow tokens are dropped; zero-match keeps the literal token.
 // Returns new argc.
 fn expand_globs(
-    toks: &[[u8; 64]; 8],
+    toks: &[[u8; 64]],
     ntok: usize,
-    lit: &[[bool; 64]; 8],
-    out: &mut [[u8; 64]; 8],
+    lit: &[[bool; 64]],
+    out: &mut [[u8; 64]],
 ) -> usize {
     let mut n = 0;
     for t in 0..ntok {
         let tl = tok_len(&toks[t]);
-        if n >= 8 {
+        if n >= out.len() {
             break;
         }
         if !token_globs(&toks[t], &lit[t]) {
@@ -700,7 +700,7 @@ fn expand_globs(
                 }
             }
         }
-        if matched == 0 && n < 8 {
+        if matched == 0 && n < out.len() {
             out[n] = toks[t]; // keep literal (nullglob off)
             n += 1;
         }
@@ -710,13 +710,13 @@ fn expand_globs(
 
 fn exec_simple(cmd: &[u8], env: &Env) {
     let cmd = trim(cmd);
-    let mut toks = [[0u8; 64]; 8];
-    let mut lit = [[false; 64]; 8];
+    let mut toks = [[0u8; 64]; 16];
+    let mut lit = [[false; 64]; 16];
     let ntok = tokenize_env(cmd, &mut toks, &mut lit, env);
     if ntok == 0 {
         user_lib::exit(-1);
     }
-    let mut xtoks = [[0u8; 64]; 8];
+    let mut xtoks = [[0u8; 64]; 16];
     let ntok = expand_globs(&toks, ntok, &lit, &mut xtoks);
     if ntok == 0 {
         user_lib::exit(-1);
@@ -724,7 +724,7 @@ fn exec_simple(cmd: &[u8], env: &Env) {
     let toks = xtoks;
     let mut path = [0u8; 64];
     resolve(&toks[0], &mut path);
-    let mut av: [*const u8; 9] = [core::ptr::null(); 9];
+    let mut av: [*const u8; 17] = [core::ptr::null(); 17];
     mkargv(&toks, ntok, &mut av);
     let mut kv = [[0u8; 96]; 16];
     let mut ev: [*const u8; 17] = [core::ptr::null(); 17];
@@ -741,10 +741,10 @@ fn run_one(path: &[u8], jobs: &mut [isize; 8]) {
 
 // exec path with argv (caller flattens to NUL-terminated bufs)
 fn run_args(path: &[u8], args: &[&[u8]], jobs: &mut [isize; 8]) {
-    let mut toks = [[0u8; 64]; 8];
+    let mut toks = [[0u8; 64]; 16];
     let mut n = 0;
     for &a in args {
-        if n >= 8 {
+        if n >= toks.len() {
             break;
         }
         let m = a.len().min(62);
@@ -752,7 +752,7 @@ fn run_args(path: &[u8], args: &[&[u8]], jobs: &mut [isize; 8]) {
         toks[n][m] = 0;
         n += 1;
     }
-    let mut av: [*const u8; 9] = [core::ptr::null(); 9];
+    let mut av: [*const u8; 17] = [core::ptr::null(); 17];
     mkargv(&toks, n, &mut av);
     let pid = user_lib::fork();
     if pid == 0 {
@@ -1209,7 +1209,15 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     );
     run_args(
         b"/bin/ctr\0",
-        &[b"ctr", b"run", b"-d", b"life", b"/bin/linger", b"30"],
+        &[b"ctr", b"run", b"-d", b"--memory", b"100000", b"--cpu", b"50", b"--weight", b"8", b"life", b"/bin/linger", b"30"],
+        &mut jobs,
+    );
+    // v2.8: tiny-cap negative (5 frames can't map sleeper's text+stack;
+    // exec fails deterministically -- see _doc/v2.8.md §2). Foreground:
+    // no state file, exit 127, suite asserts the `exec failed` marker.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"run", b"--memory", b"5", b"life", b"/bin/sleeper", b"1"],
         &mut jobs,
     );
     run_args(
@@ -1843,13 +1851,13 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
 fn exec_bg(line: &[u8], n: usize, jobs: &mut [isize; 8], env: &Env) -> isize {
     // reuse exec_cmd machinery via fork here is complex; support simple prog+args
     let core = trim(&line[..n]);
-    let mut toks = [[0u8; 64]; 8];
-    let mut lit = [[false; 64]; 8];
+    let mut toks = [[0u8; 64]; 16];
+    let mut lit = [[false; 64]; 16];
     let ntok = tokenize_env(core, &mut toks, &mut lit, env);
     if ntok == 0 {
         return -1;
     }
-    let mut xtoks = [[0u8; 64]; 8];
+    let mut xtoks = [[0u8; 64]; 16];
     let ntok = expand_globs(&toks, ntok, &lit, &mut xtoks);
     if ntok == 0 {
         return -1;
@@ -1857,7 +1865,7 @@ fn exec_bg(line: &[u8], n: usize, jobs: &mut [isize; 8], env: &Env) -> isize {
     let toks = xtoks;
     let mut path = [0u8; 64];
     resolve(&toks[0], &mut path);
-    let mut av: [*const u8; 9] = [core::ptr::null(); 9];
+    let mut av: [*const u8; 17] = [core::ptr::null(); 17];
     mkargv(&toks, ntok, &mut av);
     let mut kv = [[0u8; 96]; 16];
     let mut ev: [*const u8; 17] = [core::ptr::null(); 17];

@@ -151,7 +151,17 @@ fn cmd_assemble(name: &[u8]) {
 // ---- v2.3: `ctr run <name> <prog> [args...]` ----
 // v2.4: `detached` (from `run -d`) records /ctr/<name>/.pid and returns
 // immediately; the container is reparented to init on our exit.
-fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool) {
+/// v2.8: quota flags for `run` (all optional, all default-off).
+pub struct Quota {
+    pub mem_frames: usize, // 0 = unlimited (skip cglimit)
+    pub mem_set: bool,
+    pub cpu_pct: usize, // default 100 (skip cgsetcpu unless set)
+    pub cpu_set: bool,
+    pub weight: usize, // default 1 (skip cgsetshare unless set)
+    pub weight_set: bool,
+}
+
+fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool, q: &Quota) {
     // root must exist (pull first; no implicit magic)
     let mut root = [0u8; 64];
     root[..5].copy_from_slice(b"/ctr/");
@@ -205,8 +215,7 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool) {
         i += 1;
     }
     // v2.6: private cgroup for fate-sharing (see _doc/v2.6.md §1).
-    // Created before fork so the child enters it as its first act;
-    // limit 0 = unlimited (quota is v2.7+, this is identity only).
+    // Created before fork so the child enters it as its first act.
     // One slot per run (256/boot bound, documented); failure is loud.
     let ccg = user_lib::cgcreate(0);
     if ccg < 0 {
@@ -214,6 +223,21 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool) {
         user_lib::exit(1);
     }
     let ccg = ccg as usize;
+    // v2.8: apply requested quotas (each checked; any failure aborts
+    // the run -- requested==effective is what the `detached` line
+    // prints, see _doc/v2.8.md §1).
+    if q.mem_set && user_lib::cglimit(ccg as isize, q.mem_frames) != 0 {
+        user_lib::print("ctr: cglimit failed\n");
+        user_lib::exit(1);
+    }
+    if q.cpu_set && user_lib::cgsetcpu(ccg as isize, q.cpu_pct) != 0 {
+        user_lib::print("ctr: cgsetcpu failed\n");
+        user_lib::exit(1);
+    }
+    if q.weight_set && user_lib::cgsetshare(ccg as isize, q.weight) != 0 {
+        user_lib::print("ctr: cgsetshare failed\n");
+        user_lib::exit(1);
+    }
     // new pid namespace (child becomes pid 1 there, v2.1 semantics),
     // then fork: child jails itself, parent reaps + forwards the code.
     if user_lib::unshare(user_lib::CLONE_NEWPID) != 0 {
@@ -256,6 +280,15 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool) {
             }
             user_lib::print("detached ");
             dbg_num(pid as usize);
+            // v2.8: echo applied quotas (defaults for unset: mem=0
+            // unlimited, cpu=100, weight=1). Requested==effective:
+            // any failed set above already aborted the run.
+            user_lib::print(" mem=");
+            dbg_num(if q.mem_set { q.mem_frames } else { 0 });
+            user_lib::print(" cpu=");
+            dbg_num(if q.cpu_set { q.cpu_pct } else { 100 });
+            user_lib::print(" weight=");
+            dbg_num(if q.weight_set { q.weight } else { 1 });
             user_lib::print("\n");
             user_lib::exit(0);
         }
@@ -666,6 +699,53 @@ fn cmd_pull(host: &[u8], port: &[u8], image: &[u8]) {
 }
 
 // ---- v2.4: lifecycle (`run -d`, `ps`, `stop`, `rm`) ----
+
+/// v2.8 flag helpers (for `run`; see _doc/v2.8.md §1).
+fn bad_flag() -> ! {
+    user_lib::print("usage: ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...]\n");
+    user_lib::exit(1);
+}
+
+fn starts_with(s: &[u8], pre: &[u8]) -> bool {
+    s.len() >= pre.len() && &s[..pre.len()] == pre
+}
+
+/// strip a known `--flag=` prefix; empty if absent (caller falls back
+/// to the next argv -- `--flag=` with nothing after behaves like a
+/// separate token, deterministic either way).
+fn strip_prefix_eq<'a>(s: &'a [u8], pre: &[u8]) -> &'a [u8] {
+    if starts_with(s, pre) {
+        &s[pre.len()..]
+    } else {
+        b""
+    }
+}
+
+/// v2.8: memory size to frames: decimal with optional K/M/G suffix
+/// (bytes, rounded UP to 4KB frames). Bare number = frames. None on
+/// garbage. Overflow fails loud (checked ops), never wraps.
+fn parse_mem(b: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < b.len() && b[i] >= b'0' && b[i] <= b'9' {
+        i += 1;
+    }
+    let v = parse_dec(&b[..i])?;
+    if i == b.len() {
+        return Some(v); // frames
+    }
+    let per = match b[i] {
+        b'K' | b'k' => 1024usize,
+        b'M' | b'm' => 1024 * 1024,
+        b'G' | b'g' => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    // single-letter suffix only (no "MB"/"KB" aliases, see §3).
+    if i + 1 != b.len() {
+        return None;
+    }
+    let bytes = v.checked_mul(per)?;
+    Some(bytes.checked_add(4095)? / 4096)
+}
 
 /// decimal parse (leading digits only); None if no digits.
 fn parse_dec(b: &[u8]) -> Option<usize> {
@@ -1088,7 +1168,7 @@ fn cmd_rm(name: &[u8]) {
 #[no_mangle]
 pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     if argc < 2 {
-        user_lib::print("usage: ctr <name> | ctr run [-d] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm <name>\n");
+        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm <name>\n");
         user_lib::exit(1);
     }
     let a1 = match unsafe { user_lib::argv_str(argv, 1, argc) } {
@@ -1099,19 +1179,91 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         }
     };
     if a1 == b"run" {
-        // ctr run [-d] <name> <prog> [args...]
+        // ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...]
+        // flags in any order, before <name>; values as separate tokens
+        // or --flag=N. See _doc/v2.8.md §1.
         let mut k = 2usize;
         let mut detached = false;
-        if argc > 3 {
-            if let Some(s) = unsafe { user_lib::argv_str(argv, 2, argc) } {
-                if s == b"-d" {
-                    detached = true;
-                    k = 3;
+        let mut quota = Quota {
+            mem_frames: 0,
+            mem_set: false,
+            cpu_pct: 100,
+            cpu_set: false,
+            weight: 1,
+            weight_set: false,
+        };
+        // take a flag value: `--memory=N` suffix wins, else next argv.
+        // Returns (value-bytes, next-k) or exits loudly.
+        while k < argc {
+            let s = unsafe { user_lib::argv_str(argv, k, argc).unwrap_or(b"") };
+            if s == b"-d" {
+                detached = true;
+                k += 1;
+                continue;
+            }
+            let which: u8; // 1=mem 2=cpu 3=weight
+            let inline: &[u8];
+            if s == b"--memory" || starts_with(s, b"--memory=") {
+                which = 1;
+                inline = strip_prefix_eq(s, b"--memory=");
+            } else if s == b"--cpu" || starts_with(s, b"--cpu=") {
+                which = 2;
+                inline = strip_prefix_eq(s, b"--cpu=");
+            } else if s == b"--weight" || starts_with(s, b"--weight=") {
+                which = 3;
+                inline = strip_prefix_eq(s, b"--weight=");
+            } else {
+                break;
+            }
+            let vs = if !inline.is_empty() {
+                k += 1;
+                inline
+            } else {
+                if k + 1 >= argc {
+                    bad_flag();
+                }
+                let v = unsafe { user_lib::argv_str(argv, k + 1, argc).unwrap_or(b"") };
+                k += 2;
+                v
+            };
+            if which == 1 {
+                match parse_mem(vs) {
+                    Some(f) => {
+                        quota.mem_frames = f;
+                        quota.mem_set = true;
+                    }
+                    None => bad_flag(),
+                }
+            } else if which == 2 {
+                match parse_dec(vs) {
+                    Some(p) if p <= 100 => {
+                        quota.cpu_pct = p;
+                        quota.cpu_set = true;
+                    }
+                    _ => {
+                        user_lib::print("ctr: bad --cpu (0-100)\n");
+                        user_lib::exit(1);
+                    }
+                }
+            } else {
+                // v2.8: no client-side range check -- the kernel owns
+                // 1-1000 (returns -1 outside it) and cmd_run reports
+                // `ctr: cgsetshare failed` loudly. Unparseable input
+                // still fails here. See _doc/v2.8.md §1.
+                match parse_dec(vs) {
+                    Some(w) => {
+                        quota.weight = w;
+                        quota.weight_set = true;
+                    }
+                    _ => {
+                        user_lib::print("ctr: bad --weight (1-1000)\n");
+                        user_lib::exit(1);
+                    }
                 }
             }
         }
         if argc < k + 2 {
-            user_lib::print("usage: ctr run [-d] <name> <prog> [args...]\n");
+            user_lib::print("usage: ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...]\n");
             user_lib::exit(1);
         }
         let name = unsafe { user_lib::argv_str(argv, k, argc).unwrap_or(b"") };
@@ -1128,7 +1280,7 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             ne += 1;
             q += 1;
         }
-        cmd_run(name, prog, &extra[..ne], detached);
+        cmd_run(name, prog, &extra[..ne], detached, &quota);
     } else if a1 == b"ps" {
         // ctr ps (no args)
         if argc != 2 {
