@@ -91,13 +91,13 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [SMP] hart1 starting
 [SMP] hart2 starting
 [SMP] hart3 starting
-[PLIC] hart2 ctx irq10+virtio1-8 enabled
-[PLIC] hart1 ctx irq10+virtio1-8 enabled
-[SMP] hart2 up
-[SMP] hart1 up
 [PLIC] hart3 ctx irq10+virtio1-8 enabled
+[PLIC] hart1 ctx irq10+virtio1-8 enabled
+[PLIC] hart2 ctx irq10+virtio1-8 enabled
 [SMP] hart3 up
-[DBG] soft hart=2 n=0 sip=0x202->0x200
+[SMP] hart1 up
+[SMP] hart2 up
+[DBG] soft hart=3 n=0 sip=0x202->0x200
 [TEST] ipi PASS
 [TEST] boot markers ready
 [TEST] virtio-irq PASS
@@ -186,13 +186,13 @@ echo: hi from unix-v6
 [PROC] fork pid=11 -> child=13
 [PROC] fork pid=11 -> child=14
 [PROC] fork pid=11 -> child=15
-[smp] child on hart 1->1
+[smp] child on hart 0->0
 [PROC] pid=12 exited(40)
-[smp] child on hart 1->1
+[smp] child on hart 0->[smp] child on hart 01
+->[PROC] pid=14 exited(42)
+0
 [PROC] pid=13 exited(41)
-[smp] child on hart 1->1
-[PROC] pid=14 exited(42)
-[smp] child on hart 1->1
+[smp] child on hart 0->1
 [PROC] pid=15 exited(43)
 [TEST] smp PASS
 [PROC] pid=11 exited(0)
@@ -242,16 +242,16 @@ echo: hi from unix-v6
 [PROC] pid=41 exited(77)
 [PROC] pid=26 exited(10)
 [PROC] pid=33 exited(17)
-[PROC] pid=28 exited(12)
+[PROC] pid=34 exited(18)
 [PROC] pid=35 exited(19)
+[PROC] pid=32 exited(16)
+[PROC] pid=28 exited(12)
 [PROC] pid=37 exited(21)
+[PROC] pid=36 exited(20)
+[PROC] pid=29 exited(13)
+[PROC] pid=27 exited(11)
 [PROC] pid=30 exited(14)
 [PROC] pid=31 exited(15)
-[PROC] pid=32 exited(16)
-[PROC] pid=29 exited(13)
-[PROC] pid=34 exited(18)
-[PROC] pid=36 exited(20)
-[PROC] pid=27 exited(11)
 [PROC] fork pid=24 -> child=42
 [PROC] fork pid=24 -> child=43
 [PROC] fork pid=24 -> child=44
@@ -259,15 +259,15 @@ echo: hi from unix-v6
 [PROC] fork pid=24 -> child=46
 [PROC] fork pid=24 -> child=47
 [PROC] fork pid=24 -> child=48
+[PROC] pid=45 exited(33)
+[PROC] pid=44 exited(32)
 [PROC] fork pid=24 -> child=49
 [PROC] pid=43 exited(31)
-[PROC] pid=44 exited(32)
-[PROC] pid=42 exited(30)
-[PROC] pid=46 exited(55)
 [PROC] pid=47 exited(55)
-[PROC] pid=45 exited(33)
-[PROC] pid=48 exited(55)
+[PROC] pid=42 exited(30)
 [PROC] pid=49 exited(55)
+[PROC] pid=46 exited(55)
+[PROC] pid=48 exited(55)
 [TEST] cg PASS
 [PROC] pid=24 exited(0)
 [PROC] fork pid=2 -> child=50
@@ -521,19 +521,19 @@ echo: hi from unix-v6
 [PROC] fork pid=2 -> child=172
 [PROC] fork pid=2 -> child=173
 [PROC] exec pid=172 -> /bin/webserver (argc=0)
-[PROC] exec pid=173 -> /bin/udpping (argc=0)
 [NET] webserver listening on :80
-[DBG] soft hart=0 n=0 sip=0x2->0x0
-[DBG] soft hart=3 n=0 sip=0x2->0x0
-[DBG] soft hart=1 n=0 sip=0x2->0x0
-[DBG] soft hart=3 n=1 sip=0x2->0x0
-[DBG] soft hart=3 n=2 sip=0x2->0x0
-[DBG] soft hart=2 n=1 sip=0x2->0x0
-[DBG] soft hart=0 n=1 sip=0x2->0x0
+[PROC] exec pid=173 -> /bin/udpping (argc=0)
+[DBG] soft hart=1 n=0 sip=0x202->0x0
 [DBG] soft hart=1 n=1 sip=0x2->0x0
-[DBG] soft hart=2 n=2 sip=0x2->0x0
+[DBG] soft hart=0 n=0 sip=0x2->0x0
+[DBG] soft hart=2 n=0 sip=0x2->0x0
+[DBG] soft hart=0 n=1 sip=0x2->0x0
 [DBG] soft hart=1 n=2 sip=0x2->0x0
 [DBG] soft hart=0 n=2 sip=0x2->0x0
+[DBG] soft hart=2 n=1 sip=0x2->0x0
+[DBG] soft hart=3 n=1 sip=0x2->0x0
+[DBG] soft hart=2 n=2 sip=0x2->0x0
+[DBG] soft hart=3 n=2 sip=0x2->0x0
 [TEST] net FAIL
 [PROC] pid=173 exited(0)
 [PROC] fork pid=2 -> child=174
@@ -575,12 +575,12 @@ ready /ctr/life
 [PROC] fork pid=2 -> child=183
 [PROC] exec pid=183 -> /bin/ctr (argc=12)
 [PROC] fork pid=183 -> child=184
-[PROC] exec pid=184 -> /ctr/life/bin/linger (argc=2)
 detached 184 mem=100000 cpu=50 weight=8
 [PROC] pid=183 exited(0)
+[PROC] exec pid=184 -> /ctr/life/bin/linger (argc=2)
 [PROC] fork pid=2 -> child=185
-[PROC] fork pid=184 -> child=186
 [PROC] exec pid=185 -> /bin/ctr (argc=7)
+[PROC] fork pid=184 -> child=186
 [PROC] fork pid=185 -> child=187
 [PROC] exec pid=187 -> /ctr/life/bin/sleeper (argc=2)
 ctr: exec failed
@@ -589,7 +589,7 @@ ctr: exec failed
 [PROC] fork pid=2 -> child=188
 [PROC] exec pid=188 -> /bin/ctr (argc=2)
 CTRPS NAME PID STATUS
-CTRPS life 184 Up 44s
+CTRPS life 184 Up 47s
 [PROC] pid=188 exited(0)
 [PROC] fork pid=2 -> child=189
 [PROC] exec pid=189 -> /bin/ctr (argc=3)
@@ -750,9 +750,9 @@ halt
 sh: draining jobs
 sh: halting
 [SYS] shutdown
-[FS] cache stats hits=47396 miss=6788 dev_rd=13492 dev_wr=188
+[FS] cache stats hits=47389 miss=6795 dev_rd=13506 dev_wr=188
 [FS] marked clean
-[SMP] steals=1660
-[SMP] contention sched=9506273/1111727
-[MM] heap free=8148442 largest=7985850
+[SMP] steals=1808
+[SMP] contention sched=8983015/1105226
+[MM] heap free=8148474 largest=7985850
 [CG] groups=9

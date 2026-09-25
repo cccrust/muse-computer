@@ -20,6 +20,7 @@ rust-objcopy -O binary target/$TARGET/release/kernel kernel.bin  # or riscv64-un
 - `.cargo/config.toml` sets `target-feature=+m,+a,+zaamo,+zmmul` for RISC-V only and intentionally has **no default target** (host-tests must build for host). Do not add one.
 - Linker layouts differ per crate: `kernel/build.rs` injects `kernel/linker.ld`; user apps use root `user-linker.ld` (base `0x10000`).
 - `kernel` sets `panic = "abort"`; host-testable logic lives in `kernel/src/lib.rs` (`cfg(test)` stubs for `embed.rs`), `main.rs` is `no_std` under `cfg(not(test))`.
+- argv cap is 16 everywhere (sh `run_args`/interactive/pipe/bg, kernel `sys_exec`/`sys_execve`/`push_args`). A 12-token `ctr run -d --memory … --cpu … --weight …` needs it; do not reintroduce an 8-cap on any layer.
 
 ## Run (QEMU)
 
