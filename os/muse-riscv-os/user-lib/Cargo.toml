@@ -2,3 +2,7 @@
 name = "user-lib"
 version = "0.1.0"
 edition = "2021"
+# v3.2: publish-ready metadata (crates.io pipeline prerequisite).
+# NOTE: not yet published (needs an account token; see _doc/v3.2.md).
+description = "Raw syscall wrappers for muse-riscv-os guest programs (riscv64, custom ecall ABI, no_std)"
+license = "MIT"

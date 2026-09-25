@@ -1295,6 +1295,66 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"ctr", b"remove", b"hello"],
         &mut jobs,
     );
+    // v3.1: dependency suite (db is clean: v3.0 removed hello above).
+    // farewell pulls hello=1.0 first (topological); remove-hello is
+    // refused while needed; loopy self-depends (cycle negative).
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"farewell"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"list"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/farewell\0",
+        &[b"farewell", b"farewell-marker"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"hello"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"loopy"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"farewell"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"hello"],
+        &mut jobs,
+    );
+    // v3.2: pipeline package (fortune comes from tools/pkgdemo via
+    // pkgbuild, never through the workspace build; see _doc/v3.2.md).
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"fortune"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"list"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/fortune\0",
+        &[b"fortune", b"hello-from-fortune"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"fortune"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

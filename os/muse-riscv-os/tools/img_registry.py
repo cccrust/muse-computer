@@ -12,6 +12,15 @@ v3.0: package routes for the guest `ctr install` test:
   /pkg/hello/manifest  package manifest (name:/version: + layers)
   /pkg/hello/hello.tar ustar layer with bin/hello + hello.txt
 
+v3.1: + farewell (depends: hello=1.0) and loopy (depends: loopy,
+self-cycle negative), same echo-ELF shape, other names.
+
+v3.2: + fortune, built at startup from tools/pkgdemo/ via
+tools/pkgbuild.py (the crates.io-pipeline demo: a real out-of-tree
+guest crate, never through the workspace build). A build failure
+leaves /pkg/fortune/* unregistered (404) and loud on stderr --
+the suite then fails visibly, never silently.
+
 The layer is packed at startup with stdlib `tarfile` in USTAR_FORMAT
 (the guest untar only understands ustar regular/dir entries). bin/echo
 (resp. bin/hello, same bytes) is the *guest* echo ELF read from the
@@ -41,6 +50,19 @@ HELLO = b"hello from image layer1\n"
 PKG_HELLO_MANIFEST = b"# pkg hello 1.0\nname: hello\nversion: 1.0\nhello.tar\n"
 PKG_HELLO_TXT = b"pkg-hello-txt\n"
 
+# v3.1: dependency packages. farewell depends on hello=1.0 (same echo
+# ELF bytes, other names); loopy depends on itself (cycle negative).
+PKG_FAREWELL_MANIFEST = (
+    b"# pkg farewell 1.0\nname: farewell\nversion: 1.0\n"
+    b"depends: hello=1.0\nfarewell.tar\n"
+)
+PKG_FAREWELL_TXT = b"farewell-txt\n"
+PKG_LOOPY_MANIFEST = (
+    b"# pkg loopy 1.0\nname: loopy\nversion: 1.0\n"
+    b"depends: loopy\nloopy.tar\n"
+)
+PKG_LOOPY_TXT = b"loopy-txt\n"
+
 
 def build_layer1() -> bytes:
     with open(ECHO_ELF, "rb") as f:
@@ -69,6 +91,10 @@ def build_layer1() -> bytes:
 
 
 def build_pkg_hello(echo: bytes) -> bytes:
+    return build_pkg_bin(echo, "bin/hello", "hello.txt", PKG_HELLO_TXT)
+
+
+def build_pkg_bin(echo: bytes, binname: str, txtname: str, txt: bytes) -> bytes:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as t:
         d = tarfile.TarInfo("bin")
@@ -76,12 +102,12 @@ def build_pkg_hello(echo: bytes) -> bytes:
         d.mode = 0o755
         d.mtime = 0
         t.addfile(d)
-        h = tarfile.TarInfo("hello.txt")
-        h.size = len(PKG_HELLO_TXT)
+        h = tarfile.TarInfo(txtname)
+        h.size = len(txt)
         h.mode = 0o644
         h.mtime = 0
-        t.addfile(h, io.BytesIO(PKG_HELLO_TXT))
-        e = tarfile.TarInfo("bin/hello")
+        t.addfile(h, io.BytesIO(txt))
+        e = tarfile.TarInfo(binname)
         e.size = len(echo)
         e.mode = 0o755
         e.mtime = 0
@@ -139,6 +165,31 @@ def main() -> None:
     print("img_registry: pkg hello 1.0 = manifest (%dB) + hello.tar (%dB)"
           % (len(PKG_HELLO_MANIFEST),
              len(ROUTES[b"/pkg/hello/hello.tar"])), flush=True)
+    ROUTES[b"/pkg/farewell/manifest"] = PKG_FAREWELL_MANIFEST
+    ROUTES[b"/pkg/farewell/farewell.tar"] = build_pkg_bin(
+        echo, "bin/farewell", "farewell.txt", PKG_FAREWELL_TXT)
+    print("img_registry: pkg farewell 1.0 = manifest (%dB) + farewell.tar (%dB)"
+          % (len(PKG_FAREWELL_MANIFEST),
+             len(ROUTES[b"/pkg/farewell/farewell.tar"])), flush=True)
+    ROUTES[b"/pkg/loopy/manifest"] = PKG_LOOPY_MANIFEST
+    ROUTES[b"/pkg/loopy/loopy.tar"] = build_pkg_bin(
+        echo, "bin/loopy", "loopy.txt", PKG_LOOPY_TXT)
+    print("img_registry: pkg loopy 1.0 = manifest (%dB) + loopy.tar (%dB)"
+          % (len(PKG_LOOPY_MANIFEST),
+             len(ROUTES[b"/pkg/loopy/loopy.tar"])), flush=True)
+    # v3.2: fortune via the real pipeline (cargo build of tools/pkgdemo).
+    try:
+        import pkgbuild
+        demo_dir = os.path.join(ROOT, "tools", "pkgdemo")
+        fmanifest, ftar = pkgbuild.build_package(
+            demo_dir, "fortune", "1.0", "fortune")
+        ROUTES[b"/pkg/fortune/manifest"] = fmanifest
+        ROUTES[b"/pkg/fortune/fortune.tar"] = ftar
+        print("img_registry: pkg fortune 1.0 = manifest (%dB) + fortune.tar (%dB) [pipeline]"
+              % (len(fmanifest), len(ftar)), flush=True)
+    except Exception as e:
+        print("img_registry: FORTUNE BUILD FAILED (%r); /pkg/fortune/* will 404"
+              % (e,), flush=True)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(ADDR)

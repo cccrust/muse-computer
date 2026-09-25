@@ -1,0 +1,22 @@
+[package]
+name = "fortune"
+version = "1.0.0"
+edition = "2021"
+description = "Demo guest program for the v3.2 crates.io pipeline (fortune)"
+
+# Standalone crate: detached from the os/muse-riscv-os workspace so
+# tools/pkgbuild.py can build it like any third-party guest crate.
+[workspace]
+
+[dependencies]
+user-lib = { path = "../../user-lib" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = "s"
+panic = "abort"

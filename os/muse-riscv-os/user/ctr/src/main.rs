@@ -1221,6 +1221,7 @@ fn cmd_rm(name: &[u8]) {
 }
 
 // ---- v3.0: packages (`install/remove/list`, apt-style) ----
+// v3.1: `depends:` + recursive install + remove protection.
 
 /// list bare entry names of dir `path` (no trailing `/`); returns
 /// count. Entry-count getdents discipline, same as cmd_ps (r = entries,
@@ -1394,6 +1395,7 @@ fn pkg_db_del(name: &[u8]) -> bool {
 /// `pkg-installed <name> <version>`. Post-unpack failures roll the
 /// store back (db entry ⟺ fully installed); reinstall is refused
 /// (upgrade is a later version's job).
+/// v3.1: thin wrapper -- recursion lives in install_one (deps first).
 fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8]) {
     mkdir_p(b"/tmp\0");
     mkdir_p(b"/pkg\0");
@@ -1401,7 +1403,165 @@ fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8]) {
         user_lib::print("ctr: already installed\n");
         user_lib::exit(1);
     }
-    // 1. manifest -> /tmp/manifest (routes mirror pull, rooted at /pkg/).
+    let mut stack = [[0u8; 64]; 8];
+    let mut stklen = [0usize; 8];
+    install_one(host, port, pkg, None, &mut stack, &mut stklen, 0);
+    user_lib::exit(0);
+}
+
+/// installed version of pkg into ver_out; returns length, or
+/// usize::MAX when absent. (db lines are `name version`.)
+fn pkg_db_ver(pkg: &[u8], ver_out: &mut [u8; 32]) -> usize {
+    let f = user_lib::open(b"/pkg/db\0".as_ptr(), 0);
+    if f < 0 {
+        return usize::MAX;
+    }
+    let mut b = [0u8; 2048];
+    let mut n = 0usize;
+    loop {
+        if n >= b.len() {
+            break;
+        }
+        let r = user_lib::read(f, unsafe { b.as_mut_ptr().add(n) }, b.len() - n);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    user_lib::close(f);
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && b[j] != b'\n' {
+            j += 1;
+        }
+        if j - i > pkg.len() && &b[i..i + pkg.len()] == pkg && b[i + pkg.len()] == b' ' {
+            let vs = i + pkg.len() + 1;
+            let m = (j - vs).min(31);
+            ver_out[..m].copy_from_slice(&b[vs..vs + m]);
+            return m;
+        }
+        i = j + 1;
+    }
+    usize::MAX
+}
+
+/// parse manifest bytes: version + layer files + dep tokens.
+/// Unknown `key:` lines ignored (forward-compat, see plan3.x §3).
+/// Layer cap 8 (pull discipline); dep cap 8. Returns (vern, nl, ndeps).
+fn parse_manifest(
+    mb: &[u8],
+    mn: usize,
+    ver: &mut [u8; 32],
+    layers: &mut [[u8; 64]; 8],
+    layern: &mut [usize; 8],
+    deps: &mut [[u8; 64]; 8],
+    depn: &mut [usize; 8],
+) -> (usize, usize, usize) {
+    let mut vern = 0usize;
+    let mut nl = 0usize;
+    let mut ndeps = 0usize;
+    let mut i = 0usize;
+    while i < mn {
+        let mut j = i;
+        while j < mn && mb[j] != b'\n' {
+            j += 1;
+        }
+        let mut e = j;
+        if e > i && mb[e - 1] == b'\r' {
+            e -= 1;
+        }
+        let line = &mb[i..e];
+        if !line.is_empty() && line[0] != b'#' {
+            let mut c = 0;
+            while c < line.len() && line[c] != b':' {
+                c += 1;
+            }
+            if c < line.len() {
+                let (k, v) = (&line[..c], &line[c + 1..]);
+                let v = if !v.is_empty() && v[0] == b' ' { &v[1..] } else { v };
+                if k == b"version" && vern == 0 {
+                    vern = v.len().min(31);
+                    ver[..vern].copy_from_slice(&v[..vern]);
+                } else if k == b"depends" {
+                    // space-separated `name` / `name=ver` tokens.
+                    let mut t = 0;
+                    while t < v.len() && ndeps < 8 {
+                        while t < v.len() && v[t] == b' ' {
+                            t += 1;
+                        }
+                        if t >= v.len() {
+                            break;
+                        }
+                        let mut u = t;
+                        while u < v.len() && v[u] != b' ' {
+                            u += 1;
+                        }
+                        let m = (u - t).min(63);
+                        deps[ndeps][..m].copy_from_slice(&v[t..t + m]);
+                        depn[ndeps] = m;
+                        ndeps += 1;
+                        t = u;
+                    }
+                }
+                // (other keys ignored: forward-compat)
+            } else if nl < 8 {
+                let m = line.len().min(63);
+                layers[nl][..m].copy_from_slice(&line[..m]);
+                layern[nl] = m;
+                nl += 1;
+            }
+        }
+        i = j + 1;
+    }
+    (vern, nl, ndeps)
+}
+
+/// install pkg + its transitive deps (DFS post-order: deps first).
+/// want_ver (from a parent's `name=ver` token) is enforced against the
+/// db when already installed, and against the fetched manifest
+/// otherwise. The ancestor chain lives in `stack`/`stklen` as COPIES
+/// (borrows cannot outlive their frame across recursion); `depth` is
+/// the chain length (cycle + depth guard). Loud exits throughout
+/// (install discipline, see v2.8).
+fn install_one(
+    host: &[u8],
+    port: &[u8],
+    pkg: &[u8],
+    want_ver: Option<&[u8]>,
+    stack: &mut [[u8; 64]; 8],
+    stklen: &mut [usize; 8],
+    depth: usize,
+) {
+    // already installed: skip iff any required version matches.
+    if pkg_db_has(pkg) {
+        if let Some(w) = want_ver {
+            let mut vb = [0u8; 32];
+            let vn = pkg_db_ver(pkg, &mut vb);
+            if vn == usize::MAX || &vb[..vn] != w {
+                user_lib::print("ctr: version mismatch (");
+                let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
+                user_lib::print(")\n");
+                user_lib::exit(1);
+            }
+        }
+        return;
+    }
+    if depth >= 8 {
+        user_lib::print("ctr: dependency depth\n");
+        user_lib::exit(1);
+    }
+    let mut s = 0;
+    while s < depth {
+        if &stack[s][..stklen[s]] == pkg {
+            user_lib::print("ctr: dependency cycle\n");
+            user_lib::exit(1);
+        }
+        s += 1;
+    }
+    // manifest -> /tmp/manifest (shared tmp name is safe: the parent's
+    // parsed lists already live in ITS stack buffers before we recurse,
+    // and layers fetch only after all deps return).
     let mut mpath = [0u8; 128];
     mpath[..5].copy_from_slice(b"/pkg/");
     mpath[5..5 + pkg.len()].copy_from_slice(pkg);
@@ -1411,8 +1571,6 @@ fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8]) {
         user_lib::print("ctr: pkg fetch failed (manifest)\n");
         user_lib::exit(1);
     }
-    // 2. parse: `key: value` lines (v3.0 reads name/version, ignores
-    // the rest for v3.1 forward-compat) + layer filenames (cap 8).
     let mf = user_lib::open(b"/tmp/manifest\0".as_ptr(), 0);
     if mf < 0 {
         user_lib::print("ctr: pkg fetch failed (manifest-open)\n");
@@ -1431,51 +1589,73 @@ fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8]) {
         mn += r as usize;
     }
     user_lib::close(mf);
+    let mut ver = [0u8; 32];
     let mut layers = [[0u8; 64]; 8];
     let mut layern = [0usize; 8];
-    let mut nl = 0usize;
-    let mut ver = [0u8; 32];
-    let mut vern = 0usize;
-    let mut i = 0usize;
-    while i < mn {
-        let mut j = i;
-        while j < mn && mb[j] != b'\n' {
-            j += 1;
-        }
-        let mut e = j;
-        if e > i && mb[e - 1] == b'\r' {
-            e -= 1;
-        }
-        let line = &mb[i..e];
-        if !line.is_empty() && line[0] != b'#' {
-            // `key: value`? (v3.1 `depends:` lands here, ignored for now)
-            let mut c = 0;
-            while c < line.len() && line[c] != b':' {
-                c += 1;
-            }
-            if c < line.len() {
-                let (k, v) = (&line[..c], &line[c + 1..]);
-                // trim one leading space off the value
-                let v = if !v.is_empty() && v[0] == b' ' { &v[1..] } else { v };
-                if k == b"version" && vern == 0 {
-                    vern = v.len().min(31);
-                    ver[..vern].copy_from_slice(&v[..vern]);
-                }
-                // (unknown keys ignored: forward-compat, see plan3.x §3)
-            } else if nl < 8 {
-                let m = line.len().min(63);
-                layers[nl][..m].copy_from_slice(&line[..m]);
-                layern[nl] = m;
-                nl += 1;
-            }
-        }
-        i = j + 1;
-    }
+    let mut deps = [[0u8; 64]; 8];
+    let mut depn = [0usize; 8];
+    let (vern, nl, ndeps) = parse_manifest(&mb, mn, &mut ver, &mut layers, &mut layern, &mut deps, &mut depn);
     if nl == 0 {
         user_lib::print("ctr: pkg fetch failed (no-layers)\n");
         user_lib::exit(1);
     }
-    // 3. unpack each layer into the store (later layers overwrite).
+    // manifest version must satisfy the parent's `=ver` (db check above
+    // covers the already-installed case; this covers fresh fetches).
+    if let Some(w) = want_ver {
+        if &ver[..vern] != w {
+            user_lib::print("ctr: version mismatch (");
+            let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
+            user_lib::print(")\n");
+            user_lib::exit(1);
+        }
+    }
+    // deps first (post-order). The chain slot holds a copy: the dep
+    // name slices below borrow this frame's `deps` buffer and cannot
+    // be stored across the recursive call.
+    {
+        let m = pkg.len().min(63);
+        stack[depth][..m].copy_from_slice(&pkg[..m]);
+        stklen[depth] = m;
+    }
+    let mut d = 0;
+    while d < ndeps {
+        let tok = &deps[d][..depn[d]];
+        let mut e = 0;
+        while e < tok.len() && tok[e] != b'=' {
+            e += 1;
+        }
+        let (dn, dv) = if e < tok.len() {
+            (&tok[..e], Some(&tok[e + 1..]))
+        } else {
+            (tok, None)
+        };
+        if dn.is_empty() {
+            user_lib::print("ctr: bad dependency\n");
+            user_lib::exit(1);
+        }
+        install_one(host, port, dn, dv, stack, stklen, depth + 1);
+        d += 1;
+    }
+    install_layers(host, port, pkg, &ver[..vern], &mb[..mn], &layers, &layern, nl);
+}
+
+/// unpack + link + db for an already-resolved package (deps done).
+/// mb is the fetched manifest (a copy is stored for remove's
+/// needed-by scan). Post-unpack failures roll the store back
+/// (db entry ⟺ fully installed). Returns normally (the TOP-LEVEL
+/// cmd_install exits); failures exit loud and abort the whole tree --
+/// a dep must never exit(0) out from under its parent (v3.1 lesson:
+/// the shared exit killed the parent's own install).
+fn install_layers(
+    host: &[u8],
+    port: &[u8],
+    pkg: &[u8],
+    ver: &[u8],
+    mb: &[u8],
+    layers: &[[u8; 64]; 8],
+    layern: &[usize; 8],
+    nl: usize,
+) {
     let mut root = [0u8; 64];
     root[..5].copy_from_slice(b"/pkg/");
     root[5..5 + pkg.len()].copy_from_slice(pkg);
@@ -1516,6 +1696,27 @@ fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8]) {
         li += 1;
     }
     user_lib::unlink(b"/tmp/manifest\0".as_ptr());
+    // v3.1: stash a manifest copy in the store for remove's needed-by
+    // scan (rm_all takes it with the store; bin listing is unaffected).
+    {
+        let mut mp = [0u8; 64];
+        mp[..rootn].copy_from_slice(&root[..rootn]);
+        mp[rootn..rootn + 9].copy_from_slice(b"/manifest");
+        let f = user_lib::open(mp.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
+        if f < 0 {
+            rollback(&root);
+        }
+        let mut w = 0;
+        while w < mb.len() {
+            let r = user_lib::write(f, unsafe { mb.as_ptr().add(w) }, mb.len() - w);
+            if r <= 0 {
+                user_lib::close(f);
+                rollback(&root);
+            }
+            w += r as usize;
+        }
+        user_lib::close(f);
+    }
     // 4. link store/bin/* into /bin -- after a full shadow pre-check
     // (an existing /bin name refuses the whole install: no clobber,
     // and remove can never delete a file it did not install).
@@ -1560,7 +1761,7 @@ fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8]) {
         }
         k += 1;
     }
-    if !pkg_db_add(pkg, &ver[..vern]) {
+    if !pkg_db_add(pkg, ver) {
         // db unwritable: roll the files back too (db entry ⟺ installed).
         let mut k = 0usize;
         while k < nn {
@@ -1579,16 +1780,103 @@ fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8]) {
     user_lib::print("pkg-installed ");
     let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
     user_lib::print(" ");
-    let _ = user_lib::write(1, ver.as_ptr(), vern);
+    let _ = user_lib::write(1, ver.as_ptr(), ver.len());
     user_lib::print("\n");
-    user_lib::exit(0);
+}
+
+/// first installed package (other than `pkg`) whose stored manifest
+/// `depends:` names `pkg` (any `=ver` still counts as needing).
+/// Copies the needer name into `out`, true iff found. Scans
+/// /pkg/*/manifest (v3.1 stashes one per install; missing/unreadable
+/// entries are skipped, never fatal).
+fn pkg_needed_by(pkg: &[u8], out: &mut [u8; 32]) -> bool {
+    let mut dirs = [[0u8; 64]; 32];
+    let mut base = [0u8; 64];
+    base[..5].copy_from_slice(b"/pkg/");
+    let nd = dir_names(&base, &mut dirs);
+    let mut k = 0usize;
+    while k < nd {
+        let mut nlen = 0;
+        while nlen < 64 && dirs[k][nlen] != 0 {
+            nlen += 1;
+        }
+        let entry = &dirs[k][..nlen];
+        // self + the db file can never be needers.
+        if entry == pkg || entry == b"db" {
+            k += 1;
+            continue;
+        }
+        let mut mp = [0u8; 64];
+        mp[..5].copy_from_slice(b"/pkg/");
+        mp[5..5 + nlen].copy_from_slice(entry);
+        let mpn = 5 + nlen;
+        if mpn + 9 >= 63 {
+            k += 1;
+            continue;
+        }
+        mp[mpn..mpn + 9].copy_from_slice(b"/manifest");
+        let f = user_lib::open(mp.as_ptr(), 0);
+        if f < 0 {
+            k += 1;
+            continue;
+        }
+        let mut mb = [0u8; 2048];
+        let mut mn = 0usize;
+        loop {
+            if mn >= mb.len() {
+                break;
+            }
+            let r = user_lib::read(f, unsafe { mb.as_mut_ptr().add(mn) }, mb.len() - mn);
+            if r <= 0 {
+                break;
+            }
+            mn += r as usize;
+        }
+        user_lib::close(f);
+        let mut ver = [0u8; 32];
+        let mut layers = [[0u8; 64]; 8];
+        let mut layern = [0usize; 8];
+        let mut deps = [[0u8; 64]; 8];
+        let mut depn = [0usize; 8];
+        let (_, _, ndeps) = parse_manifest(&mb, mn, &mut ver, &mut layers, &mut layern, &mut deps, &mut depn);
+        let mut d = 0;
+        while d < ndeps {
+            let tok = &deps[d][..depn[d]];
+            let mut e = 0;
+            while e < tok.len() && tok[e] != b'=' {
+                e += 1;
+            }
+            if &tok[..e] == pkg {
+                let m = nlen.min(31);
+                out[..m].copy_from_slice(&entry[..m]);
+                out[m] = 0;
+                return true;
+            }
+            d += 1;
+        }
+        k += 1;
+    }
+    false
 }
 
 /// `ctr remove <pkg>`: unlink the /bin links, delete the store,
 /// strip the db line. Prints `pkg-removed <name>`.
+/// v3.1: refuses while another installed package depends on pkg
+/// (`ctr: needed by <other>`), found via the stored manifests.
 fn cmd_pkg_remove(pkg: &[u8]) {
     if !pkg_db_has(pkg) {
         user_lib::print("ctr: not installed\n");
+        user_lib::exit(1);
+    }
+    let mut needer = [0u8; 32];
+    if pkg_needed_by(pkg, &mut needer) {
+        user_lib::print("ctr: needed by ");
+        let mut nlen = 0;
+        while nlen < 32 && needer[nlen] != 0 {
+            nlen += 1;
+        }
+        let _ = user_lib::write(1, needer.as_ptr(), nlen);
+        user_lib::print("\n");
         user_lib::exit(1);
     }
     let mut root = [0u8; 64];

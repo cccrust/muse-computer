@@ -48,6 +48,10 @@ qemu-system-riscv64 -machine virt -smp 4 -nographic -bios default -kernel kernel
 2. `-p <name>` lists in **both** `run.sh` and `test.sh`.
 3. `kernel/src/embed.rs`: `include_bytes!` const + `get_by_name` arm. Missing any one = stale binary or boot-time "not found".
 
+Exception: `tools/pkgdemo/` is a standalone crate (own `[workspace]`,
+built by `tools/pkgbuild.py`, never in `fs.img`/`embed.rs`) — do NOT
+add it to the workspace; the registry packs it at startup.
+
 ## Do not commit
 
 `target/`, `fs.img`, `kernel.bin`, `qemu*.log` — all regenerated (`git status` already shows them dirty).

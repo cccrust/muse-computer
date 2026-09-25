@@ -25,7 +25,15 @@ const DEVID_NET: u32 = 1;
 const N_RXDESC: usize = 8;
 const RXBUF: usize = 2048;
 const NSTAGE: usize = 16; // staged RX packets
-const NSOCK: usize = 8;
+// v3.1: 32 socket slots (was 8). TCP close lingers its slot until the
+// FIN handshake drains (up to the 30s CLOSE_TIMEOUT when the close
+// stalls); package installs burst several back-to-back fetches and
+// starved at 8 (7 rapid + 1 held listener = connect FAIL, SYNs never
+// reaching the server -- diagnosed via registry accept logging).
+// Sock is small (heap buffers allocate on demand); 32 x slots is ~4K
+// .bss. This is provisioning, not a fix for slow close drain (v1.x wart,
+// see _doc/v3.1.md §5).
+const NSOCK: usize = 32;
 const MAXUDP: usize = 1472; // 1500 - 20 IP - 8 UDP
 
 const GUEST_IP: u32 = 0x0a00_020f; // 10.0.2.15, BE (wire bytes 0A 00 02 0F)
@@ -110,7 +118,33 @@ impl NetState {
             arp_victim: 0,
             arp_req_ip: 0,
             arp_req_at: 0,
+            // (Sock is not Copy: no `[Sock::new(); NSOCK]` repeat --
+            // count must match NSOCK; the compiler checks it.)
             socks: [
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
+                Sock::new(),
                 Sock::new(),
                 Sock::new(),
                 Sock::new(),
