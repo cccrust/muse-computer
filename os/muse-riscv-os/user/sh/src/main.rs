@@ -1275,6 +1275,26 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"ctr", b"rm", b"logtest"],
         &mut jobs,
     );
+    // v3.0: package suite (install -> list -> run -> cat store -> remove).
+    // `hello` is the registry's first package (echo ELF under a
+    // collision-free name + hello.txt payload); see _doc/v3.0.md §2.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"hello"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"list"],
+        &mut jobs,
+    );
+    run_args(b"/bin/hello\0", &[b"hello", b"hello-from-pkg"], &mut jobs);
+    run_args(b"/bin/cat\0", &[b"cat", b"/pkg/hello/hello.txt"], &mut jobs);
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"hello"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

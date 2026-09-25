@@ -7,10 +7,16 @@ QEMU user-net, same mechanism as tools/http_server.py). Serves:
   /testimg/manifest    plain-text layer list (`#` comments allowed)
   /testimg/layer1.tar  ustar layer with hello.txt + bin/echo
 
+v3.0: package routes for the guest `ctr install` test:
+
+  /pkg/hello/manifest  package manifest (name:/version: + layers)
+  /pkg/hello/hello.tar ustar layer with bin/hello + hello.txt
+
 The layer is packed at startup with stdlib `tarfile` in USTAR_FORMAT
 (the guest untar only understands ustar regular/dir entries). bin/echo
-is the *guest* echo ELF read from the host build tree -- deliberate:
-the suite runs the downloaded binary to prove it is executable.
+(resp. bin/hello, same bytes) is the *guest* echo ELF read from the
+host build tree -- deliberate: the suite runs the downloaded binary
+to prove it is executable.
 Everything else is 404. HTTP/1.0, closes after each reply (matches what
 the guest stack implements). Started/stopped by test.sh around run1.
 """
@@ -27,6 +33,13 @@ ECHO_ELF = os.path.join(ROOT, "target", "riscv64gc-unknown-none-elf",
 
 MANIFEST = b"# test image: one layer\nlayer1.tar\n"
 HELLO = b"hello from image layer1\n"
+
+# v3.0: first package. bin/hello is the guest echo ELF under a
+# collision-free name (/bin has no `hello`, so install/remove prove
+# the link/unlink path instead of shadowing). hello.txt carries a
+# marker line proving the store payload landed.
+PKG_HELLO_MANIFEST = b"# pkg hello 1.0\nname: hello\nversion: 1.0\nhello.tar\n"
+PKG_HELLO_TXT = b"pkg-hello-txt\n"
 
 
 def build_layer1() -> bytes:
@@ -48,6 +61,27 @@ def build_layer1() -> bytes:
         h.mtime = 0
         t.addfile(h, io.BytesIO(HELLO))
         e = tarfile.TarInfo("bin/echo")
+        e.size = len(echo)
+        e.mode = 0o755
+        e.mtime = 0
+        t.addfile(e, io.BytesIO(echo))
+    return buf.getvalue()
+
+
+def build_pkg_hello(echo: bytes) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as t:
+        d = tarfile.TarInfo("bin")
+        d.type = tarfile.DIRTYPE
+        d.mode = 0o755
+        d.mtime = 0
+        t.addfile(d)
+        h = tarfile.TarInfo("hello.txt")
+        h.size = len(PKG_HELLO_TXT)
+        h.mode = 0o644
+        h.mtime = 0
+        t.addfile(h, io.BytesIO(PKG_HELLO_TXT))
+        e = tarfile.TarInfo("bin/hello")
         e.size = len(echo)
         e.mode = 0o755
         e.mtime = 0
@@ -95,6 +129,16 @@ def main() -> None:
     ROUTES[b"/testimg/layer1.tar"] = build_layer1()
     print("img_registry: testimg = manifest (%dB) + layer1.tar (%dB)"
           % (len(MANIFEST), len(ROUTES[b"/testimg/layer1.tar"])), flush=True)
+    with open(ECHO_ELF, "rb") as f:
+        echo = f.read()
+    if not echo:
+        raise RuntimeError("empty echo ELF at %s (build user apps first)"
+                           % ECHO_ELF)
+    ROUTES[b"/pkg/hello/manifest"] = PKG_HELLO_MANIFEST
+    ROUTES[b"/pkg/hello/hello.tar"] = build_pkg_hello(echo)
+    print("img_registry: pkg hello 1.0 = manifest (%dB) + hello.tar (%dB)"
+          % (len(PKG_HELLO_MANIFEST),
+             len(ROUTES[b"/pkg/hello/hello.tar"])), flush=True)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(ADDR)

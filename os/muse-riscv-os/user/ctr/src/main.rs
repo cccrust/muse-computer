@@ -1220,6 +1220,449 @@ fn cmd_rm(name: &[u8]) {
     user_lib::exit(0);
 }
 
+// ---- v3.0: packages (`install/remove/list`, apt-style) ----
+
+/// list bare entry names of dir `path` (no trailing `/`); returns
+/// count. Entry-count getdents discipline, same as cmd_ps (r = entries,
+/// never bytes).
+fn dir_names(path: &[u8], out: &mut [[u8; 64]; 32]) -> usize {
+    let mut nb = [0u8; 512];
+    let r = user_lib::getdents(path.as_ptr(), nb.as_mut_ptr(), 512);
+    if r <= 0 {
+        return 0;
+    }
+    let mut off = 0usize;
+    let mut n = 0usize;
+    let mut seen = 0isize;
+    while seen < r && off < 511 && n < out.len() {
+        let mut len = 0;
+        while off + len < 511 && nb[off + len] != 0 {
+            len += 1;
+        }
+        if len == 0 || len > 28 {
+            break;
+        }
+        let mut dlen = len;
+        if dlen > 0 && nb[off + dlen - 1] == b'/' {
+            dlen -= 1;
+        }
+        if dlen > 0 {
+            let m = dlen.min(63);
+            out[n][..m].copy_from_slice(&nb[off..off + m]);
+            out[n][m] = 0;
+            n += 1;
+        }
+        off += len + 1;
+        seen += 1;
+    }
+    n
+}
+
+/// existence probe (regular files; dirs use getdents like cmd_run).
+fn path_exists(path: &[u8]) -> bool {
+    let f = user_lib::open(path.as_ptr(), 0);
+    if f < 0 {
+        return false;
+    }
+    user_lib::close(f);
+    true
+}
+
+/// does `/pkg/db` hold a `name ` line? (Absent db = empty, never error.)
+fn pkg_db_has(name: &[u8]) -> bool {
+    let f = user_lib::open(b"/pkg/db\0".as_ptr(), 0);
+    if f < 0 {
+        return false;
+    }
+    let mut b = [0u8; 2048];
+    let mut n = 0usize;
+    loop {
+        if n >= b.len() {
+            break;
+        }
+        let r = user_lib::read(f, unsafe { b.as_mut_ptr().add(n) }, b.len() - n);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    user_lib::close(f);
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && b[j] != b'\n' {
+            j += 1;
+        }
+        // line b[i..j]: `name version`
+        if j - i > name.len() && &b[i..i + name.len()] == name && b[i + name.len()] == b' ' {
+            return true;
+        }
+        i = j + 1;
+    }
+    false
+}
+
+/// append `name version\n` to /pkg/db. false on any I/O error.
+fn pkg_db_add(name: &[u8], ver: &[u8]) -> bool {
+    let f = user_lib::open(
+        b"/pkg/db\0".as_ptr(),
+        user_lib::O_CREATE | user_lib::O_APPEND,
+    );
+    if f < 0 {
+        return false;
+    }
+    let mut b = [0u8; 64];
+    let m = name.len().min(23);
+    b[..m].copy_from_slice(&name[..m]);
+    b[m] = b' ';
+    let v = ver.len().min(62 - m - 2);
+    b[m + 1..m + 1 + v].copy_from_slice(&ver[..v]);
+    b[m + 1 + v] = b'\n';
+    let n = m + 1 + v + 1;
+    let mut w = 0;
+    while w < n {
+        let r = user_lib::write(f, unsafe { b.as_ptr().add(w) }, n - w);
+        if r <= 0 {
+            user_lib::close(f);
+            return false;
+        }
+        w += r as usize;
+    }
+    user_lib::close(f);
+    true
+}
+
+/// rewrite /pkg/db without the `name ` line. false on I/O error
+/// (caller keeps whatever state it can still report loudly).
+fn pkg_db_del(name: &[u8]) -> bool {
+    let f = user_lib::open(b"/pkg/db\0".as_ptr(), 0);
+    if f < 0 {
+        return false;
+    }
+    let mut b = [0u8; 2048];
+    let mut n = 0usize;
+    loop {
+        if n >= b.len() {
+            break;
+        }
+        let r = user_lib::read(f, unsafe { b.as_mut_ptr().add(n) }, b.len() - n);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    user_lib::close(f);
+    let f = user_lib::open(
+        b"/pkg/db\0".as_ptr(),
+        user_lib::O_CREATE | user_lib::O_TRUNC,
+    );
+    if f < 0 {
+        return false;
+    }
+    let mut ok = true;
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && b[j] != b'\n' {
+            j += 1;
+        }
+        let e = if j < n { j + 1 } else { j }; // keep the newline
+        let keep = !(j - i > name.len() && &b[i..i + name.len()] == name && b[i + name.len()] == b' ');
+        if keep {
+            let mut w = i;
+            while w < e {
+                let r = user_lib::write(f, unsafe { b.as_ptr().add(w) }, e - w);
+                if r <= 0 {
+                    ok = false;
+                    break;
+                }
+                w += r as usize;
+            }
+            if !ok {
+                break;
+            }
+        }
+        i = e;
+    }
+    user_lib::close(f);
+    ok
+}
+
+/// `ctr install <host> <port> <pkg>`: fetch manifest + layers from
+/// `/pkg/<pkg>/...`, unpack into the `/pkg/<pkg>/` store, hardlink
+/// `bin/*` into `/bin`, record the db. Prints
+/// `pkg-installed <name> <version>`. Post-unpack failures roll the
+/// store back (db entry ⟺ fully installed); reinstall is refused
+/// (upgrade is a later version's job).
+fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8]) {
+    mkdir_p(b"/tmp\0");
+    mkdir_p(b"/pkg\0");
+    if pkg_db_has(pkg) {
+        user_lib::print("ctr: already installed\n");
+        user_lib::exit(1);
+    }
+    // 1. manifest -> /tmp/manifest (routes mirror pull, rooted at /pkg/).
+    let mut mpath = [0u8; 128];
+    mpath[..5].copy_from_slice(b"/pkg/");
+    mpath[5..5 + pkg.len()].copy_from_slice(pkg);
+    let mpn = 5 + pkg.len();
+    mpath[mpn..mpn + 9].copy_from_slice(b"/manifest");
+    if !run_wget(host, port, &mpath[..mpn + 9], b"/tmp/manifest") {
+        user_lib::print("ctr: pkg fetch failed (manifest)\n");
+        user_lib::exit(1);
+    }
+    // 2. parse: `key: value` lines (v3.0 reads name/version, ignores
+    // the rest for v3.1 forward-compat) + layer filenames (cap 8).
+    let mf = user_lib::open(b"/tmp/manifest\0".as_ptr(), 0);
+    if mf < 0 {
+        user_lib::print("ctr: pkg fetch failed (manifest-open)\n");
+        user_lib::exit(1);
+    }
+    let mut mb = [0u8; 2048];
+    let mut mn = 0usize;
+    loop {
+        if mn >= mb.len() {
+            break;
+        }
+        let r = user_lib::read(mf, unsafe { mb.as_mut_ptr().add(mn) }, mb.len() - mn);
+        if r <= 0 {
+            break;
+        }
+        mn += r as usize;
+    }
+    user_lib::close(mf);
+    let mut layers = [[0u8; 64]; 8];
+    let mut layern = [0usize; 8];
+    let mut nl = 0usize;
+    let mut ver = [0u8; 32];
+    let mut vern = 0usize;
+    let mut i = 0usize;
+    while i < mn {
+        let mut j = i;
+        while j < mn && mb[j] != b'\n' {
+            j += 1;
+        }
+        let mut e = j;
+        if e > i && mb[e - 1] == b'\r' {
+            e -= 1;
+        }
+        let line = &mb[i..e];
+        if !line.is_empty() && line[0] != b'#' {
+            // `key: value`? (v3.1 `depends:` lands here, ignored for now)
+            let mut c = 0;
+            while c < line.len() && line[c] != b':' {
+                c += 1;
+            }
+            if c < line.len() {
+                let (k, v) = (&line[..c], &line[c + 1..]);
+                // trim one leading space off the value
+                let v = if !v.is_empty() && v[0] == b' ' { &v[1..] } else { v };
+                if k == b"version" && vern == 0 {
+                    vern = v.len().min(31);
+                    ver[..vern].copy_from_slice(&v[..vern]);
+                }
+                // (unknown keys ignored: forward-compat, see plan3.x §3)
+            } else if nl < 8 {
+                let m = line.len().min(63);
+                layers[nl][..m].copy_from_slice(&line[..m]);
+                layern[nl] = m;
+                nl += 1;
+            }
+        }
+        i = j + 1;
+    }
+    if nl == 0 {
+        user_lib::print("ctr: pkg fetch failed (no-layers)\n");
+        user_lib::exit(1);
+    }
+    // 3. unpack each layer into the store (later layers overwrite).
+    let mut root = [0u8; 64];
+    root[..5].copy_from_slice(b"/pkg/");
+    root[5..5 + pkg.len()].copy_from_slice(pkg);
+    let rootn = 5 + pkg.len();
+    mkdir_p(&root);
+    let rollback = |root: &[u8; 64]| -> ! {
+        rm_all(root);
+        user_lib::print("ctr: pkg install failed\n");
+        user_lib::exit(1);
+    };
+    let mut li = 0usize;
+    while li < nl {
+        let layer = &layers[li][..layern[li]];
+        let mut rpath = [0u8; 128];
+        rpath[..5].copy_from_slice(b"/pkg/");
+        rpath[5..5 + pkg.len()].copy_from_slice(pkg);
+        let rpn = 5 + pkg.len();
+        rpath[rpn] = b'/';
+        rpath[rpn + 1..rpn + 1 + layer.len()].copy_from_slice(layer);
+        let mut ob = [0u8; 32];
+        ob[..7].copy_from_slice(b"/tmp/p0");
+        ob[6] = b'0' + li as u8;
+        ob[7..11].copy_from_slice(b".tar");
+        if !run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..11]) {
+            rollback(&root);
+        }
+        let tf = user_lib::open(ob.as_ptr(), 0);
+        if tf < 0 {
+            rollback(&root);
+        }
+        let f = untar(tf, &root[..rootn], rootn);
+        user_lib::close(tf);
+        user_lib::unlink(ob.as_ptr());
+        if f <= 0 {
+            // (empty package is bogus, like pull's empty guard)
+            rollback(&root);
+        }
+        li += 1;
+    }
+    user_lib::unlink(b"/tmp/manifest\0".as_ptr());
+    // 4. link store/bin/* into /bin -- after a full shadow pre-check
+    // (an existing /bin name refuses the whole install: no clobber,
+    // and remove can never delete a file it did not install).
+    let mut binpath = [0u8; 64];
+    binpath[..rootn].copy_from_slice(&root[..rootn]);
+    binpath[rootn..rootn + 4].copy_from_slice(b"/bin");
+    let mut names = [[0u8; 64]; 32];
+    let nn = dir_names(&binpath, &mut names);
+    let mut k = 0usize;
+    while k < nn {
+        let mut nlen = 0;
+        while nlen < 64 && names[k][nlen] != 0 {
+            nlen += 1;
+        }
+        let mut dst = [0u8; 64];
+        dst[..5].copy_from_slice(b"/bin/");
+        dst[5..5 + nlen].copy_from_slice(&names[k][..nlen]);
+        if path_exists(&dst) {
+            user_lib::print("ctr: shadows /bin/");
+            let _ = user_lib::write(1, names[k].as_ptr(), nlen);
+            user_lib::print("\n");
+            rm_all(&root);
+            user_lib::exit(1);
+        }
+        k += 1;
+    }
+    let mut k = 0usize;
+    while k < nn {
+        let mut nlen = 0;
+        while nlen < 64 && names[k][nlen] != 0 {
+            nlen += 1;
+        }
+        let mut src = [0u8; 64];
+        src[..rootn + 4].copy_from_slice(&binpath[..rootn + 4]);
+        src[rootn + 4] = b'/';
+        src[rootn + 5..rootn + 5 + nlen].copy_from_slice(&names[k][..nlen]);
+        let mut dst = [0u8; 64];
+        dst[..5].copy_from_slice(b"/bin/");
+        dst[5..5 + nlen].copy_from_slice(&names[k][..nlen]);
+        if user_lib::link(src.as_ptr(), dst.as_ptr()) != 0 {
+            rollback(&root);
+        }
+        k += 1;
+    }
+    if !pkg_db_add(pkg, &ver[..vern]) {
+        // db unwritable: roll the files back too (db entry ⟺ installed).
+        let mut k = 0usize;
+        while k < nn {
+            let mut nlen = 0;
+            while nlen < 64 && names[k][nlen] != 0 {
+                nlen += 1;
+            }
+            let mut dst = [0u8; 64];
+            dst[..5].copy_from_slice(b"/bin/");
+            dst[5..5 + nlen].copy_from_slice(&names[k][..nlen]);
+            user_lib::unlink(dst.as_ptr());
+            k += 1;
+        }
+        rollback(&root);
+    }
+    user_lib::print("pkg-installed ");
+    let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
+    user_lib::print(" ");
+    let _ = user_lib::write(1, ver.as_ptr(), vern);
+    user_lib::print("\n");
+    user_lib::exit(0);
+}
+
+/// `ctr remove <pkg>`: unlink the /bin links, delete the store,
+/// strip the db line. Prints `pkg-removed <name>`.
+fn cmd_pkg_remove(pkg: &[u8]) {
+    if !pkg_db_has(pkg) {
+        user_lib::print("ctr: not installed\n");
+        user_lib::exit(1);
+    }
+    let mut root = [0u8; 64];
+    root[..5].copy_from_slice(b"/pkg/");
+    root[5..5 + pkg.len()].copy_from_slice(pkg);
+    let rootn = 5 + pkg.len();
+    let mut binpath = [0u8; 64];
+    binpath[..rootn].copy_from_slice(&root[..rootn]);
+    binpath[rootn..rootn + 4].copy_from_slice(b"/bin");
+    let mut names = [[0u8; 64]; 32];
+    let nn = dir_names(&binpath, &mut names);
+    let mut k = 0usize;
+    while k < nn {
+        let mut nlen = 0;
+        while nlen < 64 && names[k][nlen] != 0 {
+            nlen += 1;
+        }
+        let mut dst = [0u8; 64];
+        dst[..5].copy_from_slice(b"/bin/");
+        dst[5..5 + nlen].copy_from_slice(&names[k][..nlen]);
+        user_lib::unlink(dst.as_ptr());
+        k += 1;
+    }
+    if !rm_all(&root) {
+        user_lib::print("ctr: rm failed\n");
+        user_lib::exit(1);
+    }
+    if !pkg_db_del(pkg) {
+        user_lib::print("ctr: db update failed\n");
+        user_lib::exit(1);
+    }
+    user_lib::print("pkg-removed ");
+    let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
+    user_lib::print("\n");
+    user_lib::exit(0);
+}
+
+/// `ctr list`: installed packages (`PKGLS NAME VERSION` + rows).
+/// A missing db is an empty list, exit 0.
+fn cmd_pkg_list() {
+    user_lib::print("PKGLS NAME VERSION\n");
+    let f = user_lib::open(b"/pkg/db\0".as_ptr(), 0);
+    if f < 0 {
+        user_lib::exit(0);
+    }
+    let mut b = [0u8; 2048];
+    let mut n = 0usize;
+    loop {
+        if n >= b.len() {
+            break;
+        }
+        let r = user_lib::read(f, unsafe { b.as_mut_ptr().add(n) }, b.len() - n);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    user_lib::close(f);
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && b[j] != b'\n' {
+            j += 1;
+        }
+        let e = if j < n { j + 1 } else { j };
+        if j > i {
+            user_lib::print("PKGLS ");
+            let _ = user_lib::write(1, unsafe { b.as_ptr().add(i) }, e - i);
+        }
+        i = e;
+    }
+    user_lib::exit(0);
+}
+
 /// v2.9: `ctr logs <name>` -- dump /ctr/<name>/log to stdout.
 /// Liveness is NOT required (stopped containers keep their log until
 /// rm, docker-style). Missing log -> loud, exit 1.
@@ -1321,7 +1764,7 @@ fn cmd_exec(name: &[u8], prog: &[u8], args: &[&[u8]]) {
 #[no_mangle]
 pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     if argc < 2 {
-        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm <name> | ctr logs <name> | ctr exec <name> <prog> [args...]\n");
+        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm <name> | ctr logs <name> | ctr exec <name> <prog> [args...] | ctr install <host> <port> <pkg> | ctr remove <pkg> | ctr list\n");
         user_lib::exit(1);
     }
     let a1 = match unsafe { user_lib::argv_str(argv, 1, argc) } {
@@ -1513,6 +1956,39 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             user_lib::exit(1);
         }
         cmd_pull(host, port, image);
+    } else if a1 == b"install" {
+        // v3.0: ctr install <host> <port> <pkg> (argv order mirrors pull)
+        if argc != 5 {
+            user_lib::print("usage: ctr install <host> <port> <pkg>\n");
+            user_lib::exit(1);
+        }
+        let host = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        let port = unsafe { user_lib::argv_str(argv, 3, argc).unwrap_or(b"") };
+        let pkg = unsafe { user_lib::argv_str(argv, 4, argc).unwrap_or(b"") };
+        if host.is_empty() || port.is_empty() || !valid_name(pkg) {
+            user_lib::print("ctr: bad host/port/pkg\n");
+            user_lib::exit(1);
+        }
+        cmd_install(host, port, pkg);
+    } else if a1 == b"remove" {
+        // v3.0: ctr remove <pkg> (packages, not containers -- see cmd_rm)
+        if argc != 3 {
+            user_lib::print("usage: ctr remove <pkg>\n");
+            user_lib::exit(1);
+        }
+        let pkg = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        if !valid_name(pkg) {
+            user_lib::print("ctr: bad name\n");
+            user_lib::exit(1);
+        }
+        cmd_pkg_remove(pkg);
+    } else if a1 == b"list" {
+        // v3.0: ctr list (no args)
+        if argc != 2 {
+            user_lib::print("usage: ctr list\n");
+            user_lib::exit(1);
+        }
+        cmd_pkg_list();
     } else {
         if !valid_name(a1) {
             user_lib::print("ctr: bad name\n");
