@@ -82,6 +82,11 @@ sleep 1
 python3 tools/pkgbuild.py --crate tools/pkgdemo --pkg pubdemo \
   --version 1.0 --bin fortune \
   --registry http://127.0.0.1:8091 --token admin-token || PASS=0
+# v3.11: publish the private demo package the same way (guest suite
+# proves the gate: 401 without login, install with login).
+python3 tools/pkgbuild.py --crate tools/pkgdemo --pkg privdemo \
+  --version 1.0 --bin fortune --private \
+  --registry http://127.0.0.1:8091 --token admin-token || PASS=0
 # v1.5: run1 keeps QEMU alive in background so the host web client can
 # fetch from the guest webserver mid-run (a timeout-killed QEMU can't be
 # fetched from afterwards). Sequence: boot bg -> web_fetch (30s) -> wait
@@ -219,6 +224,11 @@ check "removed ftest"
 check "restarted rtest"
 check "stopped rtest"
 check "removed rtest"
+check "held by farewell"
+check "logout ok"
+check "pkg-installed privdemo 1.0"
+check "fortune-sez hello-from-priv"
+check "pkg-removed privdemo"
 check "CTRPS life"
 check "Up"
 check "stopped life"
@@ -266,6 +276,17 @@ if grep -q "PANIC" qemu.log; then
   echo "FAIL: PANIC found"; PASS=0
 else
   echo "OK: no PANIC"
+fi
+# v3.11: registry delete API (host-side; the guest suite already
+# installed + removed privdemo above, so deleting it here interferes
+# with nothing -- a 404 afterwards proves the routes are really gone).
+OUT=$(curl -s -X DELETE -H "Authorization: Bearer admin-token" http://127.0.0.1:8091/pkg/privdemo/1.0/)
+echo "$OUT" | grep -q "deleted privdemo 1.0" || { echo "FAIL: registry DELETE"; PASS=0; }
+CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8091/pkg/privdemo/1.0/manifest)
+if [ "$CODE" = "404" ]; then
+  echo "OK: deleted routes 404"
+else
+  echo "FAIL: deleted routes still serve ($CODE)"; PASS=0
 fi
 # v1.3/v1.7/v2.3: stop the stub servers (run1 only)
 kill $ECHO_PID 2>/dev/null || true

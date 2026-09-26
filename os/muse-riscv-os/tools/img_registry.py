@@ -41,6 +41,17 @@ served on restart; live uploads go through PUT (see below).
       200 `published <name> <ver>` (writes disk + registers + reindex);
       401 bad token; 400 bad shape/size.
   GET /pkg/<name>/index          generated from disk + builtin versions.
+
+v3.11: private versions + delete API.
+
+  PUT manifest with `X-Private: 1` writes a `.private` marker file in
+  the version dir (re-PUT without the header clears it). Every route
+  under a marked version -- manifest, tar, index (iff any version is
+  private) -- needs `Authorization: Bearer test-token`, same as the
+  builtin secret (whose hardcoded gate is unchanged).
+  DELETE /pkg/<name>/<ver>[/] with the admin token removes the disk
+  dir, drops the routes and reindexes; 200 `deleted <name> <ver>`,
+  401 bad token, 404 unknown (builtins are not deletable).
 """
 import io
 import os
@@ -175,11 +186,17 @@ def handle(conn: socket.socket) -> None:
         if len(parts) >= 2 and parts[0] == b"PUT":
             handle_put(conn, parts[1], lines[1:], req)
             return
+        if len(parts) >= 2 and parts[0] == b"DELETE":
+            handle_delete(conn, parts[1], lines[1:])
+            return
         body = None
         if len(parts) >= 2 and parts[0] == b"GET":
             path = parts[1]
-            # v3.4: private routes need `Authorization: Bearer test-token`.
-            if path.startswith(b"/pkg/secret/"):
+            # v3.4: builtin secret needs `Authorization: Bearer test-token`.
+            # v3.11: disk-private versions (`.private` marker file) need it
+            # too; a package index is gated iff any of its versions is
+            # private. Public routes ignore the header entirely.
+            if private_required(path, lines[1:]):
                 auth = b""
                 for ln in lines[1:]:
                     k, s, v = ln.partition(b":")
@@ -230,6 +247,79 @@ def bearer_token(lines):
         if s and k.strip().lower() == b"authorization":
             return v.strip()
     return b""
+
+
+def version_is_private(name, ver):
+    dd = os.path.join(DATA_ROOT, name.decode("ascii", "ignore"),
+                      ver.decode("ascii", "ignore"))
+    return os.path.isfile(os.path.join(dd, ".private"))
+
+
+def private_required(path, header_lines):
+    """v3.11: does this GET path need the bearer token?"""
+    parts = path.split(b"/")
+    if len(parts) < 3 or parts[0] != b"" or parts[1] != b"pkg":
+        return False
+    name = parts[2]
+    # package index: gated iff the package has any private version
+    # (builtin secret keeps its legacy public index).
+    if len(parts) == 4 and parts[3] == b"index":
+        if name == b"secret":
+            return False
+        dd = os.path.join(DATA_ROOT, name.decode("ascii", "ignore"))
+        if not os.path.isdir(dd):
+            return False
+        for v in os.listdir(dd):
+            if version_is_private(name, v.encode()):
+                return True
+        return False
+    # versioned file route: /pkg/<name>/<ver>/<file>.
+    if len(parts) != 5 or parts[3] == b"":
+        return False
+    if name == b"secret":
+        return True
+    return version_is_private(name, parts[3])
+
+
+def has_private_flag(header_lines):
+    """v3.11: `X-Private: 1` header present (manifest PUT only)?"""
+    for ln in header_lines:
+        k, s, v = ln.partition(b":")
+        if s and k.strip().lower() == b"x-private":
+            return v.strip() == b"1"
+    return False
+
+
+def handle_delete(conn, path, header_lines):
+    """v3.11: DELETE /pkg/<name>/<ver>[/] with the admin token."""
+    try:
+        if bearer_token(header_lines).lower() != b"bearer " + ADMIN_TOKEN:
+            reply(conn, b"401 Unauthorized", b"")
+            return
+        parts = path.split(b"/")
+        # ["", "pkg", name, ver] or ["", "pkg", name, ver, ""]
+        if len(parts) not in (4, 5) or parts[0] != b"" or parts[1] != b"pkg":
+            reply(conn, b"400 Bad Request", b"bad path")
+            return
+        name, ver = parts[2], parts[3]
+        if not (valid_seg(name) and valid_seg(ver)):
+            reply(conn, b"400 Bad Request", b"bad name/version")
+            return
+        dd = os.path.join(DATA_ROOT, name.decode("ascii"), ver.decode("ascii"))
+        if not os.path.isdir(dd):
+            reply(conn, b"404 Not Found", b"")
+            return
+        import shutil
+        shutil.rmtree(dd)
+        pre = b"/pkg/" + name + b"/" + ver + b"/"
+        for k in [k for k in ROUTES if k.startswith(pre)]:
+            del ROUTES[k]
+        reindex(name)
+        reply(conn, b"200 OK", b"deleted %s %s\n" % (name, ver))
+        print("img_registry: deleted %s %s" % (name.decode(), ver.decode()),
+              flush=True)
+    except OSError:
+        pass
 
 
 def reply(conn, code, body):
@@ -345,6 +435,15 @@ def handle_put(conn, path, header_lines, req):
         with open(os.path.join(dd, fname.decode("ascii")), "wb") as fh:
             fh.write(body)
         ROUTES[b"/pkg/" + name + b"/" + ver + b"/" + fname] = body
+        # v3.11: privacy is a per-version marker, set explicitly by each
+        # manifest PUT (re-PUT without the header clears it).
+        if is_manifest:
+            mark = os.path.join(dd, ".private")
+            if has_private_flag(header_lines):
+                with open(mark, "wb") as fh:
+                    fh.write(b"private\n")
+            elif os.path.exists(mark):
+                os.remove(mark)
         reindex(name)
         reply(conn, b"200 OK",
               b"published %s %s\n" % (name, ver))

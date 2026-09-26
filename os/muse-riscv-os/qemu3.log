@@ -33,7 +33,7 @@ Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,d
 Experimental SBI Extensions : none
 
 Domain0 Name                : root
-Domain0 Boot HART           : 2
+Domain0 Boot HART           : 0
 Domain0 HARTs               : 0*,1*,2*,3*
 Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
 Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
@@ -49,7 +49,7 @@ Domain0 Next Mode           : S-mode
 Domain0 SysReset            : yes
 Domain0 SysSuspend          : yes
 
-Boot HART ID                : 2
+Boot HART ID                : 0
 Boot HART Domain            : root
 Boot HART Priv Version      : v1.12
 Boot HART Base ISA          : rv64imafdch
@@ -65,7 +65,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [BOOT] hart booted in S-mode, kernel @ 0x80200000
 [MM] heap init ok
 [MM] frame allocator ok
-[MM] root=0x80cf2000
+[MM] root=0x80cf6000
 [MM] text mapped
 [MM] rodata mapped
 [MM] data mapped
@@ -74,7 +74,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [MM] mmio mapped, activating...
 [MM] activated
 [MMU] SV39 enabled (satp MODE=8, 3-level)
-[PLIC] hart2 ctx irq10+virtio1-8 enabled
+[PLIC] hart0 ctx irq10+virtio1-8 enabled
 [PLIC] uart irq10 + virtio irq1-8 enabled
 [TRAP] stvec set
 [TIMER] enabled (10ms tick)
@@ -84,22 +84,22 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [NET] net @ 0x10002000 MAC 52:54:00:12:34:56 ip 10.0.2.15
 [TEST] net-dev PASS
 [FS] disk mount ok (MUSEFS01, 8192 blocks)
-[FS] journal replayed 179
+[FS] journal replayed 180
 [FS] fsck: bitmap rebuilt
 [PROC] init pid=1
 [PROC] spawn init
-[SMP] boot hart2
-[SMP] hart2 up
-[SMP] hart0 starting
-[SMP] hart1 starting
-[SMP] hart3 starting
-[PLIC] hart1 ctx irq10+virtio1-8 enabled
-[PLIC] hart3 ctx irq10+virtio1-8 enabled
-[PLIC] hart0 ctx irq10+virtio1-8 enabled
-[SMP] hart1 up
-[SMP] hart3 up
+[SMP] boot hart0
 [SMP] hart0 up
-[DBG] soft hart=1 n=0 sip=0x202->0x200
+[SMP] hart1 starting
+[SMP] hart2 starting
+[SMP] hart3 starting
+[PLIC] hart2 ctx irq10+virtio1-8 enabled
+[PLIC] hart3 ctx irq10+virtio1-8 enabled
+[SMP] hart2 up
+[PLIC] hart1 ctx irq10+virtio1-8 enabled
+[SMP] hart3 up
+[SMP] hart1 up
+[DBG] soft hart=2 n=0 sip=0x202->0x200
 [TEST] ipi PASS
 [TEST] boot markers ready
 [TEST] virtio-irq PASS
@@ -192,11 +192,11 @@ echo: hi from unix-v6
 [PROC] fork pid=11 -> child=15
 [smp] child on hart 3->3
 [PROC] pid=12 exited(40)
-[smp] child on hart 3->3
+[smp] child on hart 0->0
 [PROC] pid=13 exited(41)
-[smp] child on hart 3[smp] child on hart ->33
+[smp] child on hart [smp] child on hart 0->0->30
+
 [PROC] pid=14 exited(42)
-->2
 [PROC] pid=15 exited(43)
 [TEST] smp PASS
 [PROC] pid=11 exited(0)
@@ -214,9 +214,9 @@ echo: hi from unix-v6
 [PROC] fork pid=18 -> child=22
 [PROC] fork pid=19 -> child=23
 [PROC] pid=23 exited(50)
-[PROC] pid=20 exited(41)
-[PROC] pid=22 exited(43)
 [PROC] pid=21 exited(42)
+[PROC] pid=22 exited(43)
+[PROC] pid=20 exited(41)
 [PROC] pid=19 exited(40)
 [TEST] ns PASS
 [PROC] pid=18 exited(0)
@@ -240,22 +240,22 @@ echo: hi from unix-v6
 [PROC] fork pid=24 -> child=39
 [PROC] fork pid=24 -> child=40
 [PROC] fork pid=24 -> child=41
-[PROC] pid=38 exited(77)
-[PROC] pid=39 exited(77)
-[PROC] pid=41 exited(77)
 [PROC] pid=40 exited(77)
-[PROC] pid=27 exited(11)
-[PROC] pid=33 exited(17)
-[PROC] pid=30 exited(14)
-[PROC] pid=26 exited(10)
-[PROC] pid=36 exited(20)
-[PROC] pid=31 exited(15)
+[PROC] pid=38 exited(77)
+[PROC] pid=41 exited(77)
+[PROC] pid=39 exited(77)
+[PROC] pid=29 exited(13)
 [PROC] pid=35 exited(19)
+[PROC] pid=37 exited(21)
+[PROC] pid=26 exited(10)
+[PROC] pid=31 exited(15)
+[PROC] pid=27 exited(11)
 [PROC] pid=28 exited(12)
+[PROC] pid=36 exited(20)
+[PROC] pid=30 exited(14)
+[PROC] pid=33 exited(17)
 [PROC] pid=34 exited(18)
 [PROC] pid=32 exited(16)
-[PROC] pid=29 exited(13)
-[PROC] pid=37 exited(21)
 [PROC] fork pid=24 -> child=42
 [PROC] fork pid=24 -> child=43
 [PROC] fork pid=24 -> child=44
@@ -264,14 +264,14 @@ echo: hi from unix-v6
 [PROC] fork pid=24 -> child=47
 [PROC] fork pid=24 -> child=48
 [PROC] fork pid=24 -> child=49
-[PROC] pid=43 exited(31)
 [PROC] pid=44 exited(32)
+[PROC] pid=43 exited(31)
 [PROC] pid=46 exited(55)
-[PROC] pid=45 exited(33)
+[PROC] pid=47 exited(55)
 [PROC] pid=42 exited(30)
 [PROC] pid=48 exited(55)
+[PROC] pid=45 exited(33)
 [PROC] pid=49 exited(55)
-[PROC] pid=47 exited(55)
 [PROC] fork pid=24 -> child=50
 [PROC] pid=50 exited(0)
 [PROC] fork pid=24 -> child=51
@@ -1128,17 +1128,17 @@ echo: hi from unix-v6
 [PROC] exec pid=472 -> /bin/webserver (argc=0)
 [PROC] exec pid=473 -> /bin/udpping (argc=0)
 [NET] webserver listening on :80
+[DBG] soft hart=0 n=0 sip=0x2->0x0
+[DBG] soft hart=1 n=0 sip=0x2->0x0
 [DBG] soft hart=3 n=0 sip=0x2->0x0
-[DBG] soft hart=1 n=1 sip=0x2->0x0
-[DBG] soft hart=2 n=0 sip=0x2->0x0
-[DBG] soft hart=3 n=1 sip=0x2->0x0
-[DBG] soft hart=0 n=0 sip=0x202->0x200
-[DBG] soft hart=1 n=2 sip=0x2->0x0
-[DBG] soft hart=2 n=1 sip=0x2->0x0
-[DBG] soft hart=3 n=2 sip=0x2->0x0
 [DBG] soft hart=0 n=1 sip=0x2->0x0
-[DBG] soft hart=2 n=2 sip=0x2->0x0
+[DBG] soft hart=3 n=1 sip=0x2->0x0
 [DBG] soft hart=0 n=2 sip=0x2->0x0
+[DBG] soft hart=3 n=2 sip=0x2->0x0
+[DBG] soft hart=1 n=1 sip=0x2->0x0
+[DBG] soft hart=2 n=1 sip=0x2->0x0
+[DBG] soft hart=1 n=2 sip=0x2->0x0
+[DBG] soft hart=2 n=2 sip=0x2->0x0
 [TEST] net FAIL
 [PROC] pid=473 exited(0)
 [PROC] fork pid=2 -> child=474
@@ -1202,7 +1202,7 @@ hello-from-exec
 [PROC] fork pid=2 -> child=490
 [PROC] exec pid=490 -> /bin/ctr (argc=2)
 CTRPS NAME PID STATUS
-CTRPS life 484 Up 49s mem=100000 cpu=50 weight=8
+CTRPS life 484 Up 47s mem=100000 cpu=50 weight=8
 [PROC] pid=490 exited(0)
 [PROC] fork pid=2 -> child=491
 [PROC] exec pid=491 -> /bin/ctr (argc=3)
@@ -1229,14 +1229,12 @@ ready /ctr/logtest
 [PROC] exec pid=495 -> /bin/ctr (argc=6)
 [PROC] fork pid=495 -> child=496
 [PROC] exec pid=496 -> /ctr/logtest/bin/echo (argc=2)
-detached 496 mem=0 cpu=100 weight=1
 [PROC] pid=496 exited(0)
+detached 496 mem=0 cpu=100 weight=1
 [PROC] pid=495 exited(0)
 [PROC] fork pid=2 -> child=497
 [PROC] exec pid=497 -> /bin/ctr (argc=3)
-hello-from-log
-[TEST] echo PASS
-[PROC] pid=497 exited(0)
+-dllogtest /bin/echo hello-from-[PROC] pid=497 exited(0)
 [PROC] fork pid=2 -> child=498
 [PROC] exec pid=498 -> /bin/ctr (argc=3)
 removed logtest
@@ -1414,4 +1412,4 @@ ready /ctr/volc
 [PROC] pid=542 exited(0)
 [PROC] fork pid=2 -> child=543
 [PROC] exec pid=543 -> /bin/ctr (argc=7)
-qemu-system-riscv64: terminating on signal 15 from pid 97779 (<unknown process>)
+qemu-system-riscv64: terminating on signal 15 from pid 19914 (<unknown process>)

@@ -1583,6 +1583,68 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"ctr", b"rm", b"rtest"],
         &mut jobs,
     );
+    // v3.10: upgrade pin re-verification (db is clean: rtest removed).
+    // farewell pulls hello=1.0; upgrading hello to 2.0 must refuse.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"farewell"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"upgrade", b"10.0.2.2", b"8091", b"hello"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"farewell"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"hello"],
+        &mut jobs,
+    );
+    // v3.11: private package gate (db is clean; token state comes from
+    // the v3.4 block, which logged in long ago -- logout first so the
+    // 401 path is exercised, then log back in).
+    // NOTE: argv cap is 16 tokens per side (run_args + kernel); all
+    // commands below stay well under it.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"logout"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"privdemo"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"login", b"test-token"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"privdemo"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"list"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/fortune\0",
+        &[b"fortune", b"hello-from-priv"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"privdemo"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

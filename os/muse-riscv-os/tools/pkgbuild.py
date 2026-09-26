@@ -141,17 +141,16 @@ def build_package(crate_dir, pkg, version, binary, out_dir=None,
     return manifest, tar
 
 
-def put_file(registry, token, path, data):
+def put_file(registry, token, path, data, extra_headers=None):
     """PUT one file to a running registry; returns (status, body)."""
     import urllib.request
     import urllib.error
     url = registry.rstrip("/") + path
-    req = urllib.request.Request(
-        url, data=data, method="PUT",
-        headers={"Authorization": "Bearer " + token,
-                 "Content-Type": "application/octet-stream",
-                 "Content-Length": str(len(data))},
-    )
+    headers = {"Authorization": "Bearer " + token,
+               "Content-Type": "application/octet-stream",
+               "Content-Length": str(len(data))}
+    headers.update(extra_headers or {})
+    req = urllib.request.Request(url, data=data, method="PUT", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             return r.status, r.read()
@@ -159,17 +158,22 @@ def put_file(registry, token, path, data):
         return e.code, e.read()
 
 
-def publish_package(registry, token, pkg, version, manifest, tar, layer):
+def publish_package(registry, token, pkg, version, manifest, tar, layer,
+                    private=False):
     """Upload manifest + layer tar to /pkg/<pkg>/<ver>/. Loud on failure."""
     for relpath, data in (("manifest", manifest), (layer, tar)):
+        extra = {"X-Private": "1"} if (private and relpath == "manifest") else {}
         status, body = put_file(
-            registry, token, "/pkg/%s/%s/%s" % (pkg, version, relpath), data)
+            registry, token, "/pkg/%s/%s/%s" % (pkg, version, relpath), data,
+            extra)
         print("pkgbuild: PUT %s -> %s %r" % (relpath, status, body[:80]),
               flush=True)
         if status != 200:
             raise RuntimeError("publish %s failed: HTTP %s %r"
                                % (relpath, status, body[:200]))
-    print("pkgbuild: published %s %s" % (pkg, version), flush=True)
+    print("pkgbuild: published %s %s%s" % (pkg, version,
+                                           " [private]" if private else ""),
+          flush=True)
 
 
 def main(argv):
@@ -189,6 +193,8 @@ def main(argv):
                     help="upload to a running registry (PUT), e.g. http://127.0.0.1:8091")
     ap.add_argument("--token", default="",
                     help="bearer token for --registry upload")
+    ap.add_argument("--private", action="store_true",
+                    help="mark the upload private (X-Private, registry gates reads)")
     a = ap.parse_args(argv)
     crate_dir = a.crate
     if a.src is not None:
@@ -218,7 +224,8 @@ def main(argv):
         manifest, tar = build_package(crate_dir, a.pkg, a.version, a.bin,
                                       None, extra=extra, depends=a.depends)
         publish_package(a.registry, a.token, a.pkg, a.version,
-                        manifest, tar, "%s.tar" % a.pkg)
+                        manifest, tar, "%s.tar" % a.pkg,
+                        private=a.private)
     return 0
 
 

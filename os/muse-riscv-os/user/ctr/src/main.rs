@@ -2804,6 +2804,84 @@ fn pkg_needed_by(pkg: &[u8], out: &mut [u8; 32]) -> bool {
     false
 }
 
+/// v3.10: find an installed package (other than `pkg` itself) whose
+/// stored-manifest dependency on `pkg` is NOT satisfied by `newver`.
+/// Copies the holder name into `out`, true iff found (the upgrade must
+/// refuse before touching anything). Unconstrained deps (`depends: foo`
+/// with no pin) accept every version; self-dependencies are skipped.
+fn pkg_pin_violated(pkg: &[u8], newver: &[u8], out: &mut [u8; 32]) -> bool {
+    let mut dirs = [[0u8; 64]; 32];
+    let mut base = [0u8; 64];
+    base[..5].copy_from_slice(b"/pkg/");
+    let nd = dir_names(&base, &mut dirs);
+    let mut k = 0usize;
+    while k < nd {
+        let mut nlen = 0;
+        while nlen < 64 && dirs[k][nlen] != 0 {
+            nlen += 1;
+        }
+        let entry = &dirs[k][..nlen];
+        // self + the db file can never be holders.
+        if entry == pkg || entry == b"db" {
+            k += 1;
+            continue;
+        }
+        let mut mp = [0u8; 64];
+        mp[..5].copy_from_slice(b"/pkg/");
+        mp[5..5 + nlen].copy_from_slice(entry);
+        let mpn = 5 + nlen;
+        if mpn + 9 >= 63 {
+            k += 1;
+            continue;
+        }
+        mp[mpn..mpn + 9].copy_from_slice(b"/manifest");
+        let f = user_lib::open(mp.as_ptr(), 0);
+        if f < 0 {
+            k += 1;
+            continue;
+        }
+        let mut mb = [0u8; 2048];
+        let mut mn = 0usize;
+        loop {
+            if mn >= mb.len() {
+                break;
+            }
+            let r = user_lib::read(f, unsafe { mb.as_mut_ptr().add(mn) }, mb.len() - mn);
+            if r <= 0 {
+                break;
+            }
+            mn += r as usize;
+        }
+        user_lib::close(f);
+        let mut ver = [0u8; 32];
+        let mut layers = [[0u8; 64]; 8];
+        let mut layern = [0usize; 8];
+        let mut deps = [[0u8; 64]; 8];
+        let mut depn = [0usize; 8];
+        let mut sha_ign = [0u8; 64];
+        let (_, _, ndeps, _) = parse_manifest(&mb, mn, &mut ver, &mut layers, &mut layern, &mut deps, &mut depn, &mut sha_ign);
+        let mut d = 0;
+        while d < ndeps {
+            let (dn, dw) = split_vreq(&deps[d][..depn[d]]);
+            if dn == pkg {
+                let ok = match dw {
+                    None => true,
+                    Some((w, op)) => ver_sat(newver, w, op),
+                };
+                if !ok {
+                    let m = nlen.min(31);
+                    out[..m].copy_from_slice(&entry[..m]);
+                    out[m] = 0;
+                    return true;
+                }
+            }
+            d += 1;
+        }
+        k += 1;
+    }
+    false
+}
+
 /// v3.3: installed package names from /pkg/db into `out`.
 /// Returns count (cap 32).
 fn pkg_db_names(out: &mut [[u8; 64]; 32]) -> usize {
@@ -3106,6 +3184,22 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
         user_lib::print(")\n");
         user_lib::exit(1);
     }
+    // v3.10: dependents' pins must accept the target version. Checked
+    // BEFORE installing deps or touching the store: refusal is clean
+    // (nothing installed, nothing overwritten).
+    {
+        let mut holder = [0u8; 32];
+        if pkg_pin_violated(pkg, &vers[nb][..versn[nb]], &mut holder) {
+            user_lib::print("ctr: held by ");
+            let mut hlen = 0;
+            while hlen < 32 && holder[hlen] != 0 {
+                hlen += 1;
+            }
+            let _ = user_lib::write(1, holder.as_ptr(), hlen);
+            user_lib::print("\n");
+            user_lib::exit(1);
+        }
+    }
     // new deps first (their constraints rule; old store untouched).
     let mut stack = [[0u8; 64]; 8];
     let mut stklen = [0usize; 8];
@@ -3348,6 +3442,25 @@ fn cmd_login(tok: &[u8]) {
     }
     user_lib::close(f);
     user_lib::print("login ok\n");
+    user_lib::exit(0);
+}
+
+/// v3.11: `ctr logout` -- delete /pkg/token (previously stored by
+/// `login`). Prints `logout ok`; missing token is loud, not silent.
+/// (Existence via open probe: getdents returns 0, not -1, for missing
+/// paths -- see the v3.5 vol_exists lesson.)
+fn cmd_logout() {
+    let f = user_lib::open(b"/pkg/token\0".as_ptr(), 0);
+    if f < 0 {
+        user_lib::print("ctr: not logged in\n");
+        user_lib::exit(1);
+    }
+    user_lib::close(f);
+    if user_lib::unlink(b"/pkg/token\0".as_ptr()) != 0 {
+        user_lib::print("ctr: logout failed\n");
+        user_lib::exit(1);
+    }
+    user_lib::print("logout ok\n");
     user_lib::exit(0);
 }
 
@@ -3594,7 +3707,7 @@ fn cmd_exec(name: &[u8], prog: &[u8], args: &[&[u8]]) {
 #[no_mangle]
 pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     if argc < 2 {
-        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm [-f] <name> | ctr restart <name> | ctr logs <name> | ctr exec <name> <prog> [args...] | ctr install <host> <port> <pkg>[=ver] | ctr remove <pkg> | ctr list | ctr upgrade <host> <port> [<pkg>] | ctr autoremove | ctr login <token> | ctr volume create <v> | ctr volume rm <v> | ctr volume ls\n");
+        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm [-f] <name> | ctr restart <name> | ctr logs <name> | ctr exec <name> <prog> [args...] | ctr install <host> <port> <pkg>[=ver] | ctr remove <pkg> | ctr list | ctr upgrade <host> <port> [<pkg>] | ctr autoremove | ctr login <token> | ctr logout | ctr volume create <v> | ctr volume rm <v> | ctr volume ls\n");
         user_lib::exit(1);
     }
     let a1 = match unsafe { user_lib::argv_str(argv, 1, argc) } {
@@ -3968,6 +4081,13 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         }
         let tok = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
         cmd_login(tok);
+    } else if a1 == b"logout" {
+        // v3.11: ctr logout (no args)
+        if argc != 2 {
+            user_lib::print("usage: ctr logout\n");
+            user_lib::exit(1);
+        }
+        cmd_logout();
     } else {
         if !valid_name(a1) {
             user_lib::print("ctr: bad name\n");

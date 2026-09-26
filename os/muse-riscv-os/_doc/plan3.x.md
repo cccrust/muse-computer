@@ -33,7 +33,9 @@ v3.6  容器小件收尾    ps 限額 + rm -f + restart（見 §8，spec 已定�
 v3.7  registry 常駐化 publish 上架 + 磁碟持久（見 §9）
 v3.8  guest 函式庫     guest-args + guest-fmt 首發備料（見 §10，均已上架）
 v3.9  crates.io 閉環   外部 crate 下載→編譯→安裝→運行（見 §11）
-v3.10+ 候選池         按需排序，不預排版號（見 §12）
+v3.10 upgrade pin 重驗 依賴者約束不滿足即 held by 拒絕（見 §12）
+v3.11 私包+刪包+logout  `--private` 上架、DELETE 管理面（見 §13）
+v3.14+ 候選池         按需排序，不預排版號（見 §14）
 ```
 
 - v3.0 是「能用」：單包安裝閉環，不碰依賴。
@@ -54,7 +56,7 @@ user/sh                 # autorun 加 install→run→remove（v3.0）
 run.sh/test.sh          # test.sh 項數見各版；registry 樁啟停沿用 v2.3
 user-lib                # 發布到 crates.io（v3.2 前提；v3.0 不動）
 ```
-v3.3+ 增量見 §5–§11（多版本路由、sha256、`/vol/`、sidecar、publish、guest 庫、閉環）。
+v3.3+ 增量見 §5–§13（多版本路由、sha256、`/vol/`、sidecar、publish、guest 庫、閉環、pin 重驗、私包）。
 
 ## 3. 包格式（v3.0 定，後版只加行）
 
@@ -168,12 +170,22 @@ crate 從 crates.io 下來、編進 guest 二進制、裝進系統跑起來。
 落點見 `v3.9.md`（`tools/pkgrepeat` 全依賴走 crates.io
 ——含後來上架的 `user-lib` 0.1.1；update：已全切）。
 
-## 12. v3.10+ 候選池（按需排序，不預排版號）
+## 12. v3.10：upgrade 依賴 pin 重驗
 
-- 容器小件：`ps` 顯示限額（v2.8 欠賬）、`rm -f`、`restart`、
-  `KB/MB` 別名（v2.8 說不加，要加也是小版）。
+動機：v3.3 的已知缺口——upgrade 不檢查依賴者的版本 pin，
+依賴關係靜默失配。落點見 `v3.10.md`（升級前掃 stored manifest，
+約束不滿足即 `held by` 拒絕）。
+
+## 13. v3.11：私包 + 刪包 API + logout
+
+動機：v3.4 的認證只有一半——registry 認得 token，但包沒有公私之分、
+上架的東西刪不掉。落點見 `v3.11.md`（`--private` 上架落 `.private`
+標記 + 讀取門、`DELETE` 管理面、`ctr logout`；v3.12 做 ed25519 真簽名）。
+
+## 14. v3.14+ 候選池（按需排序，不預排版號）
+
 - 包小件：`install =ver` 指定舊版（downgrade 語意）、並行下載、
-  delta 更新。
+  delta 更新、`KB/MB` 別名。
 - 運行時大件（plan2.x §8 遺產）：overlayfs、netns/veth（最大版，
   放最後）、IO 權重、層級配額 enforced、cgroupfs、OOM-killer、
   `pivot_root`。
