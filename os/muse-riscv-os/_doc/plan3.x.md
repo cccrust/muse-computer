@@ -35,7 +35,8 @@ v3.8  guest 函式庫     guest-args + guest-fmt 首發備料（見 §10，均�
 v3.9  crates.io 閉環   外部 crate 下載→編譯→安裝→運行（見 §11）
 v3.10 upgrade pin 重驗 依賴者約束不滿足即 held by 拒絕（見 §12）
 v3.11 私包+刪包+logout  `--private` 上架、DELETE 管理面（見 §13）
-v3.14+ 候選池         按需排序，不預排版號（見 §14）
+v3.12 併發修復          /tmp pid-unique，併發安裝不互踩（見 §14）
+v3.13+ 候選池         按需排序，不預排版號（見 §15）
 ```
 
 - v3.0 是「能用」：單包安裝閉環，不碰依賴。
@@ -56,7 +57,7 @@ user/sh                 # autorun 加 install→run→remove（v3.0）
 run.sh/test.sh          # test.sh 項數見各版；registry 樁啟停沿用 v2.3
 user-lib                # 發布到 crates.io（v3.2 前提；v3.0 不動）
 ```
-v3.3+ 增量見 §5–§13（多版本路由、sha256、`/vol/`、sidecar、publish、guest 庫、閉環、pin 重驗、私包）。
+v3.3+ 增量見 §5–§14（多版本路由、sha256、`/vol/`、sidecar、publish、guest 庫、閉環、pin 重驗、私包、併發修復）。
 
 ## 3. 包格式（v3.0 定，後版只加行）
 
@@ -180,9 +181,15 @@ crate 從 crates.io 下來、編進 guest 二進制、裝進系統跑起來。
 
 動機：v3.4 的認證只有一半——registry 認得 token，但包沒有公私之分、
 上架的東西刪不掉。落點見 `v3.11.md`（`--private` 上架落 `.private`
-標記 + 讀取門、`DELETE` 管理面、`ctr logout`；v3.12 做 ed25519 真簽名）。
+標記 + 讀取門、`DELETE` 管理面、`ctr logout`；v3.13 做 ed25519 真簽名）。
 
-## 14. v3.14+ 候選池（按需排序，不預排版號）
+## 14. v3.12：併發安裝 /tmp 競態修復
+
+動機：`install` / `upgrade` / `pull` 共用固定 scratch 檔名，
+併發跑必互踩。落點見 `v3.12.md`（`tmp_path()` pid 後綴；
+單線行為不變；掉電原子性另立項）。
+
+## 15. v3.13+ 候選池（按需排序，不預排版號）
 
 - 包小件：`install =ver` 指定舊版（downgrade 語意）、並行下載、
   delta 更新、`KB/MB` 別名。

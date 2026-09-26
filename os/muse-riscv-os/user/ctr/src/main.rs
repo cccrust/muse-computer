@@ -435,6 +435,42 @@ fn read_token(out: &mut [u8; 64]) -> usize {
     e
 }
 
+/// v3.11-fix: per-process /tmp scratch paths. Concurrent installs,
+/// upgrades and pulls must never share scratch files (fixed names
+/// raced: a reader could see a half-written manifest or tar).
+/// Shapes: manifest -> /tmp/manifest.<pid>, index -> /tmp/pindex.<pid>,
+/// pkg layer -> /tmp/p<idx>.<pid>.tar, pull layer -> /tmp/l<idx>.<pid>.tar.
+/// NUL-terminated; returns length excl. NUL. Content always fits [u8; 64]
+/// (longest shape is 5 + 8 + 1 + 20 + 4; pids never approach 20 digits
+/// in a boot -- `next_pid` counts test-hundreds, not billions).
+/// Callers rebuild the same name wherever needed: identical inputs give
+/// identical paths within one process, and forked wget children receive
+/// the path via argv (never rebuild it themselves).
+/// `which`: b'm' manifest, b'i' index, b'p' pkg layer, b'l' pull layer.
+fn tmp_path(out: &mut [u8; 64], which: u8, idx: usize) -> usize {
+    let pid = user_lib::getpid().max(0) as usize;
+    let mut n = 0usize;
+    n = buf_put(out, n, b"/tmp/");
+    if which == b'p' {
+        n = buf_put(out, n, b"p");
+        n = push_dec(out, n, idx);
+    } else if which == b'l' {
+        n = buf_put(out, n, b"l");
+        n = push_dec(out, n, idx);
+    } else if which == b'm' {
+        n = buf_put(out, n, b"manifest");
+    } else {
+        n = buf_put(out, n, b"pindex");
+    }
+    n = buf_put(out, n, b".");
+    n = push_dec(out, n, pid);
+    if which == b'p' || which == b'l' {
+        n = buf_put(out, n, b".tar");
+    }
+    out[n.min(63)] = 0;
+    n.min(63)
+}
+
 /// run `/bin/wget <host> <port> <path> <outfile>`; true iff exit code 0.
 /// v3.4: attaches /pkg/token as a bearer header when present
 /// (registry private routes; public routes ignore it -- pull and all
@@ -742,18 +778,20 @@ fn cmd_pull(host: &[u8], port: &[u8], image: &[u8]) {
     root[5..5 + image.len()].copy_from_slice(image);
     let rootn = 5 + image.len();
     mkdir_p(&root);
-    // 1. manifest -> /tmp/manifest
+    // 1. manifest -> per-process tmp (see tmp_path).
     let mut mpath = [0u8; 128];
     mpath[0] = b'/';
     mpath[1..1 + image.len()].copy_from_slice(image);
     let mpn = 1 + image.len();
     mpath[mpn..mpn + 9].copy_from_slice(b"/manifest");
-    if !run_wget(host, port, &mpath[..mpn + 9], b"/tmp/manifest") {
+    let mut man_ob = [0u8; 64];
+    let man_n = tmp_path(&mut man_ob, b'm', 0);
+    if !run_wget(host, port, &mpath[..mpn + 9], &man_ob[..man_n]) {
         user_lib::print("[TEST] img FAIL (manifest)\n");
         user_lib::exit(1);
     }
     // 2. parse manifest: one layer filename per line, `#` comments.
-    let mf = user_lib::open(b"/tmp/manifest\0".as_ptr(), 0);
+    let mf = user_lib::open(man_ob.as_ptr(), 0);
     if mf < 0 {
         user_lib::print("[TEST] img FAIL (manifest-open)\n");
         user_lib::exit(1);
@@ -808,11 +846,9 @@ fn cmd_pull(host: &[u8], port: &[u8], image: &[u8]) {
         let rpn = 1 + image.len();
         rpath[rpn] = b'/';
         rpath[rpn + 1..rpn + 1 + layer.len()].copy_from_slice(layer);
-        let mut ob = [0u8; 32];
-        ob[..7].copy_from_slice(b"/tmp/l0");
-        ob[6] = b'0' + li as u8;
-        ob[7..11].copy_from_slice(b".tar");
-        if !run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..11]) {
+        let mut ob = [0u8; 64];
+        let obn = tmp_path(&mut ob, b'l', li);
+        if !run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..obn]) {
             user_lib::print("[TEST] img FAIL (layer)\n");
             user_lib::exit(1);
         }
@@ -831,7 +867,7 @@ fn cmd_pull(host: &[u8], port: &[u8], image: &[u8]) {
         files += f;
         li += 1;
     }
-    user_lib::unlink(b"/tmp/manifest\0".as_ptr());
+    user_lib::unlink(man_ob.as_ptr());
     if files <= 0 {
         user_lib::print("[TEST] img FAIL (empty)\n");
         user_lib::exit(1);
@@ -2102,11 +2138,13 @@ fn fetch_index(
     ipath[5..5 + pkg.len()].copy_from_slice(pkg);
     let ipn = 5 + pkg.len();
     ipath[ipn..ipn + 6].copy_from_slice(b"/index");
-    if !run_wget(host, port, &ipath[..ipn + 6], b"/tmp/pindex") {
+    let mut iob = [0u8; 64];
+    let ion = tmp_path(&mut iob, b'i', 0);
+    if !run_wget(host, port, &ipath[..ipn + 6], &iob[..ion]) {
         user_lib::print("ctr: pkg fetch failed (index)\n");
         user_lib::exit(1);
     }
-    let f = user_lib::open(b"/tmp/pindex\0".as_ptr(), 0);
+    let f = user_lib::open(iob.as_ptr(), 0);
     if f < 0 {
         user_lib::print("ctr: pkg fetch failed (index-open)\n");
         user_lib::exit(1);
@@ -2124,7 +2162,7 @@ fn fetch_index(
         n += r as usize;
     }
     user_lib::close(f);
-    user_lib::unlink(b"/tmp/pindex\0".as_ptr());
+    user_lib::unlink(iob.as_ptr());
     let mut nv = 0;
     let mut i = 0;
     while i < n && nv < 8 {
@@ -2245,11 +2283,13 @@ fn install_one(
     mpath[mpn + 1..mpn + 1 + targetn].copy_from_slice(&target[..targetn]);
     let mpn = mpn + 1 + targetn;
     mpath[mpn..mpn + 9].copy_from_slice(b"/manifest");
-    if !run_wget(host, port, &mpath[..mpn + 9], b"/tmp/manifest") {
+    let mut man_ob = [0u8; 64];
+    let man_n = tmp_path(&mut man_ob, b'm', 0);
+    if !run_wget(host, port, &mpath[..mpn + 9], &man_ob[..man_n]) {
         user_lib::print("ctr: pkg fetch failed (manifest)\n");
         user_lib::exit(1);
     }
-    let mf = user_lib::open(b"/tmp/manifest\0".as_ptr(), 0);
+    let mf = user_lib::open(man_ob.as_ptr(), 0);
     if mf < 0 {
         user_lib::print("ctr: pkg fetch failed (manifest-open)\n");
         user_lib::exit(1);
@@ -2475,7 +2515,7 @@ fn store_read_files(root: &[u8; 64], rootn: usize, out: &mut [[u8; 128]; 64]) ->
     nn
 }
 
-/// v3.4: verify the concatenated layer tars (/tmp/p0..p<nl-1>.tar)
+/// v3.4: verify the concatenated layer tars (per-process names, see tmp_path)
 /// against the manifest hex. Missing/short hash -> `sha256 missing`;
 /// mismatch or unreadable tar -> `sha256 mismatch`. True on success
 /// (callers roll back / abort loud on false).
@@ -2501,10 +2541,8 @@ fn verify_tars(nl: usize, hex: &[u8]) -> bool {
     let mut st = user_lib::Sha256::new();
     let mut li = 0usize;
     while li < nl {
-        let mut ob = [0u8; 32];
-        ob[..7].copy_from_slice(b"/tmp/p0");
-        ob[6] = b'0' + li as u8;
-        ob[7..11].copy_from_slice(b".tar");
+        let mut ob = [0u8; 64];
+        let _ = tmp_path(&mut ob, b'p', li);
         let f = user_lib::open(ob.as_ptr(), 0);
         if f < 0 {
             user_lib::print("ctr: sha256 mismatch\n");
@@ -2578,11 +2616,9 @@ fn install_layers(
         let rpn = rpn + 1 + ver.len();
         rpath[rpn] = b'/';
         rpath[rpn + 1..rpn + 1 + layer.len()].copy_from_slice(layer);
-        let mut ob = [0u8; 32];
-        ob[..7].copy_from_slice(b"/tmp/p0");
-        ob[6] = b'0' + li as u8;
-        ob[7..11].copy_from_slice(b".tar");
-        if !run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..11]) {
+        let mut ob = [0u8; 64];
+        let obn = tmp_path(&mut ob, b'p', li);
+        if !run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..obn]) {
             rollback(&root);
         }
         li += 1;
@@ -2593,10 +2629,8 @@ fn install_layers(
     }
     let mut li = 0usize;
     while li < nl {
-        let mut ob = [0u8; 32];
-        ob[..7].copy_from_slice(b"/tmp/p0");
-        ob[6] = b'0' + li as u8;
-        ob[7..11].copy_from_slice(b".tar");
+        let mut ob = [0u8; 64];
+        let _ = tmp_path(&mut ob, b'p', li);
         let tf = user_lib::open(ob.as_ptr(), 0);
         if tf < 0 {
             rollback(&root);
@@ -2610,7 +2644,10 @@ fn install_layers(
         }
         li += 1;
     }
-    user_lib::unlink(b"/tmp/manifest\0".as_ptr());
+    // (rebuild the per-process name: same pid, same path.)
+    let mut man_tmp = [0u8; 64];
+    let _ = tmp_path(&mut man_tmp, b'm', 0);
+    user_lib::unlink(man_tmp.as_ptr());
     // v3.1: stash a manifest copy in the store for remove's needed-by
     // scan (rm_all takes it with the store; bin listing is unaffected).
     {
@@ -2640,10 +2677,8 @@ fn install_layers(
         let mut li = 0usize;
         let mut ok = true;
         while li < nl && ok {
-            let mut ob = [0u8; 32];
-            ob[..7].copy_from_slice(b"/tmp/p0");
-            ob[6] = b'0' + li as u8;
-            ob[7..11].copy_from_slice(b".tar");
+            let mut ob = [0u8; 64];
+            let _ = tmp_path(&mut ob, b'p', li);
             if nn >= 64 {
                 ok = false;
             } else {
@@ -2985,7 +3020,7 @@ fn cmd_pkg_remove(pkg: &[u8]) {
     user_lib::exit(0);
 }
 
-/// v3.3: download one layer tarball to /tmp/p<idx>.tar. True on success.
+/// v3.3: download one layer tarball (per-process tmp name). True on success.
 fn fetch_layer(
     host: &[u8],
     port: &[u8],
@@ -3003,11 +3038,9 @@ fn fetch_layer(
     let rpn = rpn + 1 + ver.len();
     rpath[rpn] = b'/';
     rpath[rpn + 1..rpn + 1 + layer.len()].copy_from_slice(layer);
-    let mut ob = [0u8; 32];
-    ob[..7].copy_from_slice(b"/tmp/p0");
-    ob[6] = b'0' + idx as u8;
-    ob[7..11].copy_from_slice(b".tar");
-    run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..11])
+    let mut ob = [0u8; 64];
+    let obn = tmp_path(&mut ob, b'p', idx);
+    run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..obn])
 }
 
 /// v3.3: NUL-terminated path equality.
@@ -3144,11 +3177,13 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
     mpath[mpn + 1..mpn + 1 + versn[nb]].copy_from_slice(&vers[nb][..versn[nb]]);
     let mpn = mpn + 1 + versn[nb];
     mpath[mpn..mpn + 9].copy_from_slice(b"/manifest");
-    if !run_wget(host, port, &mpath[..mpn + 9], b"/tmp/manifest") {
+    let mut man_ob = [0u8; 64];
+    let man_n = tmp_path(&mut man_ob, b'm', 0);
+    if !run_wget(host, port, &mpath[..mpn + 9], &man_ob[..man_n]) {
         user_lib::print("ctr: pkg fetch failed (manifest)\n");
         user_lib::exit(1);
     }
-    let mf = user_lib::open(b"/tmp/manifest\0".as_ptr(), 0);
+    let mf = user_lib::open(man_ob.as_ptr(), 0);
     if mf < 0 {
         user_lib::print("ctr: pkg fetch failed (manifest-open)\n");
         user_lib::exit(1);
@@ -3247,10 +3282,8 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
     }
     let mut li = 0usize;
     while li < nl {
-        let mut ob = [0u8; 32];
-        ob[..7].copy_from_slice(b"/tmp/p0");
-        ob[6] = b'0' + li as u8;
-        ob[7..11].copy_from_slice(b".tar");
+        let mut ob = [0u8; 64];
+        let _ = tmp_path(&mut ob, b'p', li);
         let tf = user_lib::open(ob.as_ptr(), 0);
         if tf < 0 {
             up_fail("ctr: pkg fetch failed (layer-open)\n");
@@ -3268,10 +3301,8 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
     let mut ok = true;
     let mut li = 0usize;
     while li < nl && ok {
-        let mut ob = [0u8; 32];
-        ob[..7].copy_from_slice(b"/tmp/p0");
-        ob[6] = b'0' + li as u8;
-        ob[7..11].copy_from_slice(b".tar");
+        let mut ob = [0u8; 64];
+        let _ = tmp_path(&mut ob, b'p', li);
         if newn >= 64 {
             ok = false;
         } else {
@@ -3321,7 +3352,10 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
             up_fail("ctr: upgrade failed (manifest)\n");
         }
     }
-    user_lib::unlink(b"/tmp/manifest\0".as_ptr());
+    // (rebuild the per-process name: same pid, same path.)
+    let mut man_tmp = [0u8; 64];
+    let _ = tmp_path(&mut man_tmp, b'm', 0);
+    user_lib::unlink(man_tmp.as_ptr());
     if !pkg_db_del(pkg) || !pkg_db_add(pkg, &ver[..vern], manual) {
         up_fail("ctr: db update failed\n");
     }

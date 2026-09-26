@@ -33,7 +33,7 @@ Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,d
 Experimental SBI Extensions : none
 
 Domain0 Name                : root
-Domain0 Boot HART           : 1
+Domain0 Boot HART           : 0
 Domain0 HARTs               : 0*,1*,2*,3*
 Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
 Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
@@ -49,7 +49,7 @@ Domain0 Next Mode           : S-mode
 Domain0 SysReset            : yes
 Domain0 SysSuspend          : yes
 
-Boot HART ID                : 1
+Boot HART ID                : 0
 Boot HART Domain            : root
 Boot HART Priv Version      : v1.12
 Boot HART Base ISA          : rv64imafdch
@@ -74,7 +74,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [MM] mmio mapped, activating...
 [MM] activated
 [MMU] SV39 enabled (satp MODE=8, 3-level)
-[PLIC] hart1 ctx irq10+virtio1-8 enabled
+[PLIC] hart0 ctx irq10+virtio1-8 enabled
 [PLIC] uart irq10 + virtio irq1-8 enabled
 [TRAP] stvec set
 [TIMER] enabled (10ms tick)
@@ -84,22 +84,20 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [NET] net @ 0x10002000 MAC 52:54:00:12:34:56 ip 10.0.2.15
 [TEST] net-dev PASS
 [FS] disk mount ok (MUSEFS01, 8192 blocks)
-[FS] journal replayed 187
-[FS] fsck: bitmap rebuilt
 [PROC] init pid=1
 [PROC] spawn init
-[SMP] boot hart1
-[SMP] hart1 up
-[SMP] hart0 starting
+[SMP] boot hart0
+[SMP] hart0 up
+[SMP] hart1 starting
 [SMP] hart2 starting
 [SMP] hart3 starting
-[PLIC] hart0 ctx irq10+virtio1-8 enabled
-[PLIC] hart2 ctx irq10+virtio1-8 enabled
-[SMP] hart0 up
+[PLIC] hart1 ctx irq10+virtio1-8 enabled
 [PLIC] hart3 ctx irq10+virtio1-8 enabled
+[PLIC] hart2 ctx irq10+virtio1-8 enabled
+[SMP] hart1 up
 [SMP] hart3 up
 [SMP] hart2 up
-[DBG] soft hart=0 n=0 sip=0x202->0x200
+[DBG] soft hart=3 n=0 sip=0x202->0x200
 [TEST] ipi PASS
 [TEST] boot markers ready
 [TEST] virtio-irq PASS
@@ -190,13 +188,13 @@ echo: hi from unix-v6
 [PROC] fork pid=11 -> child=13
 [PROC] fork pid=11 -> child=14
 [PROC] fork pid=11 -> child=15
-[smp] child on hart 2->2
+[smp] child on hart 1->1
 [PROC] pid=12 exited(40)
-[smp] child on hart 2->2
+[smp] child on hart 1->1
 [PROC] pid=13 exited(41)
-[smp] child on hart 2->2
-[PROC] pid=14 exited(42)
-[smp] child on hart 2->2
+[smp] child on hart [smp] child on hart 11->->1
+0[PROC] pid=14 exited(42)
+
 [PROC] pid=15 exited(43)
 [TEST] smp PASS
 [PROC] pid=11 exited(0)
@@ -213,9 +211,9 @@ echo: hi from unix-v6
 [PROC] fork pid=18 -> child=21
 [PROC] fork pid=18 -> child=22
 [PROC] fork pid=19 -> child=23
-[PROC] pid=20 exited(41)
 [PROC] pid=23 exited(50)
 [PROC] pid=22 exited(43)
+[PROC] pid=20 exited(41)
 [PROC] pid=21 exited(42)
 [PROC] pid=19 exited(40)
 [TEST] ns PASS
@@ -240,22 +238,22 @@ echo: hi from unix-v6
 [PROC] fork pid=24 -> child=39
 [PROC] fork pid=24 -> child=40
 [PROC] fork pid=24 -> child=41
+[PROC] pid=40 exited(77)
 [PROC] pid=39 exited(77)
 [PROC] pid=38 exited(77)
-[PROC] pid=40 exited(77)
 [PROC] pid=41 exited(77)
-[PROC] pid=26 exited(10)
-[PROC] pid=27 exited(11)
-[PROC] pid=28 exited(12)
-[PROC] pid=31 exited(15)
-[PROC] pid=32 exited(16)
+[PROC] pid=30 exited(14)
 [PROC] pid=29 exited(13)
 [PROC] pid=34 exited(18)
-[PROC] pid=37 exited(21)
 [PROC] pid=33 exited(17)
-[PROC] pid=30 exited(14)
-[PROC] pid=35 exited(19)
 [PROC] pid=36 exited(20)
+[PROC] pid=35 exited(19)
+[PROC] pid=32 exited(16)
+[PROC] pid=28 exited(12)
+[PROC] pid=26 exited(10)
+[PROC] pid=31 exited(15)
+[PROC] pid=27 exited(11)
+[PROC] pid=37 exited(21)
 [PROC] fork pid=24 -> child=42
 [PROC] fork pid=24 -> child=43
 [PROC] fork pid=24 -> child=44
@@ -264,14 +262,14 @@ echo: hi from unix-v6
 [PROC] fork pid=24 -> child=47
 [PROC] fork pid=24 -> child=48
 [PROC] fork pid=24 -> child=49
-[PROC] pid=43 exited(31)
-[PROC] pid=42 exited(30)
-[PROC] pid=45 exited(33)
-[PROC] pid=44 exited(32)
-[PROC] pid=47 exited(55)
-[PROC] pid=49 exited(55)
 [PROC] pid=46 exited(55)
+[PROC] pid=44 exited(32)
+[PROC] pid=43 exited(31)
+[PROC] pid=47 exited(55)
+[PROC] pid=45 exited(33)
 [PROC] pid=48 exited(55)
+[PROC] pid=49 exited(55)
+[PROC] pid=42 exited(30)
 [PROC] fork pid=24 -> child=50
 [PROC] pid=50 exited(0)
 [PROC] fork pid=24 -> child=51
@@ -1126,19 +1124,19 @@ echo: hi from unix-v6
 [PROC] fork pid=2 -> child=472
 [PROC] fork pid=2 -> child=473
 [PROC] exec pid=472 -> /bin/webserver (argc=0)
-[PROC] exec pid=473 -> /bin/udpping (argc=0)
 [NET] webserver listening on :80
-[DBG] soft hart=1 n=0 sip=0x2->0x0
-[DBG] soft hart=2 n=0 sip=0x2->0x0
-[DBG] soft hart=1 n=1 sip=0x2->0x0
-[DBG] soft hart=2 n=1 sip=0x2->0x0
-[DBG] soft hart=3 n=0 sip=0x2->0x0
+[PROC] exec pid=473 -> /bin/udpping (argc=0)
+[DBG] soft hart=0 n=0 sip=0x2->0x0
 [DBG] soft hart=0 n=1 sip=0x2->0x0
-[DBG] soft hart=1 n=2 sip=0x2->0x0
+[DBG] soft hart=0 n=2 sip=0x2->0x0
 [DBG] soft hart=3 n=1 sip=0x2->0x0
 [DBG] soft hart=3 n=2 sip=0x2->0x0
+[DBG] soft hart=2 n=0 sip=0x2->0x0
+[DBG] soft hart=2 n=1 sip=0x2->0x0
 [DBG] soft hart=2 n=2 sip=0x2->0x0
-[DBG] soft hart=0 n=2 sip=0x2->0x0
+[DBG] soft hart=1 n=0 sip=0x2->0x0
+[DBG] soft hart=1 n=1 sip=0x2->0x0
+[DBG] soft hart=1 n=2 sip=0x2->0x0
 [TEST] net FAIL
 [PROC] pid=473 exited(0)
 [PROC] fork pid=2 -> child=474
@@ -1202,7 +1200,7 @@ hello-from-exec
 [PROC] fork pid=2 -> child=490
 [PROC] exec pid=490 -> /bin/ctr (argc=2)
 CTRPS NAME PID STATUS
-CTRPS life 484 Up 51s mem=100000 cpu=50 weight=8
+CTRPS life 484 Up 46s mem=100000 cpu=50 weight=8
 [PROC] pid=490 exited(0)
 [PROC] fork pid=2 -> child=491
 [PROC] exec pid=491 -> /bin/ctr (argc=3)
@@ -1406,8 +1404,8 @@ ctr: pkg fetch failed (index)
 [PROC] pid=539 exited(1)
 [PROC] fork pid=2 -> child=541
 [PROC] exec pid=541 -> /bin/ctr (argc=4)
-ctr: volume exists
-[PROC] pid=541 exited(1)
+vol-created data1
+[PROC] pid=541 exited(0)
 [PROC] fork pid=2 -> child=542
 [PROC] exec pid=542 -> /bin/ctr (argc=2)
 ready /ctr/volc
@@ -1485,7 +1483,7 @@ detached 560 mem=100000 cpu=50 weight=8
 [PROC] fork pid=2 -> child=562
 [PROC] exec pid=562 -> /bin/ctr (argc=2)
 CTRPS NAME PID STATUS
-CTRPS ftest 560 Up 60s mem=100000 cpu=50 weight=8
+CTRPS ftest 560 Up 53s mem=100000 cpu=50 weight=8
 [PROC] pid=562 exited(0)
 [PROC] fork pid=2 -> child=563
 [PROC] exec pid=563 -> /bin/ctr (argc=4)
@@ -1604,16 +1602,16 @@ hello-arg
 [PROC] pid=590 exited(0)
 [PROC] fork pid=2 -> child=591
 [bg] pipe_test &
-[PROC] exec pid=591 -> /bin/pipe_test (argc=0)
 [PROC] fork pid=2 -> child=592
+[PROC] exec pid=591 -> /bin/pipe_test (argc=0)
 [PROC] exec pid=592 -> /bin/ls (argc=1)
-/[PROC] fork pid=591 -> child=593
-:
+/:
+[PROC] fork pid=591 -> child=593
+bin/
 [PROC] pid=593 exited(0)
-[TEST] pipe PASS
-bin/[PROC] pid=591 exited(0)
-
-README ok
+README[TEST] pipe PASS
+[PROC] pid=591 exited(0)
+ ok
 ctrtest/
 dl.txt ok
 tmp/
@@ -1733,10 +1731,10 @@ halt
 sh: draining jobs
 sh: halting
 [SYS] shutdown
-[FS] cache stats hits=209601 miss=21327 dev_rd=42379 dev_wr=5037
+[FS] cache stats hits=227197 miss=21357 dev_rd=42437 dev_wr=1103
 [FS] marked clean
-[SMP] steals=1026
-[SMP] contention sched=11555155/1395674
+[SMP] steals=1006
+[SMP] contention sched=11859395/1385280
 [MM] heap free=7007306 largest=5702698
 [CG] groups=3
 [NS] ns=5
