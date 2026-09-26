@@ -74,6 +74,11 @@ DNS_PID=$!
 python3 tools/img_registry.py > /tmp/muse-img.log 2>&1 &
 IMG_PID=$!
 sleep 1
+# v3.7: publish the pipeline demo package to the live registry before
+# booting (the guest suite installs it; failure here fails the run).
+python3 tools/pkgbuild.py --crate tools/pkgdemo --pkg pubdemo \
+  --version 1.0 --bin fortune \
+  --registry http://127.0.0.1:8091 --token admin-token || PASS=0
 # v1.5: run1 keeps QEMU alive in background so the host web client can
 # fetch from the guest webserver mid-run (a timeout-killed QEMU can't be
 # fetched from afterwards). Sequence: boot bg -> web_fetch (30s) -> wait
@@ -198,6 +203,9 @@ check "VOL data1"
 check "hi-vol"
 check "removed volc"
 check "vol-removed data1"
+check "pkg-installed pubdemo 1.0"
+check "fortune-sez hello-from-pub"
+check "pkg-removed pubdemo"
 check "CTRPS life"
 check "Up"
 check "stopped life"

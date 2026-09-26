@@ -29,8 +29,9 @@ v3.3  升級鏈          registry 多版本路由 + index + 版本範圍 +
                       upgrade + autoremove（見 §5）
 v3.4  信任鏈          sha256 完整性 + registry 認證（見 §6）
 v3.5  volume          持久數據進出容器的正規路（見 §7）
-v3.6  容器小件收尾    ps 限額 + rm -f + restart（見 §9）
-v3.7+ 候選池          按需排序，不預排版號（見 §8）
+v3.6  容器小件收尾    ps 限額 + rm -f + restart（見 §8，spec 已定）
+v3.7  registry 常駐化 publish 上架 + 磁碟持久（見 §9）
+v3.8+ 候選池          按需排序，不預排版號（見 §10）
 ```
 
 - v3.0 是「能用」：單包安裝閉環，不碰依賴。
@@ -51,7 +52,7 @@ user/sh                 # autorun 加 install→run→remove（v3.0）
 run.sh/test.sh          # test.sh 項數見各版；registry 樁啟停沿用 v2.3
 user-lib                # 發布到 crates.io（v3.2 前提；v3.0 不動）
 ```
-v3.3+ 增量見 §5–§8（registry 多版本路由、guest sha256、`/vol/`）。
+v3.3+ 增量見 §5–§9（多版本路由、sha256、`/vol/`、sidecar、publish）。
 
 ## 3. 包格式（v3.0 定，後版只加行）
 
@@ -139,10 +140,19 @@ hardlink 與整盤持久」。包（v3.x）和容器（v2.x）都齊了，數據
 - 非目標：quota on volume（cgroup 配額是容器側的）、跨宿主遷移、
   volume driver。
 
-## 9. v3.6：容器小件收尾（ps 限額 + rm -f + restart）
+## 8. v3.6：容器小件收尾（ps 限額 + rm -f + restart）
 
 動機：v2.x 留的三個小件，一次收完（唯讀/組裝既有原語）。
 落點見 `v3.6.md`（SYS_CGSTAT + `.run` sidecar + stop 共用 helper）。
+狀態：spec 已定，未實作。
+
+## 9. v3.7：registry 常駐化（publish 上架）
+
+動機：測試樁只能 serve 寫死的包；日常可用的第一步是活著能收新包、
+重啟還在。落點見 `v3.7.md`（磁碟佈局 + PUT 上架 + index 生成；
+guest 零改動）。
+
+## 10. v3.8+ 候選池（按需排序，不預排版號）
 
 - 容器小件：`ps` 顯示限額（v2.8 欠賬）、`rm -f`、`restart`、
   `KB/MB` 別名（v2.8 說不加，要加也是小版）。

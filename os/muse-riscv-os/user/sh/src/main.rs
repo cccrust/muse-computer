@@ -1492,6 +1492,28 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"ctr", b"volume", b"rm", b"data1"],
         &mut jobs,
     );
+    // v3.7: published package (pubdemo is PUT to the live registry by
+    // test.sh before boot; the binary inside is still fortune).
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"pubdemo"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"list"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/fortune\0",
+        &[b"fortune", b"hello-from-pub"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"pubdemo"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

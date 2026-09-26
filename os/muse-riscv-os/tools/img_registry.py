@@ -28,6 +28,17 @@ host build tree -- deliberate: the suite runs the downloaded binary
 to prove it is executable.
 Everything else is 404. HTTP/1.0, closes after each reply (matches what
 the guest stack implements). Started/stopped by test.sh around run1.
+
+v3.7: the registry is a (stub-grade) service, not just a fixture:
+published packages persist under tools/packages/<name>/<ver>/ and are
+served on restart; live uploads go through PUT (see below).
+
+  PUT /pkg/<name>/<ver>/<file>   manifest or single layer tar
+      headers: Authorization: Bearer admin-token (toy-auth, constant)
+      caps: manifest 4K, tar 2M; names match [A-Za-z0-9._-]{1,32}
+      200 `published <name> <ver>` (writes disk + registers + reindex);
+      401 bad token; 400 bad shape/size.
+  GET /pkg/<name>/index          generated from disk + builtin versions.
 """
 import io
 import os
@@ -159,6 +170,9 @@ def handle(conn: socket.socket) -> None:
         head, _, _ = req.partition(b"\r\n\r\n")
         lines = head.split(b"\r\n")
         parts = lines[0].split(b" ") if lines else []
+        if len(parts) >= 2 and parts[0] == b"PUT":
+            handle_put(conn, parts[1], lines[1:], req)
+            return
         body = None
         if len(parts) >= 2 and parts[0] == b"GET":
             path = parts[1]
@@ -190,6 +204,153 @@ def handle(conn: socket.socket) -> None:
             conn.close()
         except OSError:
             pass
+
+
+# ---- v3.7: disk persistence + live upload ----
+
+DATA_ROOT = os.path.join(ROOT, "tools", "packages")
+ADMIN_TOKEN = b"admin-token"
+MAX_MANIFEST = 4096
+MAX_TAR = 2 * 1024 * 1024
+
+
+def valid_seg(s):
+    if not (1 <= len(s) <= 32):
+        return False
+    if s in (b".", b".."):
+        return False
+    return all(c in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-" for c in s)
+
+
+def bearer_token(lines):
+    for ln in lines:
+        k, s, v = ln.partition(b":")
+        if s and k.strip().lower() == b"authorization":
+            return v.strip()
+    return b""
+
+
+def reply(conn, code, body):
+    conn.sendall(b"HTTP/1.0 %s\r\nContent-Length: %d\r\n\r\n" % (code, len(body)) + body)
+
+
+def pkg_versions(name):
+    """All known versions of a package (builtin routes + disk)."""
+    vers = set()
+    pre = b"/pkg/" + name + b"/"
+    for k in ROUTES:
+        if k.startswith(pre) and k.endswith(b"/manifest"):
+            vers.add(k[len(pre):-len(b"/manifest")])
+    dd = os.path.join(DATA_ROOT, name.decode("ascii", "ignore"))
+    if os.path.isdir(dd):
+        for v in sorted(os.listdir(dd)):
+            vb = v.encode()
+            if valid_seg(vb) and os.path.isfile(os.path.join(dd, v, "manifest")):
+                vers.add(vb)
+    return sorted(vers)
+
+
+def reindex(name):
+    index = b"\n".join(pkg_versions(name)) + b"\n"
+    ROUTES[b"/pkg/" + name + b"/index"] = index
+
+
+def serve_disk_pkg(name, ver):
+    """Register /pkg/<name>/<ver>/* from disk files. Returns file count."""
+    dd = os.path.join(DATA_ROOT, name.decode("ascii", "ignore"),
+                      ver.decode("ascii", "ignore"))
+    n = 0
+    for f in sorted(os.listdir(dd)):
+        if f == ".gitkeep":
+            continue
+        p = os.path.join(dd, f)
+        if not os.path.isfile(p):
+            continue
+        with open(p, "rb") as fh:
+            ROUTES[b"/pkg/" + name + b"/" + ver + b"/" + f.encode()] = fh.read()
+        n += 1
+    return n
+
+
+def load_disk():
+    if not os.path.isdir(DATA_ROOT):
+        os.makedirs(DATA_ROOT, exist_ok=True)
+    loaded = 0
+    for name in sorted(os.listdir(DATA_ROOT)):
+        nb = name.encode()
+        if not valid_seg(nb):
+            continue
+        for ver in pkg_versions(nb):
+            # disk wins over builtin routes (published overrides stub).
+            dd = os.path.join(DATA_ROOT, name)
+            vd = os.path.join(dd, ver.decode("ascii", "ignore"))
+            if os.path.isdir(vd):
+                serve_disk_pkg(nb, ver)
+                loaded += 1
+        reindex(nb)
+    if loaded:
+        print("img_registry: loaded %d versioned package(s) from disk" % loaded,
+              flush=True)
+
+
+def handle_put(conn, path, header_lines, req):
+    try:
+        if bearer_token(header_lines).lower() != b"bearer " + ADMIN_TOKEN:
+            reply(conn, b"401 Unauthorized", b"")
+            return
+        parts = path.split(b"/")
+        # ["", "pkg", name, ver, file]
+        if len(parts) != 5 or parts[0] != b"" or parts[1] != b"pkg":
+            reply(conn, b"400 Bad Request", b"bad path")
+            return
+        _, _, name, ver, fname = parts
+        if not (valid_seg(name) and valid_seg(ver)):
+            reply(conn, b"400 Bad Request", b"bad name/version")
+            return
+        is_manifest = fname == b"manifest"
+        if not (is_manifest or fname.endswith(b".tar")):
+            reply(conn, b"400 Bad Request", b"manifest or *.tar only")
+            return
+        cap = MAX_MANIFEST if is_manifest else MAX_TAR
+        cl = 0
+        for ln in header_lines:
+            k, s, v = ln.partition(b":")
+            if s and k.strip().lower() == b"content-length":
+                try:
+                    cl = int(v.strip())
+                except ValueError:
+                    cl = -1
+                break
+        if cl <= 0 or cl > cap:
+            reply(conn, b"400 Bad Request", b"bad content-length")
+            return
+        body = req.split(b"\r\n\r\n", 1)[1]
+        conn.settimeout(10.0)
+        while len(body) < cl:
+            b = conn.recv(65536)
+            if not b:
+                break
+            body += b
+            if len(body) > cap:
+                reply(conn, b"400 Bad Request", b"too large")
+                return
+        if len(body) != cl:
+            reply(conn, b"400 Bad Request", b"short body")
+            return
+        dd = os.path.join(DATA_ROOT, name.decode("ascii"),
+                          ver.decode("ascii"))
+        os.makedirs(dd, exist_ok=True)
+        with open(os.path.join(dd, fname.decode("ascii")), "wb") as fh:
+            fh.write(body)
+        ROUTES[b"/pkg/" + name + b"/" + ver + b"/" + fname] = body
+        reindex(name)
+        reply(conn, b"200 OK",
+              b"published %s %s\n" % (name, ver))
+        print("img_registry: published %s %s (%s %dB)"
+              % (name.decode(), ver.decode(),
+                 fname.decode(), len(body)), flush=True)
+    except OSError:
+        pass
 
 
 def main() -> None:
@@ -256,6 +417,8 @@ def main() -> None:
         ROUTES[b"/pkg/fortune/1.0/fortune.tar"] = ftar
         ROUTES[b"/pkg/fortune/index"] = PKG_SINGLE_INDEX
         print("img_registry: pkg fortune 1.0 versioned + index", flush=True)
+    # v3.7: disk-published packages (survive restarts; win over builtins).
+    load_disk()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(ADDR)

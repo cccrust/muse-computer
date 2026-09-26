@@ -13,6 +13,8 @@ untar understands: ustar regular/dir entries). This tool:
 Usage:
   pkgbuild.py --crate DIR --pkg NAME --version VER --bin BIN --out DIR
               [--add arcpath=hostpath ...] [--depends "a b=1.0"]
+  pkgbuild.py --crate DIR --pkg NAME --version VER --bin BIN \
+              --registry URL --token TOK [...]   # publish to a live registry
   pkgbuild.py --src crates NAME VER --out DIR   # fetch-only check
 
 `--src crates` downloads the .crate file from static.crates.io
@@ -139,6 +141,37 @@ def build_package(crate_dir, pkg, version, binary, out_dir=None,
     return manifest, tar
 
 
+def put_file(registry, token, path, data):
+    """PUT one file to a running registry; returns (status, body)."""
+    import urllib.request
+    import urllib.error
+    url = registry.rstrip("/") + path
+    req = urllib.request.Request(
+        url, data=data, method="PUT",
+        headers={"Authorization": "Bearer " + token,
+                 "Content-Type": "application/octet-stream",
+                 "Content-Length": str(len(data))},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def publish_package(registry, token, pkg, version, manifest, tar, layer):
+    """Upload manifest + layer tar to /pkg/<pkg>/<ver>/. Loud on failure."""
+    for relpath, data in (("manifest", manifest), (layer, tar)):
+        status, body = put_file(
+            registry, token, "/pkg/%s/%s/%s" % (pkg, version, relpath), data)
+        print("pkgbuild: PUT %s -> %s %r" % (relpath, status, body[:80]),
+              flush=True)
+        if status != 200:
+            raise RuntimeError("publish %s failed: HTTP %s %r"
+                               % (relpath, status, body[:200]))
+    print("pkgbuild: published %s %s" % (pkg, version), flush=True)
+
+
 def main(argv):
     import argparse
     ap = argparse.ArgumentParser(description=__doc__)
@@ -152,6 +185,10 @@ def main(argv):
     ap.add_argument("--add", action="append", default=[],
                     help="arcpath=hostpath extra file (repeatable)")
     ap.add_argument("--depends", default="")
+    ap.add_argument("--registry", default=None,
+                    help="upload to a running registry (PUT), e.g. http://127.0.0.1:8091")
+    ap.add_argument("--token", default="",
+                    help="bearer token for --registry upload")
     a = ap.parse_args(argv)
     crate_dir = a.crate
     if a.src is not None:
@@ -164,14 +201,24 @@ def main(argv):
         if a.pkg is None:
             print("pkgbuild: fetched only (no --pkg given)")
             return 0
-    if not (crate_dir and a.pkg and a.version and a.bin and a.out):
-        raise SystemExit("need --crate/--pkg/--version/--bin/--out")
+    if not (crate_dir and a.pkg and a.version and a.bin):
+        raise SystemExit("need --crate/--pkg/--version/--bin (+ --out and/or --registry)")
+    if a.out is None and a.registry is None:
+        raise SystemExit("need at least one of --out / --registry")
     extra = []
     for spec in a.add:
         arc, host = spec.split("=", 1)
         extra.append((arc, host))
-    build_package(crate_dir, a.pkg, a.version, a.bin, a.out,
-                  extra=extra, depends=a.depends)
+    if a.out is not None:
+        build_package(crate_dir, a.pkg, a.version, a.bin, a.out,
+                      extra=extra, depends=a.depends)
+    if a.registry is not None:
+        if not a.token:
+            raise SystemExit("need --token for --registry upload")
+        manifest, tar = build_package(crate_dir, a.pkg, a.version, a.bin,
+                                      None, extra=extra, depends=a.depends)
+        publish_package(a.registry, a.token, a.pkg, a.version,
+                        manifest, tar, "%s.tar" % a.pkg)
     return 0
 
 
