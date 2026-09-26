@@ -12,7 +12,8 @@ description = "Demo guest program proving crates.io deps end-to-end (repeat)"
 [dependencies]
 guest-args = "0.1.0"
 guest-fmt = "0.1.0"
-user-lib = { path = "../../user-lib" }
+# v3.9+: user-lib from crates.io (0.1.1 published; was path until then).
+user-lib = "0.1.1"
 
 [profile.release]
 opt-level = "s"

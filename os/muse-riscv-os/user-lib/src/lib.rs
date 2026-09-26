@@ -7,6 +7,7 @@
 #[cfg(test)]
 extern crate std;
 
+#[cfg(target_arch = "riscv64")]
 use core::arch::asm;
 
 #[cfg(target_arch = "riscv64")]
@@ -227,6 +228,13 @@ pub fn nsenter(pid: isize) -> isize {
 /// (missing/non-dir target, bad mountpoint, table full).
 pub fn mount_vol(mp: *const u8, tgt: *const u8) -> isize {
     ecall(56, mp as usize, tgt as usize, 0)
+}
+/// v3.6: read decoded cgroup quotas into out[3]
+/// [limit_frames, cpu_pct, weight] (SYS_CGSTAT=57). Returns 0 or -1
+/// (bogus id); unset values read as detached-line defaults
+/// (mem 0, cpu 100, weight 1).
+pub fn cgstat(id: isize, out: *mut u64) -> isize {
+    ecall(57, id as usize, out as usize, 0)
 }
 pub fn getcwd(buf: *mut u8, len: usize) -> isize {
     ecall(25, buf as usize, len, 0)

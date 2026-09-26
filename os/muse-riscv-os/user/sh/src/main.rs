@@ -1536,6 +1536,53 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"ctr", b"remove", b"repeat"],
         &mut jobs,
     );
+    // v3.6: container small items (see _doc/v3.6.md §2). ftest carries
+    // quotas so ps can echo them; rm -f kills live; restart replays.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"ftest"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"run", b"-d", b"--memory", b"100000", b"--cpu", b"50", b"--weight", b"8", b"ftest", b"/bin/linger", b"30"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"ps"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"rm", b"-f", b"ftest"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"rtest"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"run", b"-d", b"rtest", b"/bin/linger", b"30"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"restart", b"rtest"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"stop", b"rtest"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"rm", b"rtest"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

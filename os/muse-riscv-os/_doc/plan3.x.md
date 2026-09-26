@@ -165,8 +165,8 @@ guest 零改動）。
 
 動機：v3.2 的 deferred 項——第一個 guest crate 上架後，證明外部
 crate 從 crates.io 下來、編進 guest 二進制、裝進系統跑起來。
-落點見 `v3.9.md`（`tools/pkgrepeat` 吃已發布的 guest-args/guest-fmt；
-user-lib 仍是 path 依賴，待其發布再切）。
+落點見 `v3.9.md`（`tools/pkgrepeat` 全依賴走 crates.io
+——含後來上架的 `user-lib` 0.1.1；update：已全切）。
 
 ## 12. v3.10+ 候選池（按需排序，不預排版號）
 

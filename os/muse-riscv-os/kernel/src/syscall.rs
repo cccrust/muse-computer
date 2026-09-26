@@ -73,6 +73,8 @@ pub const SYS_CGSETSHARE: usize = 54;
 pub const SYS_NSENTER: usize = 55;
 // v3.5: bind a host dir into the caller's view (ctr volume -v).
 pub const SYS_MOUNTVOL: usize = 56;
+// v3.6: read back decoded cgroup quotas (ctr ps).
+pub const SYS_CGSTAT: usize = 57;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -173,6 +175,7 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_CGSETSHARE => sys_cgsetshare(a0, a1 as u64) as isize,
         SYS_NSENTER => sys_nsenter(a0) as isize,
         SYS_MOUNTVOL => sys_mountvol(a0, a1) as isize,
+        SYS_CGSTAT => sys_cgstat(a0, a1) as isize,
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,
@@ -996,6 +999,36 @@ fn sys_mountvol(mp_ptr: usize, tgt_ptr: usize) -> isize {
             -1
         }
     }
+}
+
+/// v3.6: read decoded cgroup quotas into 3 user u64s
+/// [limit_frames, cpu_pct, weight]. -1 on bogus id or bad pointer
+/// (callers print detached-style defaults instead).
+fn sys_cgstat(id: usize, out_ptr: usize) -> isize {
+    if out_ptr == 0 {
+        return -1;
+    }
+    let mut out = [0u64; 3];
+    if !crate::task::cgstat(id, &mut out) {
+        return -1;
+    }
+    unsafe {
+        let dst = crate::fs::user_slice_mut(out_ptr, 24);
+        if dst.len() < 24 {
+            return -1;
+        }
+        let mut i = 0;
+        while i < 3 {
+            let b = out[i].to_le_bytes();
+            let mut k = 0;
+            while k < 8 {
+                dst[i * 8 + k] = b[k];
+                k += 1;
+            }
+            i += 1;
+        }
+    }
+    0
 }
 
 /// v2.2: create a child cgroup with a frame limit; returns id or -1.

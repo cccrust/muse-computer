@@ -138,6 +138,15 @@ pub fn cg_use(cg: usize) -> u64 {
     }
 }
 
+/// v3.6: frame cap of a cgroup (0 = unlimited). Backs SYS_CGSTAT.
+pub fn cg_lim(cg: usize) -> u64 {
+    if cg < MAX_CG {
+        ALLOC.lock().lim[cg]
+    } else {
+        0
+    }
+}
+
 pub fn frames_used() -> usize {
     let a = ALLOC.lock();
     (a.cur) as usize

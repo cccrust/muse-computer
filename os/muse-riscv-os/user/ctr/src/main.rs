@@ -366,6 +366,13 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool, q: &Quota, 
                 user_lib::print("ctr: detached state failed\n");
                 user_lib::exit(1);
             }
+            // v3.6: run-spec sidecar for `restart` (canonical argv after
+            // `run`, space-joined; restart replays it verbatim).
+            if !write_runspec(name, prog, args, q, vols, nvols) {
+                user_lib::kill(pid);
+                user_lib::print("ctr: run spec failed\n");
+                user_lib::exit(1);
+            }
             // v2.8: echo applied quotas (defaults for unset: mem=0
             // unlimited, cpu=100, weight=1). Requested==effective:
             // any failed set above already aborted the run.
@@ -941,6 +948,130 @@ fn state_path(name: &[u8], out: &mut [u8; 64]) -> usize {
     n
 }
 
+/// v3.6: write all of `s` (+ one trailing space) to `f`.
+/// False on any short write. No captures, so callers keep owning
+/// their status flags (closures would hold the borrow).
+fn putw(f: isize, s: &[u8]) -> bool {
+    let mut w = 0;
+    while w < s.len() {
+        let r = user_lib::write(f, unsafe { s.as_ptr().add(w) }, s.len() - w);
+        if r <= 0 {
+            return false;
+        }
+        w += r as usize;
+    }
+    user_lib::write(f, b" ".as_ptr(), 1) > 0
+}
+
+/// v3.6: write the run-spec sidecar `/ctr/<name>/.run`: the canonical
+/// argv after `run` (`-d`, quota flags, `-v` binds, name, prog, args),
+/// space-joined. `restart` replays it verbatim. Space-joined, not
+/// escaped: prog args containing spaces break -- the suite never uses
+/// them (see _doc/v3.6.md §1).
+fn write_runspec(
+    name: &[u8],
+    prog: &[u8],
+    args: &[&[u8]],
+    q: &Quota,
+    vols: &[VolBind],
+    nvols: usize,
+) -> bool {
+    let mut rp = [0u8; 64];
+    rp[..5].copy_from_slice(b"/ctr/");
+    rp[5..5 + name.len()].copy_from_slice(name);
+    let mut rn = 5 + name.len();
+    rp[rn..rn + 5].copy_from_slice(b"/.run");
+    rn += 5;
+    rp[rn] = 0;
+    let f = user_lib::open(rp.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
+    if f < 0 {
+        return false;
+    }
+    let mut ok = putw(f, b"-d");
+    if ok && q.mem_set {
+        let mut t = [0u8; 20];
+        let m = push_dec(&mut t, 0, q.mem_frames);
+        ok = putw(f, b"--memory") && putw(f, &t[..m]);
+    }
+    if ok && q.cpu_set {
+        let mut t = [0u8; 20];
+        let m = push_dec(&mut t, 0, q.cpu_pct);
+        ok = putw(f, b"--cpu") && putw(f, &t[..m]);
+    }
+    if ok && q.weight_set {
+        let mut t = [0u8; 20];
+        let m = push_dec(&mut t, 0, q.weight);
+        ok = putw(f, b"--weight") && putw(f, &t[..m]);
+    }
+    let mut vi = 0usize;
+    while ok && vi < nvols {
+        let mut k = 0;
+        while k < 64 && vols[vi].vol[k] != 0 {
+            k += 1;
+        }
+        let mut j = 0;
+        while j < 64 && vols[vi].cpath[j] != 0 {
+            j += 1;
+        }
+        if k == 0 || j == 0 || k + 1 + j > 127 {
+            ok = false;
+            break;
+        }
+        let mut vb = [0u8; 128];
+        vb[..k].copy_from_slice(&vols[vi].vol[..k]);
+        vb[k] = b':';
+        vb[k + 1..k + 1 + j].copy_from_slice(&vols[vi].cpath[..j]);
+        ok = putw(f, b"-v") && putw(f, &vb[..k + 1 + j]);
+        vi += 1;
+    }
+    if ok {
+        ok = putw(f, name);
+    }
+    if ok {
+        ok = putw(f, prog);
+    }
+    let mut ai = 0;
+    while ok && ai < args.len() {
+        ok = putw(f, args[ai]);
+        ai += 1;
+    }
+    // trailing newline (text hygiene; the reader trims it).
+    if ok {
+        ok = user_lib::write(f, b"\n".as_ptr(), 1) > 0;
+    }
+    user_lib::close(f);
+    ok
+}
+
+/// v3.6: read the run-spec sidecar into `out`; returns bytes read
+/// (0 = missing/empty).
+fn read_runspec(name: &[u8], out: &mut [u8; 512]) -> usize {
+    let mut rp = [0u8; 64];
+    rp[..5].copy_from_slice(b"/ctr/");
+    rp[5..5 + name.len()].copy_from_slice(name);
+    let mut rn = 5 + name.len();
+    rp[rn..rn + 5].copy_from_slice(b"/.run");
+    rn += 5;
+    rp[rn] = 0;
+    let f = user_lib::open(rp.as_ptr(), 0);
+    if f < 0 {
+        return 0;
+    }
+    let mut n = 0usize;
+    loop {
+        if n >= out.len() {
+            break;
+        }
+        let r = user_lib::read(f, unsafe { out.as_mut_ptr().add(n) }, out.len() - n);
+        if r <= 0 {
+            break;
+        }
+        n += r as usize;
+    }
+    user_lib::close(f);
+    n
+}
+
 /// write `<pid> <start> <cg> <name>\n` state; false on any I/O error.
 fn write_state(name: &[u8], pid: usize, start: usize, cg: usize) -> bool {
     let mut sp = [0u8; 64];
@@ -1107,7 +1238,12 @@ fn cmd_ps() {
         }
         let entry = &entry[..dlen];
         // state probe: non-containers (plain files) fail the open.
-        // (`rlen` = raw step length: `off` must skip the '/' too.)
+        // (`rlen` = raw step length: `off` must skip the '/' too.
+        // `len` is rebound bare below: every use under it -- the guard,
+        // the path build, the display -- means the slash-stripped name.
+        // Do NOT "clean up" the shadowing: the outer raw length would
+        // mis-size the copy and panic on every dir entry. Yes, really;
+        // v3.6 learned this the loud way.)
         let (entry, len, rlen) = (entry, dlen, len);
         let mut sp = [0u8; 64];
         if 5 + len + 5 < 63 {
@@ -1117,40 +1253,58 @@ fn cmd_ps() {
             let f = user_lib::open(sp.as_ptr(), 0);
             if f >= 0 {
                 user_lib::close(f);
-                if let Some((pid, start, _cg)) = read_state(entry) {
-                    user_lib::print("CTRPS ");
-                    let _ = user_lib::write(1, entry.as_ptr(), len);
-                    user_lib::print(" ");
-                    dbg_num(pid);
+                if let Some((pid, start, cg)) = read_state(entry) {
+                    // v3.6: the whole row goes out in ONE write (suite
+                    // greps whole lines; per-byte prints split mid-line
+                    // under concurrent exec printks -- see the v3.8
+                    // detached-line lesson). Quotas come from the live
+                    // group (dead rows: the state's group, metadata
+                    // persists; bogus id reads as detached defaults).
+                    let mut q = [0u64; 3];
+                    if user_lib::cgstat(cg as isize, q.as_mut_ptr()) != 0 {
+                        q = [0, 100, 1];
+                    }
+                    let mut b = [0u8; 192];
+                    let mut n = 0usize;
+                    n = buf_put(&mut b, n, b"CTRPS ");
+                    n = buf_put(&mut b, n, entry);
+                    n = buf_put(&mut b, n, b" ");
+                    n = push_dec(&mut b, n, pid);
                     if state_alive(pid, start) {
                         // Up seconds are for humans (time() is ms,
                         // start is ticks); never asserted, only the
                         // `Up` word is (see _doc/v2.4.md §5).
                         let now = user_lib::time().max(0) as usize;
-                        let up = now / 1000;
-                        user_lib::print(" Up ");
-                        dbg_num(up);
-                        user_lib::print("s");
+                        n = buf_put(&mut b, n, b" Up ");
+                        n = push_dec(&mut b, n, now / 1000);
+                        n = buf_put(&mut b, n, b"s");
                     } else {
                         // v2.5: dead with a retained code?
                         // reapstat returns code+0x10000, or -1 (alive-but-
                         // unreaped zombie, evicted, or never existed).
                         let rs = user_lib::reapstat(pid as isize);
                         if rs != -1 {
-                            user_lib::print(" Exited (code ");
+                            n = buf_put(&mut b, n, b" Exited (code ");
                             let code = rs - 0x10000;
                             if code < 0 {
-                                user_lib::print("-");
-                                dbg_num((0 - code) as usize);
+                                n = buf_put(&mut b, n, b"-");
+                                n = push_dec(&mut b, n, (0 - code) as usize);
                             } else {
-                                dbg_num(code as usize);
+                                n = push_dec(&mut b, n, code as usize);
                             }
-                            user_lib::print(")");
+                            n = buf_put(&mut b, n, b")");
                         } else {
-                            user_lib::print(" Exited");
+                            n = buf_put(&mut b, n, b" Exited");
                         }
                     }
-                    user_lib::print("\n");
+                    n = buf_put(&mut b, n, b" mem=");
+                    n = push_dec(&mut b, n, q[0] as usize);
+                    n = buf_put(&mut b, n, b" cpu=");
+                    n = push_dec(&mut b, n, q[1] as usize);
+                    n = buf_put(&mut b, n, b" weight=");
+                    n = push_dec(&mut b, n, q[2] as usize);
+                    n = buf_put(&mut b, n, b"\n");
+                    let _ = user_lib::write(1, b.as_ptr(), n);
                 }
             }
         }
@@ -1159,14 +1313,10 @@ fn cmd_ps() {
     }
 }
 
-fn cmd_stop(name: &[u8]) {
-    let (pid, start, cg) = match read_state(name) {
-        Some(t) => t,
-        None => {
-            user_lib::print("ctr: no such container\n");
-            user_lib::exit(1);
-        }
-    };
+/// v3.6: shared kill + reap-poll core for stop / rm -f / restart.
+/// Returns killed count (>= 0), -2 if already exited, -1 on timeout.
+/// Prints nothing; callers own the markers (and the exits).
+fn stop_kill(_name: &[u8], pid: usize, start: usize, cg: usize) -> isize {
     // v2.6: kill by cgroup when recorded (fate-sharing: children die
     // with pid1 instead of escaping to init). Legacy cg==0 (v2.4 state
     // files) keeps the old kill-pid1 path.
@@ -1174,7 +1324,7 @@ fn cmd_stop(name: &[u8]) {
     let grouped = cg > 0;
     if grouped {
         if !state_alive(pid, start) {
-            stopped_msg(name);
+            return -2;
         }
         killed = user_lib::cgkill(cg as isize);
         if killed < 0 {
@@ -1182,17 +1332,17 @@ fn cmd_stop(name: &[u8]) {
             // passed on (pid,start)... unreachable same-boot (groups are
             // never deleted), but never kill blind -- fall back to pid1.
             if user_lib::kill(pid as isize) != 0 {
-                stopped_msg(name);
+                return -2;
             }
             killed = 1;
         }
     } else {
         if !state_alive(pid, start) {
-            stopped_msg(name);
+            return -2;
         }
         if user_lib::kill(pid as isize) != 0 {
             // lost a race with exit/reap: same terminal state, same code.
-            stopped_msg(name);
+            return -2;
         }
         killed = 1;
     }
@@ -1204,18 +1354,41 @@ fn cmd_stop(name: &[u8]) {
         let gone = user_lib::pidinfo(pid as isize) == -1;
         let empty = !grouped || user_lib::cgkill(cg as isize) == 0;
         if gone && empty {
-            user_lib::print("stopped ");
-            let _ = user_lib::write(1, name.as_ptr(), name.len());
-            user_lib::print(" (killed ");
-            dbg_num(killed as usize);
-            user_lib::print(")\n");
-            user_lib::exit(0);
+            return killed;
         }
         user_lib::sleep(100); // 1s (sleep takes 10ms ticks)
         i += 1;
     }
-    user_lib::print("ctr: stop timeout\n");
-    user_lib::exit(1);
+    -1
+}
+
+fn cmd_stop(name: &[u8]) {
+    let (pid, start, cg) = match read_state(name) {
+        Some(t) => t,
+        None => {
+            user_lib::print("ctr: no such container\n");
+            user_lib::exit(1);
+        }
+    };
+    match stop_kill(name, pid, start, cg) {
+        -2 => stopped_msg(name),
+        -1 => {
+            user_lib::print("ctr: stop timeout\n");
+            user_lib::exit(1);
+        }
+        killed => {
+            // v3.8: single write (suite greps the whole line).
+            let mut b = [0u8; 96];
+            let mut n = 0usize;
+            n = buf_put(&mut b, n, b"stopped ");
+            n = buf_put(&mut b, n, name);
+            n = buf_put(&mut b, n, b" (killed ");
+            n = push_dec(&mut b, n, killed as usize);
+            n = buf_put(&mut b, n, b")\n");
+            let _ = user_lib::write(1, b.as_ptr(), n);
+            user_lib::exit(0);
+        }
+    }
 }
 
 /// shared `(already exited)` terminal print (idempotent reruns).
@@ -1279,13 +1452,34 @@ fn rm_all(path: &[u8; 64]) -> bool {
     user_lib::unlink(path.as_ptr()) == 0
 }
 
-fn cmd_rm(name: &[u8]) {
-    // refuse to delete a live container (stop first, docker-style).
+fn cmd_rm(name: &[u8], force: bool) {
+    // refuse to delete a live container (stop first, docker-style),
+    // unless -f: then stop it ourselves first.
     // A stale state (reboot, start mismatch) is NOT live: falls through.
-    if let Some((pid, start, _cg)) = read_state(name) {
+    if let Some((pid, start, cg)) = read_state(name) {
         if state_alive(pid, start) {
-            user_lib::print("ctr: running (stop first)\n");
-            user_lib::exit(1);
+            if !force {
+                user_lib::print("ctr: running (stop first)\n");
+                user_lib::exit(1);
+            }
+            match stop_kill(name, pid, start, cg) {
+                -2 => {}
+                -1 => {
+                    user_lib::print("ctr: stop timeout\n");
+                    user_lib::exit(1);
+                }
+                killed => {
+                    // v3.8: single write (suite greps the whole line).
+                    let mut b = [0u8; 96];
+                    let mut n = 0usize;
+                    n = buf_put(&mut b, n, b"stopped ");
+                    n = buf_put(&mut b, n, name);
+                    n = buf_put(&mut b, n, b" (killed ");
+                    n = push_dec(&mut b, n, killed as usize);
+                    n = buf_put(&mut b, n, b")\n");
+                    let _ = user_lib::write(1, b.as_ptr(), n);
+                }
+            }
         }
     }
     let mut root = [0u8; 64];
@@ -1302,10 +1496,115 @@ fn cmd_rm(name: &[u8]) {
         user_lib::print("ctr: rm failed\n");
         user_lib::exit(1);
     }
-    user_lib::print("removed ");
-    let _ = user_lib::write(1, name.as_ptr(), name.len());
-    user_lib::print("\n");
+    // v3.8: single write (suite greps the whole line).
+    {
+        let mut b = [0u8; 64];
+        let mut n = 0usize;
+        n = buf_put(&mut b, n, b"removed ");
+        n = buf_put(&mut b, n, name);
+        n = buf_put(&mut b, n, b"\n");
+        let _ = user_lib::write(1, b.as_ptr(), n);
+    }
     user_lib::exit(0);
+}
+
+/// v3.6: `ctr restart <name>` -- stop if alive, then re-exec
+/// `ctr run <sidecar>` (the nested run -d rewrites state + prints its
+/// own `detached` line). Exit code passes through; on 0 prints
+/// `restarted <name>` (single write, suite greps the whole line).
+fn cmd_restart(name: &[u8]) {
+    let (pid, start, cg) = match read_state(name) {
+        Some(t) => t,
+        None => {
+            user_lib::print("ctr: no such container\n");
+            user_lib::exit(1);
+        }
+    };
+    let mut spec = [0u8; 512];
+    let sn = read_runspec(name, &mut spec);
+    if sn == 0 {
+        user_lib::print("ctr: no run spec\n");
+        user_lib::exit(1);
+    }
+    if state_alive(pid, start) {
+        match stop_kill(name, pid, start, cg) {
+            -2 => {}
+            -1 => {
+                user_lib::print("ctr: stop timeout\n");
+                user_lib::exit(1);
+            }
+            _ => {}
+        }
+    }
+    // tokenize on spaces (skip empties; trailing newline trimmed).
+    // argv = ["ctr", "run", toks...], cap 16 (kernel argv limit --
+    // the original invocation faced the same cap).
+    let mut toks = [[0u8; 64]; 14];
+    let mut nt = 0usize;
+    let mut i = 0usize;
+    let mut ok = true;
+    while i < sn {
+        while i < sn && (spec[i] == b' ' || spec[i] == b'\n') {
+            i += 1;
+        }
+        if i >= sn {
+            break;
+        }
+        let mut j = i;
+        while j < sn && spec[j] != b' ' && spec[j] != b'\n' {
+            j += 1;
+        }
+        if nt >= 14 || j - i == 0 || j - i > 63 {
+            ok = false;
+            break;
+        }
+        toks[nt][..j - i].copy_from_slice(&spec[i..j]);
+        toks[nt][j - i] = 0;
+        nt += 1;
+        i = j;
+    }
+    if !ok || nt == 0 {
+        user_lib::print("ctr: bad run spec\n");
+        user_lib::exit(1);
+    }
+    let mut c0 = [0u8; 8];
+    c0[..3].copy_from_slice(b"ctr");
+    let mut r0 = [0u8; 8];
+    r0[..3].copy_from_slice(b"run");
+    let mut av: [*const u8; 17] = [core::ptr::null(); 17];
+    av[0] = c0.as_ptr();
+    av[1] = r0.as_ptr();
+    let mut k = 0;
+    while k < nt {
+        av[2 + k] = toks[k].as_ptr();
+        k += 1;
+    }
+    let cpid = user_lib::fork();
+    if cpid == 0 {
+        let mut path = [0u8; 16];
+        path[..8].copy_from_slice(b"/bin/ctr");
+        let _ = user_lib::exec(path.as_ptr(), av.as_ptr() as usize);
+        user_lib::print("ctr: exec failed\n");
+        user_lib::exit(127);
+    } else if cpid > 0 {
+        let code = wait_for(cpid);
+        if code < 0 {
+            user_lib::exit(1);
+        }
+        if code != 0 {
+            user_lib::exit(code);
+        }
+        let mut b = [0u8; 64];
+        let mut n = 0usize;
+        n = buf_put(&mut b, n, b"restarted ");
+        n = buf_put(&mut b, n, name);
+        n = buf_put(&mut b, n, b"\n");
+        let _ = user_lib::write(1, b.as_ptr(), n);
+        user_lib::exit(0);
+    } else {
+        user_lib::print("ctr: fork failed\n");
+        user_lib::exit(1);
+    }
 }
 
 // ---- v3.0: packages (`install/remove/list`, apt-style) ----
@@ -1896,7 +2195,7 @@ fn install_one(
     // resolve the version to fetch: pinned goes direct, otherwise the
     // index maximum satisfying the constraint (unconstrained = max).
     let mut target = [0u8; 32];
-    let mut targetn = 0usize;
+    let mut targetn: usize;
     match want {
         Some((w, VEXACT)) => {
             if !ver_valid(w) {
@@ -3295,7 +3594,7 @@ fn cmd_exec(name: &[u8], prog: &[u8], args: &[&[u8]]) {
 #[no_mangle]
 pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     if argc < 2 {
-        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm <name> | ctr logs <name> | ctr exec <name> <prog> [args...] | ctr install <host> <port> <pkg>[=ver] | ctr remove <pkg> | ctr list | ctr upgrade <host> <port> [<pkg>] | ctr autoremove | ctr login <token> | ctr volume create <v> | ctr volume rm <v> | ctr volume ls\n");
+        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm [-f] <name> | ctr restart <name> | ctr logs <name> | ctr exec <name> <prog> [args...] | ctr install <host> <port> <pkg>[=ver] | ctr remove <pkg> | ctr list | ctr upgrade <host> <port> [<pkg>] | ctr autoremove | ctr login <token> | ctr volume create <v> | ctr volume rm <v> | ctr volume ls\n");
         user_lib::exit(1);
     }
     let a1 = match unsafe { user_lib::argv_str(argv, 1, argc) } {
@@ -3469,9 +3768,30 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         }
         cmd_stop(name);
     } else if a1 == b"rm" {
-        // ctr rm <name>
+        // v3.6: ctr rm [-f] <name>
+        if argc != 3 && argc != 4 {
+            user_lib::print("usage: ctr rm [-f] <name>\n");
+            user_lib::exit(1);
+        }
+        let (force, name) = if argc == 4 {
+            let flag = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+            if flag != b"-f" {
+                user_lib::print("usage: ctr rm [-f] <name>\n");
+                user_lib::exit(1);
+            }
+            (true, unsafe { user_lib::argv_str(argv, 3, argc).unwrap_or(b"") })
+        } else {
+            (false, unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") })
+        };
+        if !valid_name(name) {
+            user_lib::print("ctr: bad name\n");
+            user_lib::exit(1);
+        }
+        cmd_rm(name, force);
+    } else if a1 == b"restart" {
+        // v3.6: ctr restart <name>
         if argc != 3 {
-            user_lib::print("usage: ctr rm <name>\n");
+            user_lib::print("usage: ctr restart <name>\n");
             user_lib::exit(1);
         }
         let name = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
@@ -3479,7 +3799,7 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             user_lib::print("ctr: bad name\n");
             user_lib::exit(1);
         }
-        cmd_rm(name);
+        cmd_restart(name);
     } else if a1 == b"volume" {
         // v3.5: ctr volume create <v> | ctr volume rm <v> | ctr volume ls
         if argc < 3 {

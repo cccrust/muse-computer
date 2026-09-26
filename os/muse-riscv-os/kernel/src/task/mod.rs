@@ -238,6 +238,31 @@ pub fn cg_set_share(id: usize, weight: u64) -> bool {
     true
 }
 
+/// v3.6: read back a cgroup's quotas into out[3] =
+/// [limit_frames, cpu_pct, weight], DECODED the way the `detached`
+/// line prints them (uncapped cpu reads as 100, unset weight as 1;
+/// group 0 follows the same defaults). False for bogus ids (caller
+/// prints defaults). Lock discipline: liveness under sched_lock,
+/// then lock-free atomic + frame-lock reads, never nested.
+pub fn cgstat(id: usize, out: &mut [u64; 3]) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    if id >= 256 {
+        return false;
+    }
+    {
+        let s = sched_lock();
+        if id >= s.cg.len() {
+            return false;
+        }
+    }
+    out[0] = crate::mem::frame::cg_lim(id);
+    let cap = CG_CAP[id].load(Relaxed);
+    out[1] = if cap == 0 { 100 } else { cap - 1 };
+    let share = CG_SHARE[id].load(Relaxed);
+    out[2] = if share == 0 { 1 } else { share };
+    true
+}
+
 /// v2.7: windowed vruntime of a cgroup: `win_use * 1024 / eff_weight`
 /// (unset weight reads as 1). Stale-window reads as 0 (no debt yet).
 /// Racy-relaxed like the ceiling counters: worst case a slightly-off
