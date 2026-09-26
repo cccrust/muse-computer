@@ -1514,6 +1514,28 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"ctr", b"remove", b"pubdemo"],
         &mut jobs,
     );
+    // v3.9: crates.io end-to-end (repeat's guest-args/guest-fmt come
+    // from the registry-published crates, not path; see _doc/v3.9.md).
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"repeat"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"list"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/repeat\0",
+        &[b"repeat", b"3", b"yo"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"repeat"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

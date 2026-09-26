@@ -1,0 +1,10 @@
+[package]
+name = "guest-fmt"
+version = "0.1.0"
+edition = "2021"
+description = "Allocation-free decimal/hex/octal formatting for muse-riscv-os guest programs (no_std compatible, zero deps)"
+license = "MIT"
+
+# Standalone crate (detached from the os/muse-riscv-os workspace):
+# publishable to crates.io as-is; in-tree users take it by path.
+[workspace]

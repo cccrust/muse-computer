@@ -31,7 +31,9 @@ v3.4  信任鏈          sha256 完整性 + registry 認證（見 §6）
 v3.5  volume          持久數據進出容器的正規路（見 §7）
 v3.6  容器小件收尾    ps 限額 + rm -f + restart（見 §8，spec 已定）
 v3.7  registry 常駐化 publish 上架 + 磁碟持久（見 §9）
-v3.8+ 候選池          按需排序，不預排版號（見 §10）
+v3.8  guest 函式庫     guest-args + guest-fmt 首發備料（見 §10，均已上架）
+v3.9  crates.io 閉環   外部 crate 下載→編譯→安裝→運行（見 §11）
+v3.10+ 候選池         按需排序，不預排版號（見 §12）
 ```
 
 - v3.0 是「能用」：單包安裝閉環，不碰依賴。
@@ -52,7 +54,7 @@ user/sh                 # autorun 加 install→run→remove（v3.0）
 run.sh/test.sh          # test.sh 項數見各版；registry 樁啟停沿用 v2.3
 user-lib                # 發布到 crates.io（v3.2 前提；v3.0 不動）
 ```
-v3.3+ 增量見 §5–§9（多版本路由、sha256、`/vol/`、sidecar、publish）。
+v3.3+ 增量見 §5–§11（多版本路由、sha256、`/vol/`、sidecar、publish、guest 庫、閉環）。
 
 ## 3. 包格式（v3.0 定，後版只加行）
 
@@ -152,7 +154,21 @@ hardlink 與整盤持久」。包（v3.x）和容器（v2.x）都齊了，數據
 重啟還在。落點見 `v3.7.md`（磁碟佈局 + PUT 上架 + index 生成；
 guest 零改動）。
 
-## 10. v3.8+ 候選池（按需排序，不預排版號）
+## 10. v3.8：guest 函式庫（guest-args + guest-fmt）
+
+動機：管線能編 binary，但 crates.io 上零個 guest 包——先放兩個
+真正有用的 library（argv 解析 + 無分配格式化，in-tree 手刻 N 遍的
+收攏）。落點見 `v3.8.md`（獨立 crate + host 向量 + mirror 紀律；
+`cargo publish` 由主人執行，兩包皆已上架）。
+
+## 11. v3.9：crates.io 端到端閉環
+
+動機：v3.2 的 deferred 項——第一個 guest crate 上架後，證明外部
+crate 從 crates.io 下來、編進 guest 二進制、裝進系統跑起來。
+落點見 `v3.9.md`（`tools/pkgrepeat` 吃已發布的 guest-args/guest-fmt；
+user-lib 仍是 path 依賴，待其發布再切）。
+
+## 12. v3.10+ 候選池（按需排序，不預排版號）
 
 - 容器小件：`ps` 顯示限額（v2.8 欠賬）、`rm -f`、`restart`、
   `KB/MB` 別名（v2.8 說不加，要加也是小版）。

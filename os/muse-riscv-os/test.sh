@@ -6,6 +6,9 @@ PASS=1
 
 echo "=== 1. host unit tests ==="
 cargo test -p kernel -p host-tests -p mkfs -p user-lib || PASS=0
+# v3.8: standalone guest-lib crates (own [workspace], not -p addressable)
+(cd user-lib/guest-args && cargo test) || PASS=0
+(cd user-lib/guest-fmt && cargo test) || PASS=0
 
 echo "=== 2. build user ELFs ==="
 cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver -p crashwrite -p ping -p nslookup -p wget -p curl -p ctr -p sleeper -p linger -p chroot_test -p nstest -p cgtest || PASS=0
@@ -206,6 +209,10 @@ check "vol-removed data1"
 check "pkg-installed pubdemo 1.0"
 check "fortune-sez hello-from-pub"
 check "pkg-removed pubdemo"
+check "pkg-installed repeat 1.0"
+check "PKGLS repeat 1.0"
+check "3 yo"
+check "pkg-removed repeat"
 check "CTRPS life"
 check "Up"
 check "stopped life"

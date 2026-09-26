@@ -36,10 +36,16 @@ qemu-system-riscv64 -machine virt -smp 4 -nographic -bios default -kernel kernel
 
 - blk stays on `virtio-mmio-bus.0`, net pinned to `bus.1`.
 - Background/piped QEMU **must** get `< /dev/null` or it goes silent (see `test.sh` note). Prompt-gated runs poll for `^sh\$ ` / `redirenv PASS`, never fixed sleeps — autorun length varies with host load.
+- Suite markers must print in a SINGLE `write()` call: the console lock
+  covers one syscall at a time, and a forked child exec-prints
+  concurrently on another hart — per-byte prints split mid-line and
+  whole-line greps fail (seen twice on the `detached` line).
 
 ## Verify
 
 - Fast gate first: `cargo test -p kernel -p host-tests -p mkfs -p user-lib`
+  plus `cargo test` inside `user-lib/guest-args/` and `user-lib/guest-fmt/`
+  (standalone crates, not `-p` addressable)
 - Full suite `./test.sh` is expensive (11 QEMU boots, 10+ min, `qemu.log`-`qemu7.log` assertions). Needs `qemu-system-riscv64`, `rust-objcopy`, `python3` (stub servers in `tools/`), `timeout`/`gtimeout`. Same-spot wedge twice under light load = real bug; do not just raise timeouts.
 
 ## Add a user program — 3 touches

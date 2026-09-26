@@ -33,7 +33,7 @@ Standard SBI Extensions     : time,rfnc,ipi,base,hsm,srst,pmu,dbcn,fwft,legacy,d
 Experimental SBI Extensions : none
 
 Domain0 Name                : root
-Domain0 Boot HART           : 1
+Domain0 Boot HART           : 2
 Domain0 HARTs               : 0*,1*,2*,3*
 Domain0 Region00            : 0x0000000000100000-0x0000000000100fff M: (I,R,W) S/U: (R,W)
 Domain0 Region01            : 0x0000000010000000-0x0000000010000fff M: (I,R,W) S/U: (R,W)
@@ -49,7 +49,7 @@ Domain0 Next Mode           : S-mode
 Domain0 SysReset            : yes
 Domain0 SysSuspend          : yes
 
-Boot HART ID                : 1
+Boot HART ID                : 2
 Boot HART Domain            : root
 Boot HART Priv Version      : v1.12
 Boot HART Base ISA          : rv64imafdch
@@ -74,7 +74,7 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [MM] mmio mapped, activating...
 [MM] activated
 [MMU] SV39 enabled (satp MODE=8, 3-level)
-[PLIC] hart1 ctx irq10+virtio1-8 enabled
+[PLIC] hart2 ctx irq10+virtio1-8 enabled
 [PLIC] uart irq10 + virtio irq1-8 enabled
 [TRAP] stvec set
 [TIMER] enabled (10ms tick)
@@ -88,16 +88,16 @@ Boot HART MEDELEG           : 0x0000000000f4b509
 [FS] fsck: bitmap rebuilt
 [PROC] init pid=1
 [PROC] spawn init
-[SMP] boot hart1
-[SMP] hart1 up
+[SMP] boot hart2
+[SMP] hart2 up
 [SMP] hart0 starting
-[SMP] hart2 starting
+[SMP] hart1 starting
 [SMP] hart3 starting
 [PLIC] hart0 ctx irq10+virtio1-8 enabled
-[PLIC] hart2 ctx irq10+virtio1-8 enabled
+[PLIC] hart1 ctx irq10+virtio1-8 enabled
 [SMP] hart0 up
+[SMP] hart1 up
 [PLIC] hart3 ctx irq10+virtio1-8 enabled
-[SMP] hart2 up
 [SMP] hart3 up
 [DBG] soft hart=0 n=0 sip=0x202->0x200
 [TEST] ipi PASS
@@ -190,13 +190,13 @@ echo: hi from unix-v6
 [PROC] fork pid=11 -> child=13
 [PROC] fork pid=11 -> child=14
 [PROC] fork pid=11 -> child=15
-[smp] child on hart 2->2
+[smp] child on hart 0->0
 [PROC] pid=12 exited(40)
-[smp] child on hart 2->2
+[smp] child on hart 3->3
 [PROC] pid=13 exited(41)
-[smp] child on hart 2->2
+[smp] child on hart 3->3
 [PROC] pid=14 exited(42)
-[smp] child on hart 2->2
+[smp] child on hart 3->3
 [PROC] pid=15 exited(43)
 [TEST] smp PASS
 [PROC] pid=11 exited(0)
@@ -213,11 +213,11 @@ echo: hi from unix-v6
 [PROC] fork pid=18 -> child=21
 [PROC] fork pid=18 -> child=22
 [PROC] fork pid=19 -> child=23
-[PROC] pid=23 exited(50)
-[PROC] pid=19 exited(40)
 [PROC] pid=20 exited(41)
+[PROC] pid=23 exited(50)
 [PROC] pid=22 exited(43)
 [PROC] pid=21 exited(42)
+[PROC] pid=19 exited(40)
 [TEST] ns PASS
 [PROC] pid=18 exited(0)
 [PROC] fork pid=2 -> child=24
@@ -240,22 +240,22 @@ echo: hi from unix-v6
 [PROC] fork pid=24 -> child=39
 [PROC] fork pid=24 -> child=40
 [PROC] fork pid=24 -> child=41
-[PROC] pid=38 exited(77)
-[PROC] pid=40 exited(77)
-[PROC] pid=39 exited(77)
 [PROC] pid=41 exited(77)
-[PROC] pid=26 exited(10)
-[PROC] pid=35 exited(19)
-[PROC] pid=36 exited(20)
-[PROC] pid=29 exited(13)
-[PROC] pid=27 exited(11)
+[PROC] pid=39 exited(77)
+[PROC] pid=40 exited(77)
+[PROC] pid=38 exited(77)
 [PROC] pid=33 exited(17)
-[PROC] pid=31 exited(15)
-[PROC] pid=28 exited(12)
-[PROC] pid=32 exited(16)
-[PROC] pid=37 exited(21)
 [PROC] pid=34 exited(18)
+[PROC] pid=36 exited(20)
+[PROC] pid=32 exited(16)
 [PROC] pid=30 exited(14)
+[PROC] pid=26 exited(10)
+[PROC] pid=27 exited(11)
+[PROC] pid=35 exited(19)
+[PROC] pid=37 exited(21)
+[PROC] pid=31 exited(15)
+[PROC] pid=29 exited(13)
+[PROC] pid=28 exited(12)
 [PROC] fork pid=24 -> child=42
 [PROC] fork pid=24 -> child=43
 [PROC] fork pid=24 -> child=44
@@ -264,14 +264,14 @@ echo: hi from unix-v6
 [PROC] fork pid=24 -> child=47
 [PROC] fork pid=24 -> child=48
 [PROC] fork pid=24 -> child=49
-[PROC] pid=44 exited(32)
-[PROC] pid=43 exited(31)
 [PROC] pid=45 exited(33)
+[PROC] pid=43 exited(31)
 [PROC] pid=46 exited(55)
-[PROC] pid=42 exited(30)
 [PROC] pid=48 exited(55)
-[PROC] pid=47 exited(55)
 [PROC] pid=49 exited(55)
+[PROC] pid=47 exited(55)
+[PROC] pid=44 exited(32)
+[PROC] pid=42 exited(30)
 [PROC] fork pid=24 -> child=50
 [PROC] pid=50 exited(0)
 [PROC] fork pid=24 -> child=51
@@ -1126,18 +1126,18 @@ echo: hi from unix-v6
 [PROC] fork pid=2 -> child=472
 [PROC] fork pid=2 -> child=473
 [PROC] exec pid=472 -> /bin/webserver (argc=0)
-[NET] webserver listening on :80
 [PROC] exec pid=473 -> /bin/udpping (argc=0)
-[DBG] soft hart=1 n=0 sip=0x2->0x0
-[DBG] soft hart=0 n=1 sip=0x2->0x0
+[NET] webserver listening on :80
 [DBG] soft hart=3 n=0 sip=0x2->0x0
-[DBG] soft hart=1 n=1 sip=0x2->0x0
-[DBG] soft hart=0 n=2 sip=0x2->0x0
-[DBG] soft hart=1 n=2 sip=0x2->0x0
 [DBG] soft hart=2 n=0 sip=0x2->0x0
+[DBG] soft hart=0 n=1 sip=0x2->0x0
 [DBG] soft hart=2 n=1 sip=0x2->0x0
+[DBG] soft hart=0 n=2 sip=0x2->0x0
+[DBG] soft hart=1 n=0 sip=0x2->0x0
 [DBG] soft hart=3 n=1 sip=0x2->0x0
+[DBG] soft hart=1 n=1 sip=0x2->0x0
 [DBG] soft hart=2 n=2 sip=0x2->0x0
+[DBG] soft hart=1 n=2 sip=0x2->0x0
 [DBG] soft hart=3 n=2 sip=0x2->0x0
 [TEST] net FAIL
 [PROC] pid=473 exited(0)
@@ -1183,14 +1183,14 @@ ready /ctr/life
 [PROC] exec pid=484 -> /ctr/life/bin/linger (argc=2)
 detached 484 mem=100000 cpu=50 weight=8
 [PROC] pid=483 exited(0)
-[PROC] fork pid=484 -> child=485
-[PROC] fork pid=2 -> child=486
-[PROC] exec pid=486 -> /bin/ctr (argc=7)
-[PROC] fork pid=486 -> child=487
+[PROC] fork pid=2 -> child=485
+[PROC] fork pid=484 -> child=486
+[PROC] exec pid=485 -> /bin/ctr (argc=7)
+[PROC] fork pid=485 -> child=487
 [PROC] exec pid=487 -> /ctr/life/bin/sleeper (argc=2)
 ctr: exec failed
 [PROC] pid=487 exited(127)
-[PROC] pid=486 exited(127)
+[PROC] pid=485 exited(127)
 [PROC] fork pid=2 -> child=488
 [PROC] exec pid=488 -> /bin/ctr (argc=5)
 [PROC] fork pid=488 -> child=489
@@ -1202,14 +1202,14 @@ hello-from-exec
 [PROC] fork pid=2 -> child=490
 [PROC] exec pid=490 -> /bin/ctr (argc=2)
 CTRPS NAME PID STATUS
-CTRPS life 484 Up 45s
+CTRPS life 484 Up 47s
 [PROC] pid=490 exited(0)
 [PROC] fork pid=2 -> child=491
 [PROC] exec pid=491 -> /bin/ctr (argc=3)
 [PROC] pid=484 killed
 [PROC] pid=484 exited(-9)
-[PROC] pid=485 killed
-[PROC] pid=485 exited(-9)
+[PROC] pid=486 killed
+[PROC] pid=486 exited(-9)
 stopped life (killed 2)
 [PROC] pid=491 exited(0)
 [PROC] fork pid=2 -> child=492
@@ -1228,9 +1228,9 @@ ready /ctr/logtest
 [PROC] fork pid=2 -> child=495
 [PROC] exec pid=495 -> /bin/ctr (argc=6)
 [PROC] fork pid=495 -> child=496
-[PROC] exec pid=496 -> /ctr/logtest/bin/echo (argc=2)
 detached 496 mem=0 cpu=100 weight=1
 [PROC] pid=495 exited(0)
+[PROC] exec pid=496 -> /ctr/logtest/bin/echo (argc=2)
 [PROC] pid=496 exited(0)
 [PROC] fork pid=2 -> child=497
 [PROC] exec pid=497 -> /bin/ctr (argc=3)
@@ -1453,30 +1453,49 @@ PKGLS NAME VERSION
 ctr: not installed
 [PROC] pid=552 exited(1)
 [PROC] fork pid=2 -> child=553
-[PROC] exec pid=553 -> /bin/persist (argc=0)
-[TEST] persist READ PASS
-[PROC] pid=553 exited(0)
-[PROC] fork pid=2 -> child=554
-[PROC] exec pid=554 -> /bin/cat (argc=2)
-PERSIST-v0.2-0123456789abcdef[TEST] cat ARG PASS
-[PROC] pid=554 exited(0)
+[PROC] exec pid=553 -> /bin/ctr (argc=5)
+[PROC] fork pid=553 -> child=554
+[PROC] exec pid=554 -> /bin/wget (argc=6)
+[TEST] wget FAIL (send)
+[PROC] pid=554 exited(1)
+ctr: pkg fetch failed (index)
+[PROC] pid=553 exited(1)
 [PROC] fork pid=2 -> child=555
-[PROC] exec pid=555 -> /bin/echo (argc=2)
-hello-arg
-[TEST] echo PASS
+[PROC] exec pid=555 -> /bin/ctr (argc=2)
+PKGLS NAME VERSION
 [PROC] pid=555 exited(0)
 [PROC] fork pid=2 -> child=556
-[bg] pipe_test &
-[PROC] exec pid=556 -> /bin/pipe_test (argc=0)
+[PROC] exec pid=556 -> /bin/repeat (argc=3)
+[PROC] pid=556 exited(-1)
 [PROC] fork pid=2 -> child=557
-[PROC] exec pid=557 -> /bin/ls (argc=1)
-[PROC] fork pid=556 -> child=558
+[PROC] exec pid=557 -> /bin/ctr (argc=3)
+ctr: not installed
+[PROC] pid=557 exited(1)
+[PROC] fork pid=2 -> child=558
+[PROC] exec pid=558 -> /bin/persist (argc=0)
+[TEST] persist READ PASS
 [PROC] pid=558 exited(0)
-[TEST] pipe PASS
-[PROC] pid=556 exited(0)
+[PROC] fork pid=2 -> child=559
+[PROC] exec pid=559 -> /bin/cat (argc=2)
+PERSIST-v0.2-0123456789abcdef[TEST] cat ARG PASS
+[PROC] pid=559 exited(0)
+[PROC] fork pid=2 -> child=560
+[PROC] exec pid=560 -> /bin/echo (argc=2)
+hello-arg
+[TEST] echo PASS
+[PROC] pid=560 exited(0)
+[PROC] fork pid=2 -> child=561
+[bg] pipe_test &
+[PROC] fork pid=2 -> child=562
+[PROC] exec pid=561 -> /bin/pipe_test (argc=0)
+[PROC] exec pid=562 -> /bin/ls (argc=1)
 /:
+[PROC] fork pid=561 -> child=563
 bin/
-README ok
+README[PROC] pid=563 exited(0)
+[TEST] pipe PASS
+ ok[PROC] pid=561 exited(0)
+
 ctrtest/
 dl.txt ok
 tmp/
@@ -1515,99 +1534,99 @@ cgtest ok
 ping ok
 [TEST] fstat PASS
 [TEST] ls PASS
-[PROC] pid=557 exited(0)
+[PROC] pid=562 exited(0)
 [bg] done
 [TEST] bg PASS
 [TEST] sleep PASS
-[PROC] fork pid=2 -> child=559
-[PROC] pid=559 killed
-[PROC] pid=559 exited(-9)
+[PROC] fork pid=2 -> child=564
+[PROC] pid=564 killed
+[PROC] pid=564 exited(-9)
 [TEST] kill PASS
 [TEST] chdir PASS
 [TEST] append PASS
 [TEST] dup2 PASS
 [TEST] lseek PASS
-[PROC] fork pid=2 -> child=560
-[PROC] pid=560 exited(42)
+[PROC] fork pid=2 -> child=565
+[PROC] pid=565 exited(42)
 [TEST] waitpid PASS
 [TEST] df PASS
 [TEST] time PASS
-[PROC] fork pid=2 -> child=561
-[PROC] fork pid=561 -> child=562
-[PROC] execve pid=562 -> /bin/echo (argc=2 envc=0)
-[PROC] pid=562 exited(0)
-[PROC] pid=561 exited(0)
+[PROC] fork pid=2 -> child=566
+[PROC] fork pid=566 -> child=567
+[PROC] execve pid=567 -> /bin/echo (argc=2 envc=0)
+[PROC] pid=567 exited(0)
+[PROC] pid=566 exited(0)
 [TEST] quote PASS
-[PROC] fork pid=2 -> child=563
-[PROC] fork pid=563 -> child=564
-[PROC] execve pid=564 -> /bin/echo (argc=2 envc=1)
-[PROC] pid=564 exited(0)
-[PROC] pid=563 exited(0)
+[PROC] fork pid=2 -> child=568
+[PROC] fork pid=568 -> child=569
+[PROC] execve pid=569 -> /bin/echo (argc=2 envc=1)
+[PROC] pid=569 exited(0)
+[PROC] pid=568 exited(0)
 [TEST] env PASS
-[PROC] fork pid=2 -> child=565
+[PROC] fork pid=2 -> child=570
 [bg] started
-[PROC] execve pid=565 -> /bin/echo (argc=2 envc=1)
+[PROC] execve pid=570 -> /bin/echo (argc=2 envc=1)
 hi
 [TEST] echo PASS
-[PROC] pid=565 exited(0)
+[PROC] pid=570 exited(0)
 [bg] done
 [TEST] fg PASS
 [TEST] history PASS
-[PROC] fork pid=2 -> child=566
-[PROC] fork pid=566 -> child=567
-[PROC] execve pid=567 -> /bin/ps (argc=1 envc=1)
-[PROC] execve pid=567 -> /ps (argc=1 envc=1)
-[PROC] pid=567 exited(0)
-[PROC] pid=566 exited(0)
+[PROC] fork pid=2 -> child=571
+[PROC] fork pid=571 -> child=572
+[PROC] execve pid=572 -> /bin/ps (argc=1 envc=1)
+[PROC] execve pid=572 -> /ps (argc=1 envc=1)
+[PROC] pid=572 exited(0)
+[PROC] pid=571 exited(0)
 [TEST] ps PASS
 [STRACE] pid=2 id=12 a0=0 ret=2
 [STRACE] pid=2 id=33 a0=2 ret=0
 [TEST] strace DONE
-[PROC] fork pid=2 -> child=568
-[PROC] fork pid=568 -> child=569
-[PROC] execve pid=569 -> /bin/echo (argc=3 envc=1)
-[PROC] pid=569 exited(0)
-[PROC] pid=568 exited(0)
-[PROC] fork pid=2 -> child=570
-[PROC] fork pid=570 -> child=571
-[PROC] execve pid=571 -> /bin/echo (argc=2 envc=1)
-[PROC] pid=571 exited(0)
-[PROC] pid=570 exited(0)
-[TEST] glob PASS
-[PROC] fork pid=2 -> child=572
-[PROC] fork pid=572 -> child=573
-[PROC] execve pid=573 -> /bin/printenv (argc=2 envc=2)
-[PROC] pid=573 exited(0)
-[PROC] pid=572 exited(0)
-[TEST] envp PASS
-[PROC] fork pid=2 -> child=574
-[PROC] fork pid=574 -> child=575
-[PROC] execve pid=575 -> /bin/echo (argc=2 envc=3)
-[PROC] pid=575 exited(0)
+[PROC] fork pid=2 -> child=573
+[PROC] fork pid=573 -> child=574
+[PROC] execve pid=574 -> /bin/echo (argc=3 envc=1)
 [PROC] pid=574 exited(0)
-[PROC] fork pid=2 -> child=576
-[PROC] fork pid=576 -> child=577
-[PROC] execve pid=577 -> /bin/cat (argc=2 envc=3)
-[PROC] pid=577 exited(0)
+[PROC] pid=573 exited(0)
+[PROC] fork pid=2 -> child=575
+[PROC] fork pid=575 -> child=576
+[PROC] execve pid=576 -> /bin/echo (argc=2 envc=1)
 [PROC] pid=576 exited(0)
+[PROC] pid=575 exited(0)
+[TEST] glob PASS
+[PROC] fork pid=2 -> child=577
+[PROC] fork pid=577 -> child=578
+[PROC] execve pid=578 -> /bin/printenv (argc=2 envc=2)
+[PROC] pid=578 exited(0)
+[PROC] pid=577 exited(0)
+[TEST] envp PASS
+[PROC] fork pid=2 -> child=579
+[PROC] fork pid=579 -> child=580
+[PROC] execve pid=580 -> /bin/echo (argc=2 envc=3)
+[PROC] pid=580 exited(0)
+[PROC] pid=579 exited(0)
+[PROC] fork pid=2 -> child=581
+[PROC] fork pid=581 -> child=582
+[PROC] execve pid=582 -> /bin/cat (argc=2 envc=3)
+[PROC] pid=582 exited(0)
+[PROC] pid=581 exited(0)
 [TEST] redirenv PASS
 sh$ [TEST] uart-tx-irq PASS
-[TTY] Ctrl-C -> kill fg
 [PROC] pid=2 killed
+[TTY] Ctrl-C -> kill fg
 [PROC] pid=2 exited(130)
 [USER] init: sh exited, respawn
-[PROC] fork pid=1 -> child=578
-[PROC] exec pid=578 -> /bin/sh (argc=2)
+[PROC] fork pid=1 -> child=583
+[PROC] exec pid=583 -> /bin/sh (argc=2)
 [USER] sh: Unix-v6 like shell. try: ls, cat /README, echo hi | grep hi, usertests
 [USER] sh: builtins: cd pwd df jobs fg kill halt export unset env chroot unshare; quotes + $VAR + history
 sh$ halt
 sh: draining jobs
 sh: halting
 [SYS] shutdown
-[FS] cache stats hits=137475 miss=15951 dev_rd=31691 dev_wr=4557
+[FS] cache stats hits=140173 miss=16609 dev_rd=33002 dev_wr=4560
 [FS] marked clean
-[SMP] steals=863
-[SMP] contention sched=12255468/1298086
+[SMP] steals=1340
+[SMP] contention sched=13373076/1322652
 [MM] heap free=7007658 largest=5702698
 [CG] groups=3
 [NS] ns=5

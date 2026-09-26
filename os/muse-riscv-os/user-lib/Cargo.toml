@@ -6,3 +6,6 @@ edition = "2021"
 # NOTE: not yet published (needs an account token; see _doc/v3.2.md).
 description = "Raw syscall wrappers for muse-riscv-os guest programs (riscv64, custom ecall ABI, no_std)"
 license = "MIT"
+# v3.8: guest-* are sibling standalone crates (own [workspace]), not
+# part of this package's published files.
+exclude = ["guest-args/", "guest-fmt/"]

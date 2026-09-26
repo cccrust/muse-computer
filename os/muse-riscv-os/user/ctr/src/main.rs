@@ -366,18 +366,26 @@ fn cmd_run(name: &[u8], prog: &[u8], args: &[&[u8]], detached: bool, q: &Quota, 
                 user_lib::print("ctr: detached state failed\n");
                 user_lib::exit(1);
             }
-            user_lib::print("detached ");
-            dbg_num(pid as usize);
             // v2.8: echo applied quotas (defaults for unset: mem=0
             // unlimited, cpu=100, weight=1). Requested==effective:
             // any failed set above already aborted the run.
-            user_lib::print(" mem=");
-            dbg_num(if q.mem_set { q.mem_frames } else { 0 });
-            user_lib::print(" cpu=");
-            dbg_num(if q.cpu_set { q.cpu_pct } else { 100 });
-            user_lib::print(" weight=");
-            dbg_num(if q.weight_set { q.weight } else { 1 });
-            user_lib::print("\n");
+            // v3.8: single write (no interleave): the forked child
+            // exec-prints concurrently on another hart, and the console
+            // lock only covers one write() at a time -- per-byte dbg_num
+            // splits mid-line (`cpu=` + `[PROC]` + `50 weight=8` across
+            // two lines), breaking the suite's whole-line greps.
+            let mut db = [0u8; 96];
+            let mut dn = 0usize;
+            dn = buf_put(&mut db, dn, b"detached ");
+            dn = push_dec(&mut db, dn, pid as usize);
+            dn = buf_put(&mut db, dn, b" mem=");
+            dn = push_dec(&mut db, dn, if q.mem_set { q.mem_frames } else { 0 });
+            dn = buf_put(&mut db, dn, b" cpu=");
+            dn = push_dec(&mut db, dn, if q.cpu_set { q.cpu_pct } else { 100 });
+            dn = buf_put(&mut db, dn, b" weight=");
+            dn = push_dec(&mut db, dn, if q.weight_set { q.weight } else { 1 });
+            dn = buf_put(&mut db, dn, b"\n");
+            let _ = user_lib::write(1, db.as_ptr(), dn);
             user_lib::exit(0);
         }
         // stdio inherited; no setfg (fg job control stays shell-side).
@@ -889,6 +897,14 @@ fn parse_dec(b: &[u8]) -> Option<usize> {
         return None;
     }
     Some(v)
+}
+
+/// bytes append into a stack buffer; returns new length (saturating,
+/// never NUL-terminates -- for composing single-write log lines).
+fn buf_put(buf: &mut [u8], mut n: usize, s: &[u8]) -> usize {
+    let m = s.len().min(buf.len().saturating_sub(n));
+    buf[n..n + m].copy_from_slice(&s[..m]);
+    n + m
 }
 
 /// decimal append into a stack buffer; returns new length (saturating).

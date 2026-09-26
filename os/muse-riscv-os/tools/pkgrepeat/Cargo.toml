@@ -1,0 +1,25 @@
+[package]
+name = "repeat"
+version = "1.0.0"
+edition = "2021"
+description = "Demo guest program proving crates.io deps end-to-end (repeat)"
+
+# Standalone crate (detached from the os/muse-riscv-os workspace):
+# guest-args/guest-fmt come from crates.io (not path) -- that is the
+# v3.9 point. user-lib stays a path dep until it is published.
+[workspace]
+
+[dependencies]
+guest-args = "0.1.0"
+guest-fmt = "0.1.0"
+user-lib = { path = "../../user-lib" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = "s"
+panic = "abort"

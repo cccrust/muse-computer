@@ -20,6 +20,8 @@ tools/pkgbuild.py (the crates.io-pipeline demo: a real out-of-tree
 guest crate, never through the workspace build). A build failure
 leaves /pkg/fortune/* unregistered (404) and loud on stderr --
 the suite then fails visibly, never silently.
+v3.9: + repeat, same pattern from tools/pkgrepeat/ (whose
+guest-args/guest-fmt deps resolve from crates.io, not path).
 
 The layer is packed at startup with stdlib `tarfile` in USTAR_FORMAT
 (the guest untar only understands ustar regular/dir entries). bin/echo
@@ -417,6 +419,24 @@ def main() -> None:
         ROUTES[b"/pkg/fortune/1.0/fortune.tar"] = ftar
         ROUTES[b"/pkg/fortune/index"] = PKG_SINGLE_INDEX
         print("img_registry: pkg fortune 1.0 versioned + index", flush=True)
+    # v3.9: repeat via the crates.io pipeline (tools/pkgrepeat eats the
+    # published guest-args/guest-fmt; user-lib stays a path dep).
+    try:
+        import pkgbuild
+        rdemo_dir = os.path.join(ROOT, "tools", "pkgrepeat")
+        rmanifest, rtar = pkgbuild.build_package(
+            rdemo_dir, "repeat", "1.0", "repeat")
+        print("img_registry: pkg repeat 1.0 = manifest (%dB) + repeat.tar (%dB) [crates.io]"
+              % (len(rmanifest), len(rtar)), flush=True)
+    except Exception as e:
+        print("img_registry: REPEAT BUILD FAILED (%r); /pkg/repeat/* will 404"
+              % (e,), flush=True)
+        rmanifest, rtar = None, None
+    if rmanifest is not None:
+        ROUTES[b"/pkg/repeat/1.0/manifest"] = rmanifest
+        ROUTES[b"/pkg/repeat/1.0/repeat.tar"] = rtar
+        ROUTES[b"/pkg/repeat/index"] = PKG_SINGLE_INDEX
+        print("img_registry: pkg repeat 1.0 versioned + index", flush=True)
     # v3.7: disk-published packages (survive restarts; win over builtins).
     load_disk()
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
