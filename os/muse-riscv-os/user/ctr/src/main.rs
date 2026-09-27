@@ -2574,6 +2574,88 @@ fn verify_tars(nl: usize, hex: &[u8]) -> bool {
     true
 }
 
+/// v3.13: staging dirs are `<name>.new`; forbid the suffix in package
+/// names so staging can never collide with a real store.
+fn is_staging_name(name: &[u8]) -> bool {
+    name.len() >= 4 && &name[name.len() - 4..] == b".new"
+}
+
+/// v3.13: does entry `name` exist directly under dir `dirpath`?
+/// (Parent-listing probe -- getdents returns 0, not -1, for missing
+/// paths; same reason as vol_exists.)
+fn dir_has(dirpath: &[u8], name: &[u8]) -> bool {
+    let mut names = [[0u8; 64]; 32];
+    let nn = dir_names(dirpath, &mut names);
+    let mut k = 0usize;
+    while k < nn {
+        let mut nlen = 0;
+        while nlen < 64 && names[k][nlen] != 0 {
+            nlen += 1;
+        }
+        if nlen == name.len() && &names[k][..nlen] == name {
+            return true;
+        }
+        k += 1;
+    }
+    false
+}
+
+/// v3.13: build `/pkg/<pkg>.new` staging path (NUL-terminated).
+/// Caller guarantees pkg fits (valid_name <24, so rootn <= 32).
+fn staging_path(pkg: &[u8], out: &mut [u8; 64]) -> usize {
+    out[..5].copy_from_slice(b"/pkg/");
+    out[5..5 + pkg.len()].copy_from_slice(pkg);
+    let mut n = 5 + pkg.len();
+    out[n..n + 4].copy_from_slice(b".new");
+    n += 4;
+    out[n] = 0;
+    n
+}
+
+/// v3.13: move staged files into the live store (per-file link+unlink
+/// on the same FS: no single file is ever torn; at worst a mid-move
+/// crash duplicates an inode across both dirs, which the next install
+/// of the same package clears with the staging dir).
+/// Creates parent dirs as needed. False on any failure.
+fn commit_staged(
+    sroot: &[u8; 64],
+    srootn: usize,
+    root: &[u8; 64],
+    rootn: usize,
+    names: &[[u8; 128]; 64],
+    nn: usize,
+) -> bool {
+    let mut k = 0;
+    while k < nn {
+        let mut nlen = 0;
+        while nlen < 128 && names[k][nlen] != 0 {
+            nlen += 1;
+        }
+        let rel = &names[k][..nlen];
+        if !mkdir_parents(root, rootn, rel, false) {
+            return false;
+        }
+        let mut sp = [0u8; 128];
+        let mut lp = [0u8; 128];
+        if srootn + 1 + nlen > 127 || rootn + 1 + nlen > 127 {
+            return false;
+        }
+        sp[..srootn].copy_from_slice(&sroot[..srootn]);
+        sp[srootn] = b'/';
+        sp[srootn + 1..srootn + 1 + nlen].copy_from_slice(rel);
+        lp[..rootn].copy_from_slice(&root[..rootn]);
+        lp[rootn] = b'/';
+        lp[rootn + 1..rootn + 1 + nlen].copy_from_slice(rel);
+        user_lib::unlink(lp.as_ptr());
+        if user_lib::link(sp.as_ptr(), lp.as_ptr()) != 0 {
+            return false;
+        }
+        user_lib::unlink(sp.as_ptr());
+        k += 1;
+    }
+    true
+}
+
 /// unpack + link + db for an already-resolved package (deps done).
 /// mb is the fetched manifest (a copy is stored for remove's
 /// needed-by scan). Post-unpack failures roll the store back
@@ -2581,6 +2663,9 @@ fn verify_tars(nl: usize, hex: &[u8]) -> bool {
 /// cmd_install exits); failures exit loud and abort the whole tree --
 /// a dep must never exit(0) out from under its parent (v3.1 lesson:
 /// the shared exit killed the parent's own install).
+/// v3.13: unpacks into a staging dir and commits (db-last ordering);
+/// a kill -9 mid-install leaves only an unreferenced staging dir,
+/// cleared by the next install of the same package.
 fn install_layers(
     host: &[u8],
     port: &[u8],
@@ -2593,13 +2678,38 @@ fn install_layers(
     manual: bool,
     sha: &[u8],
 ) {
+    if is_staging_name(pkg) {
+        user_lib::print("ctr: bad name\n");
+        user_lib::exit(1);
+    }
     let mut root = [0u8; 64];
     root[..5].copy_from_slice(b"/pkg/");
     root[5..5 + pkg.len()].copy_from_slice(pkg);
     let rootn = 5 + pkg.len();
-    mkdir_p(&root);
-    let rollback = |root: &[u8; 64]| -> ! {
-        rm_all(root);
+    let mut sroot = [0u8; 64];
+    let srootn = staging_path(pkg, &mut sroot);
+    // v3.13: self-heal residue, then exclusive create (mkdir itself is
+    // atomic: a concurrent same-package installer either wins the dir
+    // or refuses below -- never a shared torn staging).
+    rm_all(&sroot);
+    if user_lib::mkdir(sroot.as_ptr()) != 0 {
+        // staging name for the parent-listing probe.
+        let mut snm = [0u8; 64];
+        snm[..pkg.len()].copy_from_slice(pkg);
+        snm[pkg.len()..pkg.len() + 4].copy_from_slice(b".new");
+        if dir_has(b"/pkg\0", &snm[..pkg.len() + 4]) {
+            user_lib::print("ctr: install in progress\n");
+            user_lib::exit(1);
+        }
+        user_lib::print("ctr: staging failed\n");
+        user_lib::exit(1);
+    }
+    let had_store = dir_has(b"/pkg\0", pkg);
+    let rollback = |sroot: &[u8; 64], live: &[u8; 64], fresh: bool| -> ! {
+        rm_all(sroot);
+        if fresh {
+            rm_all(live);
+        }
         user_lib::print("ctr: pkg install failed\n");
         user_lib::exit(1);
     };
@@ -2619,13 +2729,13 @@ fn install_layers(
         let mut ob = [0u8; 64];
         let obn = tmp_path(&mut ob, b'p', li);
         if !run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..obn]) {
-            rollback(&root);
+            rollback(&sroot, &root, !had_store);
         }
         li += 1;
     }
     // v3.4: verify BEFORE unpacking (tampered bytes never touch the store).
     if !verify_tars(nl, sha) {
-        rollback(&root);
+        rollback(&sroot, &root, !had_store);
     }
     let mut li = 0usize;
     while li < nl {
@@ -2633,14 +2743,14 @@ fn install_layers(
         let _ = tmp_path(&mut ob, b'p', li);
         let tf = user_lib::open(ob.as_ptr(), 0);
         if tf < 0 {
-            rollback(&root);
+            rollback(&sroot, &root, !had_store);
         }
-        let f = untar(tf, &root[..rootn], rootn);
+        let f = untar(tf, &sroot[..srootn], srootn);
         user_lib::close(tf);
         // (tars stay until the files list is scanned below.)
         if f <= 0 {
             // (empty package is bogus, like pull's empty guard)
-            rollback(&root);
+            rollback(&sroot, &root, !had_store);
         }
         li += 1;
     }
@@ -2648,32 +2758,32 @@ fn install_layers(
     let mut man_tmp = [0u8; 64];
     let _ = tmp_path(&mut man_tmp, b'm', 0);
     user_lib::unlink(man_tmp.as_ptr());
-    // v3.1: stash a manifest copy in the store for remove's needed-by
-    // scan (rm_all takes it with the store; bin listing is unaffected).
+    // v3.1: stash a manifest copy in the STAGING store for remove's
+    // needed-by scan (moves to live at commit; bin listing unaffected).
     {
         let mut mp = [0u8; 64];
-        mp[..rootn].copy_from_slice(&root[..rootn]);
-        mp[rootn..rootn + 9].copy_from_slice(b"/manifest");
+        mp[..srootn].copy_from_slice(&sroot[..srootn]);
+        mp[srootn..srootn + 9].copy_from_slice(b"/manifest");
         let f = user_lib::open(mp.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
         if f < 0 {
-            rollback(&root);
+            rollback(&sroot, &root, !had_store);
         }
         let mut w = 0;
         while w < mb.len() {
             let r = user_lib::write(f, unsafe { mb.as_ptr().add(w) }, mb.len() - w);
             if r <= 0 {
                 user_lib::close(f);
-                rollback(&root);
+                rollback(&sroot, &root, !had_store);
             }
             w += r as usize;
         }
         user_lib::close(f);
     }
     // v3.3: scan the kept tars into the store file list (upgrade GC),
-    // then drop the tars.
+    // then drop the tars. File list lands in staging too.
+    let mut names = [[0u8; 128]; 64];
+    let mut nn = 0usize;
     {
-        let mut names = [[0u8; 128]; 64];
-        let mut nn = 0usize;
         let mut li = 0usize;
         let mut ok = true;
         while li < nl && ok {
@@ -2692,56 +2802,62 @@ fn install_layers(
             user_lib::unlink(ob.as_ptr());
             li += 1;
         }
-        if !ok || !store_write_files(&root, rootn, &names, nn) {
-            rollback(&root);
+        if !ok || !store_write_files(&sroot, srootn, &names, nn) {
+            rollback(&sroot, &root, !had_store);
         }
     }
+    // commit list = tar files + manifest + files metadata.
+    if nn + 2 > 64 {
+        rollback(&sroot, &root, !had_store);
+    }
+    names[nn][..8].copy_from_slice(b"manifest");
+    names[nn][8] = 0;
+    names[nn + 1][..5].copy_from_slice(b"files");
+    names[nn + 1][5] = 0;
+    nn += 2;
     // 4. link store/bin/* into /bin -- after a full shadow pre-check
-    // (an existing /bin name refuses the whole install: no clobber,
-    // and remove can never delete a file it did not install).
+    // on the STAGED listing (an existing /bin name refuses the whole
+    // install: no clobber, and remove can never delete a file it did
+    // not install). Live is untouched until commit below.
     let mut binpath = [0u8; 64];
-    binpath[..rootn].copy_from_slice(&root[..rootn]);
-    binpath[rootn..rootn + 4].copy_from_slice(b"/bin");
-    let mut names = [[0u8; 64]; 32];
-    let nn = dir_names(&binpath, &mut names);
+    binpath[..srootn].copy_from_slice(&sroot[..srootn]);
+    binpath[srootn..srootn + 4].copy_from_slice(b"/bin");
+    let mut bnames = [[0u8; 64]; 32];
+    let bnn = dir_names(&binpath, &mut bnames);
     let mut k = 0usize;
-    while k < nn {
+    while k < bnn {
         let mut nlen = 0;
-        while nlen < 64 && names[k][nlen] != 0 {
+        while nlen < 64 && bnames[k][nlen] != 0 {
             nlen += 1;
         }
         let mut dst = [0u8; 64];
         dst[..5].copy_from_slice(b"/bin/");
-        dst[5..5 + nlen].copy_from_slice(&names[k][..nlen]);
+        dst[5..5 + nlen].copy_from_slice(&bnames[k][..nlen]);
         if path_exists(&dst) {
             user_lib::print("ctr: shadows /bin/");
-            let _ = user_lib::write(1, names[k].as_ptr(), nlen);
+            let _ = user_lib::write(1, bnames[k].as_ptr(), nlen);
             user_lib::print("\n");
-            rm_all(&root);
+            rm_all(&sroot);
             user_lib::exit(1);
         }
         k += 1;
     }
-    let mut k = 0usize;
-    while k < nn {
-        let mut nlen = 0;
-        while nlen < 64 && names[k][nlen] != 0 {
-            nlen += 1;
-        }
-        let mut src = [0u8; 64];
-        src[..rootn + 4].copy_from_slice(&binpath[..rootn + 4]);
-        src[rootn + 4] = b'/';
-        src[rootn + 5..rootn + 5 + nlen].copy_from_slice(&names[k][..nlen]);
-        let mut dst = [0u8; 64];
-        dst[..5].copy_from_slice(b"/bin/");
-        dst[5..5 + nlen].copy_from_slice(&names[k][..nlen]);
-        if user_lib::link(src.as_ptr(), dst.as_ptr()) != 0 {
-            rollback(&root);
-        }
-        k += 1;
+    mkdir_p(&root);
+    if !commit_staged(&sroot, srootn, &root, rootn, &names, nn) {
+        rollback(&sroot, &root, !had_store);
+    }
+    // relink from the live store (fresh links; O_TRUNC would have
+    // orphaned any pre-existing ones -- there are none: shadow check).
+    if !relink_bin(&root, rootn) {
+        rollback(&sroot, &root, !had_store);
     }
     if !pkg_db_add(pkg, ver, manual) {
         // db unwritable: roll the files back too (db entry ⟺ installed).
+        let mut binpath = [0u8; 64];
+        binpath[..rootn].copy_from_slice(&root[..rootn]);
+        binpath[rootn..rootn + 4].copy_from_slice(b"/bin");
+        let mut names = [[0u8; 64]; 32];
+        let nn = dir_names(&binpath, &mut names);
         let mut k = 0usize;
         while k < nn {
             let mut nlen = 0;
@@ -2754,8 +2870,11 @@ fn install_layers(
             user_lib::unlink(dst.as_ptr());
             k += 1;
         }
-        rollback(&root);
+        rollback(&sroot, &root, !had_store);
     }
+    // success: drop the staging dir (ignore residue; next install
+    // of the same package clears it first anyway).
+    rm_all(&sroot);
     user_lib::print("pkg-installed ");
     let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
     user_lib::print(" ");
@@ -3135,10 +3254,16 @@ fn relink_bin(root: &[u8; 64], rootn: usize) -> bool {
 /// v3.3: upgrade one installed package to the index maximum.
 /// Prints `pkg-upgraded <name> <newver>`, or `already latest <name>`
 /// (exit 0 either way; failures exit loud). Flow: new deps first
-/// (old store intact on dep failure), then download + overwrite +
+/// (old store intact on dep failure), then download + stage + commit +
 /// GC stale files + relink + manifest/files/db refresh.
+/// v3.13: unpacks into staging (db-last ordering like install); a kill -9
+/// mid-upgrade leaves the old store referenced until commit flips it.
 /// Known gap: dependents' pins are NOT re-verified (see _doc/v3.3.md).
 fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
+    if is_staging_name(pkg) {
+        user_lib::print("ctr: bad name\n");
+        user_lib::exit(1);
+    }
     let mut cur = [0u8; 32];
     let curn = pkg_db_ver(pkg, &mut cur);
     if curn == usize::MAX {
@@ -3259,11 +3384,29 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
         install_one(host, port, dn, dw, &mut stack, &mut stklen, 1, false);
         d += 1;
     }
-    // download into /tmp (kept), verify, then overwrite the live store.
+    // v3.13: staging setup (mirrors install_layers): clear residue,
+    // then exclusive create (concurrent same-package upgrade refuses).
     let mut root = [0u8; 64];
     root[..5].copy_from_slice(b"/pkg/");
     root[5..5 + pkg.len()].copy_from_slice(pkg);
     let rootn = 5 + pkg.len();
+    let mut sroot = [0u8; 64];
+    let srootn = staging_path(pkg, &mut sroot);
+    rm_all(&sroot);
+    if user_lib::mkdir(sroot.as_ptr()) != 0 {
+        let mut snm = [0u8; 64];
+        snm[..pkg.len()].copy_from_slice(pkg);
+        snm[pkg.len()..pkg.len() + 4].copy_from_slice(b".new");
+        if dir_has(b"/pkg\0", &snm[..pkg.len() + 4]) {
+            user_lib::print("ctr: upgrade in progress\n");
+            user_lib::exit(1);
+        }
+        user_lib::print("ctr: staging failed\n");
+        user_lib::exit(1);
+    }
+    // download into /tmp (kept), verify, then unpack into STAGING.
+    // (up_fail leaves live untouched pre-commit; staging residue
+    // self-heals on the next run of this package.)
     let up_fail = |msg: &str| -> ! {
         user_lib::print(msg);
         user_lib::exit(1);
@@ -3271,6 +3414,7 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
     let mut li = 0usize;
     while li < nl {
         if !fetch_layer(host, port, pkg, &ver[..vern], &layers[li][..layern[li]], li) {
+            rm_all(&sroot);
             up_fail("ctr: pkg fetch failed (layer)\n");
         }
         li += 1;
@@ -3278,6 +3422,7 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
     // v3.4: verify BEFORE unpacking (tampered bytes never touch the store).
     // usha/ushan came from this manifest's own parse above.
     if !verify_tars(nl, &usha[..ushan]) {
+        rm_all(&sroot);
         up_fail("ctr: upgrade failed (sha)\n");
     }
     let mut li = 0usize;
@@ -3286,11 +3431,13 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
         let _ = tmp_path(&mut ob, b'p', li);
         let tf = user_lib::open(ob.as_ptr(), 0);
         if tf < 0 {
+            rm_all(&sroot);
             up_fail("ctr: pkg fetch failed (layer-open)\n");
         }
-        let f = untar(tf, &root[..rootn], rootn);
+        let f = untar(tf, &sroot[..srootn], srootn);
         user_lib::close(tf);
         if f <= 0 {
+            rm_all(&sroot);
             up_fail("ctr: pkg fetch failed (untar)\n");
         }
         li += 1;
@@ -3299,7 +3446,7 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
     let mut newset = [[0u8; 128]; 64];
     let mut newn = 0usize;
     let mut ok = true;
-    let mut li = 0usize;
+    li = 0;
     while li < nl && ok {
         let mut ob = [0u8; 64];
         let _ = tmp_path(&mut ob, b'p', li);
@@ -3317,24 +3464,57 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
         li += 1;
     }
     if !ok {
+        rm_all(&sroot);
         up_fail("ctr: upgrade failed (scan)\n");
     }
     let mut oldset = [[0u8; 128]; 64];
     let oldn = store_read_files(&root, rootn, &mut oldset);
-    gc_stale_files(&root, rootn, &oldset, oldn, &newset, newn);
-    if !relink_bin(&root, rootn) {
-        up_fail("ctr: upgrade failed (relink)\n");
+    // v3.13: new bin names (absent from the old set) must not shadow
+    // /bin entries -- the old set relinks over itself safely below.
+    {
+        let mut qi = 0usize;
+        while qi < newn {
+            let mut qlen = 0;
+            while qlen < 128 && newset[qi][qlen] != 0 {
+                qlen += 1;
+            }
+            if qlen > 4 && &newset[qi][..4] == b"bin/" {
+                let mut found = false;
+                let mut oi = 0usize;
+                while oi < oldn {
+                    if path_eq(&newset[qi], &oldset[oi]) {
+                        found = true;
+                        break;
+                    }
+                    oi += 1;
+                }
+                if !found {
+                    let rest = &newset[qi][4..qlen];
+                    if 5 + rest.len() < 63 {
+                        let mut dst = [0u8; 64];
+                        dst[..5].copy_from_slice(b"/bin/");
+                        dst[5..5 + rest.len()].copy_from_slice(rest);
+                        if path_exists(&dst) {
+                            user_lib::print("ctr: shadows /bin/");
+                            let _ = user_lib::write(1, rest.as_ptr(), rest.len());
+                            user_lib::print("\n");
+                            rm_all(&sroot);
+                            user_lib::exit(1);
+                        }
+                    }
+                }
+            }
+            qi += 1;
+        }
     }
-    if !store_write_files(&root, rootn, &newset, newn) {
-        up_fail("ctr: upgrade failed (files)\n");
-    }
-    // manifest refresh.
+    // manifest + files land in STAGING (moved at commit like the rest).
     {
         let mut mp = [0u8; 64];
-        mp[..rootn].copy_from_slice(&root[..rootn]);
-        mp[rootn..rootn + 9].copy_from_slice(b"/manifest");
+        mp[..srootn].copy_from_slice(&sroot[..srootn]);
+        mp[srootn..srootn + 9].copy_from_slice(b"/manifest");
         let f = user_lib::open(mp.as_ptr(), user_lib::O_CREATE | user_lib::O_TRUNC);
         if f < 0 {
+            rm_all(&sroot);
             up_fail("ctr: upgrade failed (manifest)\n");
         }
         let mut w = 0;
@@ -3349,8 +3529,41 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
         }
         user_lib::close(f);
         if !okw {
+            rm_all(&sroot);
             up_fail("ctr: upgrade failed (manifest)\n");
         }
+    }
+    if !store_write_files(&sroot, srootn, &newset, newn) {
+        rm_all(&sroot);
+        up_fail("ctr: upgrade failed (files)\n");
+    }
+    // commit list = new files + manifest + files metadata.
+    let mut moveset = [[0u8; 128]; 64];
+    let mut moven = 0usize;
+    {
+        let mut qi = 0usize;
+        while qi < newn && moven < 64 {
+            moveset[moven] = newset[qi];
+            moven += 1;
+            qi += 1;
+        }
+        if moven + 2 > 64 {
+            rm_all(&sroot);
+            up_fail("ctr: upgrade failed (files)\n");
+        }
+        moveset[moven][..8].copy_from_slice(b"manifest");
+        moveset[moven][8] = 0;
+        moveset[moven + 1][..5].copy_from_slice(b"files");
+        moveset[moven + 1][5] = 0;
+        moven += 2;
+    }
+    mkdir_p(&root);
+    if !commit_staged(&sroot, srootn, &root, rootn, &moveset, moven) {
+        up_fail("ctr: upgrade failed (commit)\n");
+    }
+    gc_stale_files(&root, rootn, &oldset, oldn, &newset, newn);
+    if !relink_bin(&root, rootn) {
+        up_fail("ctr: upgrade failed (relink)\n");
     }
     // (rebuild the per-process name: same pid, same path.)
     let mut man_tmp = [0u8; 64];
@@ -3359,6 +3572,9 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
     if !pkg_db_del(pkg) || !pkg_db_add(pkg, &ver[..vern], manual) {
         up_fail("ctr: db update failed\n");
     }
+    // success: drop the staging dir (ignore residue; next run of this
+    // package clears it first anyway).
+    rm_all(&sroot);
     user_lib::print("pkg-upgraded ");
     let _ = user_lib::write(1, pkg.as_ptr(), pkg.len());
     user_lib::print(" ");
@@ -3640,6 +3856,196 @@ fn cmd_pkg_list() {
     user_lib::exit(0);
 }
 
+/// v3.13: `ctr verify [<pkg>]` -- read-only consistency check over
+/// installed packages: store dir + files-list + manifest present, every
+/// listed file openable in the store, every store/bin entry linked
+/// under /bin. Prints `verify-ok <name> <ver>` per healthy package
+/// (single writes, suite greps whole lines); any failure prints
+/// `verify-fail <name> <reason>` and exits 1 at the end (all problems
+/// reported, not just the first). Orphan staging dirs (`*.new`, never
+/// referenced by the db) are reported as `orphan <base>` lines but do
+/// not fail the run -- the next install of that package clears them.
+fn cmd_verify(pkg_opt: Option<&[u8]>) {
+    // collect targets: (name, ver) from db, or the single named pkg.
+    let mut names = [[0u8; 64]; 32];
+    let mut vers = [[0u8; 32]; 32];
+    let mut nt = 0usize;
+    if let Some(pkg) = pkg_opt {
+        if !valid_name(pkg) {
+            user_lib::print("ctr: bad name\n");
+            user_lib::exit(1);
+        }
+        let mut vb = [0u8; 32];
+        let vn = pkg_db_ver(pkg, &mut vb);
+        if vn == usize::MAX {
+            user_lib::print("ctr: not installed\n");
+            user_lib::exit(1);
+        }
+        let m = pkg.len().min(63);
+        names[0][..m].copy_from_slice(&pkg[..m]);
+        let vm = vn.min(31);
+        vers[0][..vm].copy_from_slice(&vb[..vm]);
+        nt = 1;
+    } else {
+        let mut dbn = [[0u8; 64]; 32];
+        let nd = pkg_db_names(&mut dbn);
+        let mut k = 0usize;
+        while k < nd && nt < 32 {
+            let mut nlen = 0;
+            while nlen < 64 && dbn[k][nlen] != 0 {
+                nlen += 1;
+            }
+            let mut vb = [0u8; 32];
+            let vn = pkg_db_ver(&dbn[k][..nlen], &mut vb);
+            if vn != usize::MAX {
+                let m = nlen.min(63);
+                names[nt][..m].copy_from_slice(&dbn[k][..m]);
+                let vm = vn.min(31);
+                vers[nt][..vm].copy_from_slice(&vb[..vm]);
+                // store paired lengths alongside? recompute below.
+                nt += 1;
+            }
+            k += 1;
+        }
+        // NOTE: names[] entries are NUL-padded by construction ([0u8; 64]
+        // arrays, copies shorter than 63); lengths rescanned per use.
+    }
+    let mut failed = false;
+    let mut t = 0usize;
+    while t < nt {
+        let mut nlen = 0;
+        while nlen < 64 && names[t][nlen] != 0 {
+            nlen += 1;
+        }
+        let mut vlen = 0;
+        while vlen < 32 && vers[t][vlen] != 0 {
+            vlen += 1;
+        }
+        let name = &names[t][..nlen];
+        let ver = &vers[t][..vlen];
+        let mut root = [0u8; 64];
+        root[..5].copy_from_slice(b"/pkg/");
+        root[5..5 + nlen].copy_from_slice(name);
+        let rootn = 5 + nlen;
+        // returns Some(reason) on first problem, None if healthy.
+        let reason: Option<&[u8]> = if !dir_has(b"/pkg\0", name) {
+            Some(b"store")
+        } else {
+            let mut fl = [[0u8; 128]; 64];
+            // files list must exist and be non-trivially readable;
+            // store_read_files returns 0 both for missing and empty,
+            // so probe the file directly first.
+            let mut fp = [0u8; 64];
+            fp[..rootn].copy_from_slice(&root[..rootn]);
+            fp[rootn..rootn + 6].copy_from_slice(b"/files");
+            if !path_exists(&fp) {
+                Some(b"files")
+            } else {
+                let fnn = store_read_files(&root, rootn, &mut fl);
+                let mut mp = [0u8; 64];
+                mp[..rootn].copy_from_slice(&root[..rootn]);
+                mp[rootn..rootn + 9].copy_from_slice(b"/manifest");
+                if !path_exists(&mp) {
+                    Some(b"manifest")
+                } else {
+                    // every listed file must open in the store...
+                    let mut bad: Option<&[u8]> = None;
+                    let mut fi = 0usize;
+                    while fi < fnn {
+                        let mut flen = 0;
+                        while flen < 128 && fl[fi][flen] != 0 {
+                            flen += 1;
+                        }
+                        if rootn + 1 + flen < 63 {
+                            let mut sp = [0u8; 64];
+                            sp[..rootn].copy_from_slice(&root[..rootn]);
+                            sp[rootn] = b'/';
+                            sp[rootn + 1..rootn + 1 + flen].copy_from_slice(&fl[fi][..flen]);
+                            if !path_exists(&sp) {
+                                bad = Some(b"file");
+                                break;
+                            }
+                        }
+                        fi += 1;
+                    }
+                    // ...and every store/bin entry must link under /bin.
+                    if bad.is_none() {
+                        let mut binpath = [0u8; 64];
+                        binpath[..rootn].copy_from_slice(&root[..rootn]);
+                        binpath[rootn..rootn + 4].copy_from_slice(b"/bin");
+                        let mut bn = [[0u8; 64]; 32];
+                        let bnn = dir_names(&binpath, &mut bn);
+                        let mut bi = 0usize;
+                        while bi < bnn {
+                            let mut blen = 0;
+                            while blen < 64 && bn[bi][blen] != 0 {
+                                blen += 1;
+                            }
+                            let mut dst = [0u8; 64];
+                            dst[..5].copy_from_slice(b"/bin/");
+                            dst[5..5 + blen].copy_from_slice(&bn[bi][..blen]);
+                            if !path_exists(&dst) {
+                                bad = Some(b"link");
+                                break;
+                            }
+                            bi += 1;
+                        }
+                    }
+                    bad
+                }
+            }
+        };
+        // single writes (v3.8 lesson: suite greps whole lines).
+        let mut b = [0u8; 128];
+        let mut n = 0usize;
+        match reason {
+            None => {
+                n = buf_put(&mut b, n, b"verify-ok ");
+                n = buf_put(&mut b, n, name);
+                n = buf_put(&mut b, n, b" ");
+                n = buf_put(&mut b, n, ver);
+                n = buf_put(&mut b, n, b"\n");
+            }
+            Some(r) => {
+                failed = true;
+                n = buf_put(&mut b, n, b"verify-fail ");
+                n = buf_put(&mut b, n, name);
+                n = buf_put(&mut b, n, b" ");
+                n = buf_put(&mut b, n, r);
+                n = buf_put(&mut b, n, b"\n");
+            }
+        }
+        let _ = user_lib::write(1, b.as_ptr(), n);
+        t += 1;
+    }
+    // orphan staging report (informational only).
+    {
+        let mut dirs = [[0u8; 64]; 32];
+        let nd = dir_names(b"/pkg\0", &mut dirs);
+        let mut k = 0usize;
+        while k < nd {
+            let mut nlen = 0;
+            while nlen < 64 && dirs[k][nlen] != 0 {
+                nlen += 1;
+            }
+            let e = &dirs[k][..nlen];
+            if e.len() > 4 && &e[e.len() - 4..] == b".new" {
+                let mut b = [0u8; 64];
+                let mut n = 0usize;
+                n = buf_put(&mut b, n, b"orphan ");
+                n = buf_put(&mut b, n, &e[..e.len() - 4]);
+                n = buf_put(&mut b, n, b"\n");
+                let _ = user_lib::write(1, b.as_ptr(), n);
+            }
+            k += 1;
+        }
+    }
+    if failed {
+        user_lib::exit(1);
+    }
+    user_lib::exit(0);
+}
+
 /// v2.9: `ctr logs <name>` -- dump /ctr/<name>/log to stdout.
 /// Liveness is NOT required (stopped containers keep their log until
 /// rm, docker-style). Missing log -> loud, exit 1.
@@ -3741,7 +4147,7 @@ fn cmd_exec(name: &[u8], prog: &[u8], args: &[&[u8]]) {
 #[no_mangle]
 pub extern "C" fn main(argc: usize, argv: *const *const u8) {
     if argc < 2 {
-        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm [-f] <name> | ctr restart <name> | ctr logs <name> | ctr exec <name> <prog> [args...] | ctr install <host> <port> <pkg>[=ver] | ctr remove <pkg> | ctr list | ctr upgrade <host> <port> [<pkg>] | ctr autoremove | ctr login <token> | ctr logout | ctr volume create <v> | ctr volume rm <v> | ctr volume ls\n");
+        user_lib::print("usage: ctr <name> | ctr run [-d] [--memory N] [--cpu P] [--weight W] <name> <prog> [args...] | ctr pull <host> <port> <image> | ctr ps | ctr stop <name> | ctr rm [-f] <name> | ctr restart <name> | ctr logs <name> | ctr exec <name> <prog> [args...] | ctr install <host> <port> <pkg>[=ver] | ctr remove <pkg> | ctr list | ctr upgrade <host> <port> [<pkg>] | ctr autoremove | ctr login <token> | ctr logout | ctr verify [<pkg>] | ctr volume create <v> | ctr volume rm <v> | ctr volume ls\n");
         user_lib::exit(1);
     }
     let a1 = match unsafe { user_lib::argv_str(argv, 1, argc) } {
@@ -4122,6 +4528,18 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             user_lib::exit(1);
         }
         cmd_logout();
+    } else if a1 == b"verify" {
+        // v3.13: ctr verify [<pkg>]
+        if argc != 2 && argc != 3 {
+            user_lib::print("usage: ctr verify [<pkg>]\n");
+            user_lib::exit(1);
+        }
+        if argc == 3 {
+            let pkg = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+            cmd_verify(Some(pkg));
+        } else {
+            cmd_verify(None);
+        }
     } else {
         if !valid_name(a1) {
             user_lib::print("ctr: bad name\n");

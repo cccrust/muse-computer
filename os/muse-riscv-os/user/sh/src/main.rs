@@ -1645,6 +1645,25 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"ctr", b"remove", b"privdemo"],
         &mut jobs,
     );
+    // v3.13: staging protocol + verify checker (db is clean; token file
+    // lingers from the v3.4/v3.11 blocks, harmless -- no fetch here).
+    // Every install/upgrade above already flowed through staging; the
+    // verify-ok line proves the checker agrees the store is whole.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"install", b"10.0.2.2", b"8091", b"hello=1.0"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"verify", b"hello"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"hello"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);
