@@ -796,7 +796,47 @@ pub fn sock_open_kind(kind: u8) -> Option<usize> {
             break;
         }
     }
-    let i = free?;
+    // v3.15: under pressure, reclaim the OLDEST lingering close slot
+    // instead of failing. Full table + a fetch burst (installs = 5 rapid
+    // multi-socket fetches at the end of a 30s lingering window) hit the
+    // 32-slot ceiling deterministically on fast boots. Victims are
+    // fd-detached closing TCP slots (FIN already sent; app declared
+    // disinterest by closing): RST + reuse is standard under-TCB-pressure
+    // behavior, and data loss is impossible -- FIN states mean we already
+    // received everything. Live states (Est/CloseWait/Listen/Syn*) are
+    // never stolen. Same fork-shared-fd hazard as reap cleanup (see
+    // task waitpid): current tree holds no socket fd across fork+use.
+    let i = match free {
+        Some(i) => i,
+        None => {
+            let mut victim = None;
+            let mut oldest = u64::MAX;
+            for (j, s) in n.socks.iter().enumerate() {
+                if s.used
+                    && s.kind == 1
+                    && s.closing
+                    && matches!(
+                        s.tcp.state,
+                        tcp::TState::FinW1
+                            | tcp::TState::FinW2
+                            | tcp::TState::Closing
+                            | tcp::TState::LastAck
+                    )
+                    && s.tcp.rto_at < oldest
+                {
+                    oldest = s.tcp.rto_at;
+                    victim = Some(j);
+                }
+            }
+            let v = victim?;
+            // `_` arm for these states: RST if peered, then free.
+            tcp::tcp_close(&mut n, v);
+            if n.socks[v].used {
+                return None;
+            }
+            v
+        }
+    };
     let port = alloc_port(&mut n);
     if port == 0 {
         return None;

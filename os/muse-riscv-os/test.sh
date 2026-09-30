@@ -239,6 +239,9 @@ check "verify-ok hello 1.0"
 # v3.14: TLS downloads (same routes over :8443; distinct per-fetch markers)
 check "wgets PASS manifest"
 check "wgets PASS hello.tar"
+# v3.15: TLS install chain (farewell.tar is TLS-unique: only `installs`
+# fetches it; v3.14 direct calls only grab manifest + hello.tar)
+check "wgets PASS farewell.tar"
 check "CTRPS life"
 check "Up"
 check "stopped life"

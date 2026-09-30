@@ -2507,8 +2507,37 @@ pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
         if let Some((c, code)) = found {
             // v1.2: capture the dead address space, THEN release everything
             // without the sched lock (slot is gone; nobody can touch it).
+            // v3.15: also capture open socket slots (fd_kind 7). Sockets
+            // live in the global NSOCK table, not the address space, so
+            // nothing else frees them: a child that exits with an open
+            // socket (every fail() path in wget/wgets/curl) leaked its
+            // slot forever, and a fetch-heavy boot (installs = 5 rapid
+            // multi-socket fetches at the END of a 30s lingering window)
+            // deterministically exhausted all 32 (observed: `socket`
+            // failure at the same installs fetch, fast boots only).
+            // Closed AFTER drop(s): NET lock nests under no sched lock
+            // (same discipline as free_user_space below).
+            // Sharing hazard: a fork-inherited fd still open in the
+            // PARENT aliases the same slot; reap-closing it leaves the
+            // parent's fd dangling (sock_close on a freed slot is a
+            // no-op, but a REUSED slot would alias). Current tree never
+            // holds a socket fd across a child's reap (fetch parents
+            // fork-then-wait with no sockets of their own), so this is
+            // safe today; revisit with refcounts if that changes.
             let dead = match s.procs[c].take() {
-                Some(p) => Some((p.root, p.tf_pa)),
+                Some(p) => {
+                    let mut socks = [usize::MAX; 16];
+                    let mut ns = 0usize;
+                    let mut i = 0;
+                    while i < 16 {
+                        if p.fd_kind[i] == 7 && p.fds[i] >= 0 {
+                            socks[ns] = p.fds[i] as usize;
+                            ns += 1;
+                        }
+                        i += 1;
+                    }
+                    Some((p.root, p.tf_pa, socks, ns))
+                }
                 None => None,
             };
             // v2.5: retain the exit code (pid-only key: pids never repeat
@@ -2526,13 +2555,24 @@ pub fn waitpid(pid: usize, target: isize, options: usize) -> (i32, usize) {
             if let Some(Some(pp)) = s.procs.get_mut(pid) {
                 pp.children.retain(|&x| x != c);
             }
-            if let Some((root, tf_pa)) = dead {
+            if let Some((root, tf_pa, socks, ns)) = dead {
                 drop(s);
                 crate::mem::free_user_space(root);
                 crate::mem::frame::dealloc_frame(tf_pa);
                 // freed frames are reused under ASID 0: flush remotes so
                 // stale TLB entries cannot alias the next mappings.
                 crate::mem::pagetable::remote_flush_all();
+                // v3.15: release the dead child's socket slots (see the
+                // capture above). sock_close on an already-freed slot is
+                // a no-op, so double-close with a sharing parent is safe;
+                // slot REUSE aliasing is the documented hazard instead.
+                let mut k = 0usize;
+                while k < ns {
+                    if socks[k] != usize::MAX {
+                        crate::net::sock_close(socks[k]);
+                    }
+                    k += 1;
+                }
             }
             Some((c as i32, code as usize))
         } else {

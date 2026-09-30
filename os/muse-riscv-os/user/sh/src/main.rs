@@ -1678,6 +1678,37 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"wgets", b"10.0.2.2", b"8443", b"/pkg/hello/1.0/hello.tar", b"/tmp/wgets-hello"],
         &mut jobs,
     );
+    // v3.15: install over TLS (db is clean: v3.13 removed hello; token
+    // lingers from v3.4/v3.11, harmless). farewell pulls hello=1.0 as
+    // an auto dep (same as the v3.1 plaintext flow); both are removed
+    // after so the db is clean for persist. The `wgets PASS farewell.tar`
+    // line is TLS-unique (v3.14 only fetches manifest + hello.tar), so
+    // it proves the install chain ran end-to-end over :8443.
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"installs", b"10.0.2.2", b"8443", b"farewell"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"list"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/farewell\0",
+        &[b"farewell", b"farewell-marker"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"farewell"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/ctr\0",
+        &[b"ctr", b"remove", b"hello"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

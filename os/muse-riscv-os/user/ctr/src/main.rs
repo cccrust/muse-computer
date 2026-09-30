@@ -471,11 +471,13 @@ fn tmp_path(out: &mut [u8; 64], which: u8, idx: usize) -> usize {
     n.min(63)
 }
 
-/// run `/bin/wget <host> <port> <path> <outfile>`; true iff exit code 0.
+/// run `/bin/wget <host> <port> <path> <outfile>` (secure=false) or
+/// `/bin/wgets <host> <tlsport> <path> <outfile>` (secure=true, v3.15:
+/// same argv shape, TLS inside); true iff exit code 0.
 /// v3.4: attaches /pkg/token as a bearer header when present
 /// (registry private routes; public routes ignore it -- pull and all
 /// pre-login fetches behave bit-for-bit as before).
-fn run_wget(host: &[u8], port: &[u8], path: &[u8], out: &[u8]) -> bool {
+fn run_fetch(host: &[u8], port: &[u8], path: &[u8], out: &[u8], secure: bool) -> bool {
     let mut hb = [0u8; 64];
     nul_copy(&mut hb, &host[..host.len().min(63)]);
     let mut pb = [0u8; 16];
@@ -485,7 +487,11 @@ fn run_wget(host: &[u8], port: &[u8], path: &[u8], out: &[u8]) -> bool {
     let mut ob = [0u8; 32];
     nul_copy(&mut ob, &out[..out.len().min(31)]);
     let mut w0 = [0u8; 8];
-    w0[..4].copy_from_slice(b"wget");
+    if secure {
+        w0[..5].copy_from_slice(b"wgets");
+    } else {
+        w0[..4].copy_from_slice(b"wget");
+    }
     // token: first line of /pkg/token (login-validated charset).
     // Absent token leaves av[5] NULL (argc 5, pre-v3.4 behavior).
     let mut tb = [0u8; 64];
@@ -505,7 +511,11 @@ fn run_wget(host: &[u8], port: &[u8], path: &[u8], out: &[u8]) -> bool {
         av[5] = core::ptr::null();
     }
     let mut wget = [0u8; 16];
-    wget[..9].copy_from_slice(b"/bin/wget");
+    if secure {
+        wget[..10].copy_from_slice(b"/bin/wgets");
+    } else {
+        wget[..9].copy_from_slice(b"/bin/wget");
+    }
     let pid = user_lib::fork();
     if pid == 0 {
         let _ = user_lib::exec(wget.as_ptr(), av.as_ptr() as usize);
@@ -514,6 +524,11 @@ fn run_wget(host: &[u8], port: &[u8], path: &[u8], out: &[u8]) -> bool {
         return wait_for(pid) == 0;
     }
     false
+}
+
+/// Plaintext fetch (pull + upgrade paths; bit-for-bit pre-v3.15).
+fn run_wget(host: &[u8], port: &[u8], path: &[u8], out: &[u8]) -> bool {
+    run_fetch(host, port, path, out, false)
 }
 
 fn is_zero_block(blk: &[u8; 512]) -> bool {
@@ -1954,7 +1969,23 @@ fn cmd_install(host: &[u8], port: &[u8], pkg: &[u8], want: Option<(&[u8], u8)>) 
     }
     let mut stack = [[0u8; 64]; 8];
     let mut stklen = [0usize; 8];
-    install_one(host, port, pkg, want, &mut stack, &mut stklen, 0, true);
+    install_one(host, port, pkg, want, &mut stack, &mut stklen, 0, true, false);
+    user_lib::exit(0);
+}
+
+/// v3.15: `ctr installs <host> <tlsport> <pkg>`: install_one with the
+/// TLS fetch layer (forked /bin/wgets per fetch). Same markers, same
+/// staging, same db -- only the transport differs.
+fn cmd_installs(host: &[u8], port: &[u8], pkg: &[u8], want: Option<(&[u8], u8)>) {
+    mkdir_p(b"/tmp\0");
+    mkdir_p(b"/pkg\0");
+    if pkg_db_has(pkg) {
+        user_lib::print("ctr: already installed\n");
+        user_lib::exit(1);
+    }
+    let mut stack = [[0u8; 64]; 8];
+    let mut stklen = [0usize; 8];
+    install_one(host, port, pkg, want, &mut stack, &mut stklen, 0, true, true);
     user_lib::exit(0);
 }
 
@@ -2132,6 +2163,7 @@ fn fetch_index(
     pkg: &[u8],
     vers: &mut [[u8; 32]; 8],
     versn: &mut [usize; 8],
+    secure: bool,
 ) -> usize {
     let mut ipath = [0u8; 128];
     ipath[..5].copy_from_slice(b"/pkg/");
@@ -2140,7 +2172,7 @@ fn fetch_index(
     ipath[ipn..ipn + 6].copy_from_slice(b"/index");
     let mut iob = [0u8; 64];
     let ion = tmp_path(&mut iob, b'i', 0);
-    if !run_wget(host, port, &ipath[..ipn + 6], &iob[..ion]) {
+    if !run_fetch(host, port, &ipath[..ipn + 6], &iob[..ion], secure) {
         user_lib::print("ctr: pkg fetch failed (index)\n");
         user_lib::exit(1);
     }
@@ -2203,6 +2235,7 @@ fn install_one(
     stklen: &mut [usize; 8],
     depth: usize,
     manual: bool,
+    secure: bool,
 ) {
     // already installed: skip iff any required version satisfies.
     if pkg_db_has(pkg) {
@@ -2246,7 +2279,7 @@ fn install_one(
         _ => {
             let mut vers = [[0u8; 32]; 8];
             let mut versn = [0usize; 8];
-            let nv = fetch_index(host, port, pkg, &mut vers, &mut versn);
+            let nv = fetch_index(host, port, pkg, &mut vers, &mut versn, secure);
             if nv == 0 {
                 user_lib::print("ctr: no versions\n");
                 user_lib::exit(1);
@@ -2285,7 +2318,7 @@ fn install_one(
     mpath[mpn..mpn + 9].copy_from_slice(b"/manifest");
     let mut man_ob = [0u8; 64];
     let man_n = tmp_path(&mut man_ob, b'm', 0);
-    if !run_wget(host, port, &mpath[..mpn + 9], &man_ob[..man_n]) {
+    if !run_fetch(host, port, &mpath[..mpn + 9], &man_ob[..man_n], secure) {
         user_lib::print("ctr: pkg fetch failed (manifest)\n");
         user_lib::exit(1);
     }
@@ -2348,10 +2381,10 @@ fn install_one(
                 user_lib::exit(1);
             }
         }
-        install_one(host, port, dn, dw, stack, stklen, depth + 1, false);
+        install_one(host, port, dn, dw, stack, stklen, depth + 1, false, secure);
         d += 1;
     }
-    install_layers(host, port, pkg, &ver[..vern], &mb[..mn], &layers, &layern, nl, manual, &sha[..shan]);
+    install_layers(host, port, pkg, &ver[..vern], &mb[..mn], &layers, &layern, nl, manual, &sha[..shan], secure);
 }
 
 /// v3.3: scan a tar file's headers, collecting regular-file paths
@@ -2677,6 +2710,7 @@ fn install_layers(
     nl: usize,
     manual: bool,
     sha: &[u8],
+    secure: bool,
 ) {
     if is_staging_name(pkg) {
         user_lib::print("ctr: bad name\n");
@@ -2728,7 +2762,7 @@ fn install_layers(
         rpath[rpn + 1..rpn + 1 + layer.len()].copy_from_slice(layer);
         let mut ob = [0u8; 64];
         let obn = tmp_path(&mut ob, b'p', li);
-        if !run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..obn]) {
+        if !run_fetch(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..obn], secure) {
             rollback(&sroot, &root, !had_store);
         }
         li += 1;
@@ -3147,6 +3181,7 @@ fn fetch_layer(
     ver: &[u8],
     layer: &[u8],
     idx: usize,
+    secure: bool,
 ) -> bool {
     let mut rpath = [0u8; 128];
     rpath[..5].copy_from_slice(b"/pkg/");
@@ -3159,7 +3194,7 @@ fn fetch_layer(
     rpath[rpn + 1..rpn + 1 + layer.len()].copy_from_slice(layer);
     let mut ob = [0u8; 64];
     let obn = tmp_path(&mut ob, b'p', idx);
-    run_wget(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..obn])
+    run_fetch(host, port, &rpath[..rpn + 1 + layer.len()], &ob[..obn], secure)
 }
 
 /// v3.3: NUL-terminated path equality.
@@ -3273,7 +3308,7 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
     let manual = pkg_db_manual(pkg);
     let mut vers = [[0u8; 32]; 8];
     let mut versn = [0usize; 8];
-    let nv = fetch_index(host, port, pkg, &mut vers, &mut versn);
+    let nv = fetch_index(host, port, pkg, &mut vers, &mut versn, false);
     if nv == 0 {
         user_lib::print("ctr: no versions\n");
         user_lib::exit(1);
@@ -3381,7 +3416,7 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
                 user_lib::exit(1);
             }
         }
-        install_one(host, port, dn, dw, &mut stack, &mut stklen, 1, false);
+        install_one(host, port, dn, dw, &mut stack, &mut stklen, 1, false, false);
         d += 1;
     }
     // v3.13: staging setup (mirrors install_layers): clear residue,
@@ -3413,7 +3448,7 @@ fn upgrade_one(host: &[u8], port: &[u8], pkg: &[u8]) {
     };
     let mut li = 0usize;
     while li < nl {
-        if !fetch_layer(host, port, pkg, &ver[..vern], &layers[li][..layern[li]], li) {
+        if !fetch_layer(host, port, pkg, &ver[..vern], &layers[li][..layern[li]], li, false) {
             rm_all(&sroot);
             up_fail("ctr: pkg fetch failed (layer)\n");
         }
@@ -4470,6 +4505,42 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
             }
         }
         cmd_install(host, port, pkg, want);
+    } else if a1 == b"installs" {
+        // v3.15: ctr installs <host> <tlsport> <pkg>[=ver] -- install_one
+        // over TLS (forked /bin/wgets per fetch). Same pins, same db.
+        if argc != 5 {
+            user_lib::print("usage: ctr installs <host> <tlsport> <pkg>[=ver]\n");
+            user_lib::exit(1);
+        }
+        let host = unsafe { user_lib::argv_str(argv, 2, argc).unwrap_or(b"") };
+        let port = unsafe { user_lib::argv_str(argv, 3, argc).unwrap_or(b"") };
+        let arg = unsafe { user_lib::argv_str(argv, 4, argc).unwrap_or(b"") };
+        if host.is_empty() || port.is_empty() {
+            user_lib::print("ctr: bad host/port/pkg\n");
+            user_lib::exit(1);
+        }
+        let (pkg, want) = split_vreq(arg);
+        if !valid_name(pkg) {
+            user_lib::print("ctr: bad host/port/pkg\n");
+            user_lib::exit(1);
+        }
+        if let Some((w, _)) = want {
+            if !ver_valid(w) {
+                user_lib::print("ctr: bad pkg version\n");
+                user_lib::exit(1);
+            }
+        }
+        {
+            let mut q = 0;
+            while q < arg.len() {
+                if arg[q] == b'>' && (q + 1 >= arg.len() || arg[q + 1] != b'=') {
+                    user_lib::print("ctr: bad pkg version\n");
+                    user_lib::exit(1);
+                }
+                q += 1;
+            }
+        }
+        cmd_installs(host, port, pkg, want);
     } else if a1 == b"remove" {
         // v3.0: ctr remove <pkg> (packages, not containers -- see cmd_rm)
         if argc != 3 {
