@@ -9,9 +9,12 @@ cargo test -p kernel -p host-tests -p mkfs -p user-lib || PASS=0
 # v3.8: standalone guest-lib crates (own [workspace], not -p addressable)
 (cd user-lib/guest-args && cargo test) || PASS=0
 (cd user-lib/guest-fmt && cargo test) || PASS=0
+# v3.14: guest-tls is a workspace MEMBER (in-tree wgets path-depends on
+# it), so both forms work; keep the standalone line for symmetry.
+(cd user-lib/guest-tls && cargo test) || PASS=0
 
 echo "=== 2. build user ELFs ==="
-cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver -p crashwrite -p ping -p nslookup -p wget -p curl -p ctr -p sleeper -p linger -p chroot_test -p nstest -p cgtest || PASS=0
+cargo build --release --target $TARGET -p init -p sh -p ls -p cat -p echo -p grep -p fork_test -p pipe_test -p usertests -p persist -p printenv -p smp_test -p reclaim_test -p stress -p udpping -p webserver -p crashwrite -p ping -p nslookup -p wget -p wgets -p curl -p ctr -p sleeper -p linger -p chroot_test -p nstest -p cgtest || PASS=0
 
 echo "=== 3. mkfs ==="
 cargo run --release -p mkfs -- fs.img || PASS=0
@@ -36,18 +39,21 @@ rm -f qemu.log
 # v2.0: short runs need headroom for loaded hosts (autorun keeps growing;
 # fixed 25-60s timeouts expire mid-autorun and look like kernel failures).
 # TO3/TO4 cover prompt-gated interactive runs; run2 is poll-based below.
+# v3.14: TO3 360->480, TO4 300->480. The §8/§9 feeders now poll 360 for
+# the prompt (loaded-host autorun ~250s at load ~5.8); the outer kill
+# must sit above feeder + trailing sleeps + halt/shutdown margin.
 if command -v timeout >/dev/null 2>&1; then
   TO="timeout 120"
   TO1="timeout 180"
   TO2="timeout 120"
-  TO3="timeout 360"
-  TO4="timeout 300"
+  TO3="timeout 480"
+  TO4="timeout 480"
 elif command -v gtimeout >/dev/null 2>&1; then
   TO="gtimeout 120"
   TO1="gtimeout 180"
   TO2="gtimeout 120"
-  TO3="gtimeout 360"
-  TO4="gtimeout 300"
+  TO3="gtimeout 480"
+  TO4="gtimeout 480"
 else
   TO=""
   TO1=""
@@ -65,15 +71,15 @@ START=$(date +%s)
 # must be dug, not papered with more timeout.
 # v1.3: net pinned to mmio bus.1 (0x10002000); the kernel probes by DEVID
 # (QEMU auto-attach otherwise fills from the top -- observed bus.7).
-# v1.3: UDP echo server for udpping (background, killed after §6).
+# v1.3: UDP echo server for udpping (background, killed after §11).
 python3 tools/udp_echo.py > /tmp/muse-echo.log 2>&1 &
 ECHO_PID=$!
-# v1.7: HTTP + DNS stubs for wget/curl/nslookup (background, killed after §6).
+# v1.7: HTTP + DNS stubs for wget/curl/nslookup (background, killed after §11).
 python3 tools/http_server.py > /tmp/muse-http.log 2>&1 &
 HTTP_PID=$!
 python3 tools/dns_stub.py > /tmp/muse-dns.log 2>&1 &
 DNS_PID=$!
-# v2.3: image registry stub for `ctr pull` (background, killed after §6).
+# v2.3: image registry stub for `ctr pull` (background, killed after §11).
 python3 tools/img_registry.py > /tmp/muse-img.log 2>&1 &
 IMG_PID=$!
 sleep 1
@@ -99,7 +105,7 @@ qemu-system-riscv64 \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
+  -netdev user,id=n0,hostfwd=tcp::8081-:80 \
   < /dev/null > qemu.log 2>&1 &
 QEMU_PID=$!
 echo "QEMU bg pid $QEMU_PID (log qemu.log)"
@@ -230,6 +236,9 @@ check "pkg-installed privdemo 1.0"
 check "fortune-sez hello-from-priv"
 check "pkg-removed privdemo"
 check "verify-ok hello 1.0"
+# v3.14: TLS downloads (same routes over :8443; distinct per-fetch markers)
+check "wgets PASS manifest"
+check "wgets PASS hello.tar"
 check "CTRPS life"
 check "Up"
 check "stopped life"
@@ -289,11 +298,15 @@ if [ "$CODE" = "404" ]; then
 else
   echo "FAIL: deleted routes still serve ($CODE)"; PASS=0
 fi
-# v1.3/v1.7/v2.3: stop the stub servers (run1 only)
-kill $ECHO_PID 2>/dev/null || true
-kill $HTTP_PID 2>/dev/null || true
-kill $DNS_PID 2>/dev/null || true
-kill $IMG_PID 2>/dev/null || true
+# v1.3/v1.7/v2.3: stub servers stay up through §11 (NOT killed here).
+# v3.14: §§7-11 all boot the full sh autorun before their marker. With
+# the stubs down, every network step (wget/curl/ctr/nslookup/udpping,
+# plus the 2 wgets TLS fetches) burns its connect/query retry budget
+# (500-spin loops) and a stub-less bootB needs >280s for the prompt
+# (measured: 36s with stubs, autorun-identical). The §11 crash proof
+# is fs-local (journal replay + page verify); the stubs only make the
+# unrelated autorun prefix deterministic-fast, so they are killed
+# after §11b instead.
 
 echo "=== 7. persistence: second boot on SAME fs.img (no rebuild) ==="
 # v1.4: persist READ needs deep autorun (past stress), which loaded hosts
@@ -308,7 +321,7 @@ qemu-system-riscv64 \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
+  -netdev user,id=n0,hostfwd=tcp::8081-:80 \
   < /dev/null > qemu2.log 2>&1 &
 QEMU2=$!
 for i in $(seq 1 280); do
@@ -349,7 +362,11 @@ rm -f qemu3.log
 # v2.0: Ctrl-C is sent ONLY after the sh prompt is up. A fixed 15s sleep
 # races slow-boot autorun (Ctrl-C then lands on an autorun child: killed
 # but no respawn, a test artifact not a kernel bug). Poll for `sh$ ` first.
-( for i in $(seq 1 240); do grep -q '^sh\$ ' qemu3.log 2>/dev/null && break; sleep 1; done; printf '\003'; sleep 7; printf 'halt\n' ) | $TO3 qemu-system-riscv64 \
+# v3.14: feeder 240->360. Stubbed autorun is ~36s on a quiet host but
+# ~250s at host load ~5.8 (MTTCG -smp 4 contends with desktop CPU burn);
+# a blind Ctrl-C into autorun is a guaranteed FAIL, so the feeder must
+# cover the slowest observed prompt, not the median.
+( for i in $(seq 1 360); do grep -q '^sh\$ ' qemu3.log 2>/dev/null && break; sleep 1; done; printf '\003'; sleep 7; printf 'halt\n' ) | $TO3 qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
   -bios default \
@@ -357,7 +374,7 @@ rm -f qemu3.log
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
+  -netdev user,id=n0,hostfwd=tcp::8081-:80 \
   2>&1 | tee qemu3.log || true
 
 if [ ! -s qemu3.log ]; then
@@ -439,7 +456,9 @@ rm -f qemu4.log
 # v2.0: ...in theory. In practice autorun-phase console readers nibble early
 # input (observed: "crashwrite" -> "ashwrite"), and loaded hosts push the
 # prompt past any fixed sleep. Poll for the prompt like run3, then halt.
-( for i in $(seq 1 240); do grep -q '^sh\$ ' qemu4.log 2>/dev/null && break; sleep 1; done; printf 'halt\n' ) | $TO4 qemu-system-riscv64 \
+# v3.14: feeder 240->360 (same loaded-host math as §8; a blind halt is
+# nibbled and the section FAILs without [halting]).
+( for i in $(seq 1 360); do grep -q '^sh\$ ' qemu4.log 2>/dev/null && break; sleep 1; done; printf 'halt\n' ) | $TO4 qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
   -bios default \
@@ -447,7 +466,7 @@ rm -f qemu4.log
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
+  -netdev user,id=n0,hostfwd=tcp::8081-:80 \
   2>&1 | tee qemu4.log || true
 
 if [ ! -s qemu4.log ]; then
@@ -477,7 +496,7 @@ $TO qemu-system-riscv64 \
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
+  -netdev user,id=n0,hostfwd=tcp::8081-:80 \
   < /dev/null 2>&1 | tee qemu5.log || true
 
 if [ ! -s qemu5.log ]; then
@@ -514,7 +533,10 @@ echo "=== 11. power loss: SIGKILL mid-write, journal must recover ==="
 # input gets nibbled by autorun's console readers (observed: grep/sh byte
 # reads ate "cr" off "crashwrite"), so polling for `sh$ ` is mandatory.
 rm -f qemu6.log
-( for i in $(seq 1 240); do grep -q '^sh\$ ' qemu6.log 2>/dev/null && break; sleep 1; done; printf 'crashwrite write &\n'; sleep 60 ) | qemu-system-riscv64 \
+# v3.14: feeder 240->360, writer poll 280->420 (loaded-host prompt can
+# sit past 240s; a blind `crashwrite write &` is nibbled and bootB then
+# checks a file that was never written -- `crash FAIL (no file)`).
+( for i in $(seq 1 360); do grep -q '^sh\$ ' qemu6.log 2>/dev/null && break; sleep 1; done; printf 'crashwrite write &\n'; sleep 60 ) | qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
   -bios default \
@@ -522,10 +544,10 @@ rm -f qemu6.log
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
+  -netdev user,id=n0,hostfwd=tcp::8081-:80 \
   > qemu6.log 2>&1 &
 QEMU6=$!
-for i in $(seq 1 280); do
+for i in $(seq 1 420); do
   if grep -q "crashwrite running" qemu6.log 2>/dev/null; then
     echo "writer up, accumulating versions"
     break
@@ -543,7 +565,10 @@ wait $QEMU6 2>/dev/null || true
 
 echo "=== 11b. reboot after power loss: replay + verify ==="
 rm -f qemu7.log
-( for i in $(seq 1 240); do grep -q '^sh\$ ' qemu7.log 2>/dev/null && break; sleep 1; done; printf 'crashwrite check\n'; sleep 30 ) | qemu-system-riscv64 \
+# v3.14: feeder 240->360, poll 280->420. Same loaded-host math as §8/§9:
+# the `crashwrite check` must be prompt-gated (blind input is nibbled),
+# and the check itself runs only after the full autorun prefix.
+( for i in $(seq 1 360); do grep -q '^sh\$ ' qemu7.log 2>/dev/null && break; sleep 1; done; printf 'crashwrite check\n'; sleep 30 ) | qemu-system-riscv64 \
   -machine virt -smp 4 \
   -nographic \
   -bios default \
@@ -551,10 +576,10 @@ rm -f qemu7.log
   -drive file=fs.img,if=none,format=raw,id=x0 \
   -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
   -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \
-  -netdev user,id=n0,hostfwd=tcp::8080-:80 \
+  -netdev user,id=n0,hostfwd=tcp::8081-:80 \
   > qemu7.log 2>&1 &
 QEMU7=$!
-for i in $(seq 1 280); do
+for i in $(seq 1 420); do
   if grep -q "crash PASS\|crash FAIL" qemu7.log 2>/dev/null; then
     echo "check done"
     break
@@ -583,6 +608,12 @@ if grep -q "PANIC" qemu6.log qemu7.log; then
 else
   echo "OK: no PANIC (power-loss runs)"
 fi
+# v3.14: stop the stub servers here (kept alive through §11 so the
+# §11 boots' autorun prefix stays fast; see the §6 note).
+kill $ECHO_PID 2>/dev/null || true
+kill $HTTP_PID 2>/dev/null || true
+kill $DNS_PID 2>/dev/null || true
+kill $IMG_PID 2>/dev/null || true
 
 if [ "$PASS" = "1" ]; then
   echo "ALL TESTS PASSED"

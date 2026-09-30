@@ -1,0 +1,11 @@
+[package]
+name = "guest-tls"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal TLS 1.3 client crypto for muse-riscv-os guest programs (no_std compatible, zero deps)"
+license = "MIT"
+
+# Workspace member (so in-tree crates like user/wgets can path-depend on
+# it); still `cargo publish`-able via `cargo publish -p guest-tls`.
+# (Differs from guest-args/guest-fmt, which stay detached so the crates.io
+# round-trip test eats its own dogfood; guest-tls has no such test.)

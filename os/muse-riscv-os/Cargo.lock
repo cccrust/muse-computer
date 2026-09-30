@@ -66,6 +66,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "guest-tls"
+version = "0.1.0"
+
+[[package]]
 name = "host-tests"
 version = "0.1.0"
 
@@ -204,5 +208,13 @@ dependencies = [
 name = "wget"
 version = "0.1.0"
 dependencies = [
+ "user-lib",
+]
+
+[[package]]
+name = "wgets"
+version = "0.1.0"
+dependencies = [
+ "guest-tls",
  "user-lib",
 ]

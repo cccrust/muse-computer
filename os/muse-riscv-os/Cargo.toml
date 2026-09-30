@@ -2,6 +2,7 @@
 members = [
   "kernel",
   "user-lib",
+  "user-lib/guest-tls",
   "user/init",
   "user/sh",
   "user/ls",
@@ -22,6 +23,7 @@ members = [
   "user/ping",
   "user/nslookup",
   "user/wget",
+  "user/wgets",
   "user/curl",
     "user/ctr",
     "user/sleeper",

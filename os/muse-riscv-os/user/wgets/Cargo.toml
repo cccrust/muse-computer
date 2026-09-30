@@ -1,0 +1,18 @@
+[package]
+name = "wgets"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+user-lib = { path = "../../user-lib" }
+guest-tls = { path = "../../user-lib/guest-tls" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = "s"
+panic = "abort"

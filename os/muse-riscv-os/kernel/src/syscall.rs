@@ -75,6 +75,11 @@ pub const SYS_NSENTER: usize = 55;
 pub const SYS_MOUNTVOL: usize = 56;
 // v3.6: read back decoded cgroup quotas (ctr ps).
 pub const SYS_CGSTAT: usize = 57;
+// v3.14: test-grade entropy + wall clock for guest TLS (virt has neither
+// an RNG device nor an RTC; see sys_getrandom/sys_setwall/sys_getwall).
+pub const SYS_GETRANDOM: usize = 58;
+pub const SYS_SETWALL: usize = 59;
+pub const SYS_GETWALL: usize = 60;
 // v1.5: TCP listen-side + bind.
 pub const SYS_BIND: usize = 41;
 pub const SYS_LISTEN: usize = 42;
@@ -179,6 +184,9 @@ pub fn handle(id: usize, a0: usize, a1: usize, a2: usize, tf: *mut TrapFrame) ->
         SYS_BIND => sys_bind(a0 as i32, a1 as u16) as isize,
         SYS_LISTEN => sys_listen(a0 as i32) as isize,
         SYS_ACCEPT => sys_accept(a0 as i32) as isize,
+        SYS_GETRANDOM => sys_getrandom(a1, a2) as isize,
+        SYS_SETWALL => sys_setwall(a0 as u64) as isize,
+        SYS_GETWALL => sys_getwall() as isize,
         SYS_SHUTDOWN => {
             crate::println!("[SYS] shutdown");
             if crate::fs::use_disk() {
@@ -588,6 +596,66 @@ fn sys_recv(fd: i32, buf: usize, len: usize) -> isize {
             crate::net::sock_recv(s, dst)
         },
         None => -1,
+    }
+}
+
+// ---- v3.14: test-grade entropy + wall clock (guest TLS premises) ----
+//
+// virt has no RNG device and no RTC. This is NOT a CSPRNG and NOT NTP:
+// splitmix64 over (boot counter ^ timer ticks ^ hart id). Good enough for
+// TLS ClientHello random / ECDHE ephemeral in the test net (outcome
+// deterministic, bytes drift); a virtio-rng device is a later version.
+static mut RNG_STATE: u64 = 0x9e37_79b9_7f4a_7c15;
+static mut BOOT_EPOCH: u64 = 0; // wall secs at boot (0 = unset)
+
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+fn sys_getrandom(buf: usize, len: usize) -> isize {
+    if len == 0 || len > 256 {
+        return -1;
+    }
+    unsafe {
+        let dst = crate::fs::user_slice_mut(buf, len);
+        let mut i = 0;
+        while i < len {
+            // mix per-word entropy (SIE=0 in syscall context: no race).
+            RNG_STATE = RNG_STATE.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let t = crate::timer::ticks() as u64;
+            let h = crate::task::hartid() as u64;
+            let mut w = splitmix64(RNG_STATE ^ t.rotate_left(17) ^ h.rotate_left(41));
+            let mut j = 0;
+            while j < 8 && i + j < len {
+                dst[i + j] = (w & 0xff) as u8;
+                w >>= 8;
+                j += 1;
+            }
+            i += j;
+        }
+        len as isize
+    }
+}
+
+/// set the wall-clock epoch (secs at boot). From the registry's plaintext
+/// GET /time (host date); re-settable for the wrong-clock negative test.
+fn sys_setwall(epoch: u64) -> isize {
+    unsafe {
+        BOOT_EPOCH = epoch;
+    }
+    0
+}
+
+/// wall secs = epoch + uptime. -1 while unset (guest must sync first).
+fn sys_getwall() -> isize {
+    unsafe {
+        if BOOT_EPOCH == 0 {
+            return -1;
+        }
+        (BOOT_EPOCH + (crate::timer::ticks() / 100) as u64) as isize
     }
 }
 

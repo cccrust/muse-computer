@@ -56,9 +56,12 @@ v3.11: private versions + delete API.
 import io
 import os
 import socket
+import subprocess
 import tarfile
+import threading
 
 ADDR = ("127.0.0.1", 8091)
+TLS_ADDR = ("127.0.0.1", 8443)
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)  # os/muse-riscv-os/
 ECHO_ELF = os.path.join(ROOT, "target", "riscv64gc-unknown-none-elf",
@@ -192,6 +195,15 @@ def handle(conn: socket.socket) -> None:
         body = None
         if len(parts) >= 2 and parts[0] == b"GET":
             path = parts[1]
+            # v3.14: wall-clock feed (dynamic: host epoch + newline).
+            if path == b"/time":
+                import time as _time
+                now = ("%d\n" % int(_time.time())).encode()
+                conn.sendall(
+                    b"HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                    b"Content-Length: " + str(len(now)).encode() + b"\r\n"
+                    b"Connection: close\r\n\r\n" + now)
+                return
             # v3.4: builtin secret needs `Authorization: Bearer test-token`.
             # v3.11: disk-private versions (`.private` marker file) need it
             # too; a package index is gated iff any of its versions is
@@ -454,6 +466,131 @@ def handle_put(conn, path, header_lines, req):
         pass
 
 
+# ---- v3.14: TLS sidecar (chain files + 8443 listener) ----
+
+STATE_DIR = os.path.join(ROOT, "tools", "registry-state")
+
+
+def sh(cmd, cwd):
+    """Run an openssl recipe step; False (loud) on any failure."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        print("img_registry: TLS openssl missing/failed (%r)" % (e,), flush=True)
+        return False
+    if p.returncode != 0:
+        print("img_registry: TLS openssl failed: %r %s" % (cmd, p.stderr[-500:]), flush=True)
+        return False
+    return True
+
+
+def ensure_tls_chain():
+    """Root CA + leaf (SAN DNS:registry.local,IP:10.0.2.2) under STATE_DIR.
+
+    Generated once, reused across restarts (a pinned guest keeps working).
+    True on success; False (loud) when openssl is missing or any step fails
+    (the suite's TLS lines then fail visibly, never silently).
+    """
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(os.path.join(STATE_DIR, ".gitignore"), "w") as fh:
+            fh.write("# key material + generated chain -- never commit\n"
+                     "rootkey.pem\n"
+                     "leafkey.pem\n"
+                     "rootcert.der\n"
+                     "rootcert.srl\n"
+                     "leafcert.der\n"
+                     "leafcert.pem\n"
+                     "leaf.csr\n"
+                     "leafext.cnf\n"
+                     "!.gitignore\n")
+    except OSError as e:
+        print("img_registry: TLS state dir failed (%r)" % (e,), flush=True)
+        return False
+    need = ("rootkey.pem", "rootcert.der", "leafkey.pem", "leafcert.der", "leafcert.pem")
+    if all(os.path.isfile(os.path.join(STATE_DIR, f)) for f in need):
+        print("img_registry: TLS chain reused from %s" % STATE_DIR, flush=True)
+        return True
+    print("img_registry: generating TLS chain (openssl)...", flush=True)
+    steps = [
+        ["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout",
+         "-out", "rootkey.pem"],
+        ["openssl", "req", "-new", "-x509", "-key", "rootkey.pem",
+         "-out", "rootcert.der", "-outform", "DER", "-days", "3650",
+         "-subj", "/CN=Test Root CA",
+         "-addext", "basicConstraints=critical,CA:TRUE",
+         "-addext", "keyUsage=critical,keyCertSign,cRLSign,digitalSignature"],
+        ["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout",
+         "-out", "leafkey.pem"],
+        ["openssl", "req", "-new", "-key", "leafkey.pem", "-out", "leaf.csr",
+         "-subj", "/CN=registry.local"],
+    ]
+    for cmd in steps:
+        if not sh(cmd, STATE_DIR):
+            return False
+    try:
+        with open(os.path.join(STATE_DIR, "leafext.cnf"), "w") as fh:
+            fh.write("subjectAltName=DNS:registry.local,IP:10.0.2.2\n"
+                     "basicConstraints=CA:FALSE\n"
+                     "keyUsage=digitalSignature\n"
+                     "extendedKeyUsage=serverAuth\n")
+    except OSError as e:
+        print("img_registry: TLS extfile failed (%r)" % (e,), flush=True)
+        return False
+    if not sh(["openssl", "x509", "-req", "-in", "leaf.csr",
+               "-CA", "rootcert.der", "-CAkey", "rootkey.pem",
+               "-CAcreateserial", "-out", "leafcert.der", "-outform", "DER",
+               "-days", "3650", "-extfile", "leafext.cnf"], STATE_DIR):
+        return False
+    if not sh(["openssl", "x509", "-in", "leafcert.der", "-inform", "DER",
+               "-out", "leafcert.pem"], STATE_DIR):
+        return False
+    import hashlib
+    with open(os.path.join(STATE_DIR, "rootcert.der"), "rb") as fh:
+        fp = hashlib.sha256(fh.read()).hexdigest()
+    print("img_registry: TLS chain ready (root sha256 %s...)" % fp[:16], flush=True)
+    return True
+
+
+def tls_serve():
+    """8443 accept loop: same ROUTES/handler over TLS 1.3, single suite."""
+    import ssl
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    try:
+        ctx.set_ciphersuites("TLS_AES_128_GCM_SHA256")
+    except AttributeError:
+        pass  # older Pythons lack the setter; version floor still holds
+    ctx.load_cert_chain(os.path.join(STATE_DIR, "leafcert.pem"),
+                        os.path.join(STATE_DIR, "leafkey.pem"))
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(TLS_ADDR)
+    s.listen(8)
+    print("img_registry: listening on %s:%d [TLS1.3 AES_128_GCM_SHA256]"
+          % TLS_ADDR, flush=True)
+    while True:
+        try:
+            conn, _ = s.accept()
+            try:
+                tls = ctx.wrap_socket(conn, server_side=True)
+            except OSError as e:
+                print("img_registry: TLS accept failed (%r)" % (e,), flush=True)
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+            handle(tls)
+        except OSError:
+            pass
+
+
+def start_tls():
+    t = threading.Thread(target=tls_serve, name="tls8443", daemon=True)
+    t.start()
+
+
 def main() -> None:
     ROUTES[b"/testimg/manifest"] = MANIFEST
     ROUTES[b"/testimg/layer1.tar"] = build_layer1()
@@ -538,6 +675,19 @@ def main() -> None:
         print("img_registry: pkg repeat 1.0 versioned + index", flush=True)
     # v3.7: disk-published packages (survive restarts; win over builtins).
     load_disk()
+    # v3.14: TLS sidecar (same ROUTES over TLS 1.3 on 8443 + /time +
+    # /rootcert on plaintext for the guest wall clock and TOFU pin).
+    # The chain lives in tools/registry-state/ (persisted across restarts
+    # so a pinned guest keeps working; self-ignored via its own .gitignore
+    # -- never commit keys).
+    if ensure_tls_chain():
+        with open(os.path.join(STATE_DIR, "rootcert.der"), "rb") as fh:
+            ROUTES[b"/rootcert"] = fh.read()
+        print("img_registry: /time + /rootcert live on plaintext", flush=True)
+        start_tls()
+    else:
+        print("img_registry: TLS DISABLED (chain build failed; "
+              "wgets suite lines will fail -- see above)", flush=True)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(ADDR)

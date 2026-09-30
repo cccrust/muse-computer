@@ -1664,6 +1664,20 @@ pub extern "C" fn main(argc: usize, argv: *const *const u8) {
         &[b"ctr", b"remove", b"hello"],
         &mut jobs,
     );
+    // v3.14: TLS downloads (registry :8443 serves the same routes; the
+    // TOFU pin + wall clock ride the plaintext :8091 side channel).
+    // Fetches land in /tmp (no db involvement); each prints a distinct
+    // `wgets PASS <basename>` marker (see _doc/v3.14.md).
+    run_args(
+        b"/bin/wgets\0",
+        &[b"wgets", b"10.0.2.2", b"8443", b"/pkg/hello/1.0/manifest", b"/tmp/wgets-manifest"],
+        &mut jobs,
+    );
+    run_args(
+        b"/bin/wgets\0",
+        &[b"wgets", b"10.0.2.2", b"8443", b"/pkg/hello/1.0/hello.tar", b"/tmp/wgets-hello"],
+        &mut jobs,
+    );
     run_one(b"/bin/persist\0", &mut jobs);
     run_args(b"/bin/cat\0", &[b"cat", b"/TESTDATA"], &mut jobs);
     run_args(b"/bin/echo\0", &[b"echo", b"hello-arg"], &mut jobs);

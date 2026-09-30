@@ -279,6 +279,20 @@ pub fn memstat() -> isize {
 pub fn uptime_ms() -> isize {
     ecall(44, 0, 0, 0)
 }
+/// v3.14: test-grade entropy (SYS_GETRANDOM=58). Fills `buf` (<=256B),
+/// returns bytes written or -1. NOT a CSPRNG (splitmix over ticks/hart).
+pub fn getrandom(buf: &mut [u8]) -> isize {
+    ecall(58, 0, buf.as_mut_ptr() as usize, buf.len())
+}
+/// v3.14: wall clock (SYS_SETWALL=59, SYS_GETWALL=60). setwall(epoch_secs)
+/// records the host epoch at boot; walltime() returns epoch + uptime secs,
+/// or -1 while unset (guest must sync via GET /time first).
+pub fn setwall(epoch_secs: usize) -> isize {
+    ecall(59, epoch_secs, 0, 0)
+}
+pub fn walltime() -> isize {
+    ecall(60, 0, 0, 0)
+}
 
 /// v1.3: UDP sockets (SYS_SOCKET=37 .. SYS_RECV=40). connect takes BE
 /// IPv4 u32 + port; send/recv are datagrams on the connected peer.

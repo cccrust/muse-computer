@@ -1,0 +1,10 @@
+# key material + generated chain -- never commit
+rootkey.pem
+leafkey.pem
+rootcert.der
+rootcert.srl
+leafcert.der
+leafcert.pem
+leaf.csr
+leafext.cnf
+!.gitignore

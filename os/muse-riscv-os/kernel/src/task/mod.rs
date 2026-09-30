@@ -7,7 +7,13 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 pub const USER_STACK_TOP: usize = 0x7000_0000;
-pub const USER_STACK_PAGES: usize = 8;
+// v3.14: 16 pages (was 8). `ctr upgrade_one` holds ~29.5KB of parse
+// buffers in one frame (mb[2048] + manifest tables); with main +
+// cmd_upgrade + pkg_db_ver on top, 32KB overflowed deterministically
+// (page fault at pkg_db_ver prologue, same sepc/stval 3x). 64KB costs
+// 8 pre-allocated frames per proc and restores 2x headroom. (wgets
+// dodges this class entirely via mmap for its ~17KB record buffers.)
+pub const USER_STACK_PAGES: usize = 16;
 pub const TRAPFRAME_VA: usize = 0x7fff_e000;
 
 extern "C" {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """v1.5 host-side HTTP client for the guest webserver test.
 
-Connects to 127.0.0.1:8080 (QEMU user-net forwards it to the guest's
+Connects to 127.0.0.1:8081 (QEMU user-net forwards it to the guest's
 10.0.2.15:80 via hostfwd), sends `GET /README HTTP/1.0`, and asserts the
 response carries HTTP/1.0 200 plus the known README marker. Retries the
 connect for up to ~30s (SLIRP first-packet setup + guest boot are slow).
@@ -12,7 +12,7 @@ import sys
 import time
 
 HOST = "127.0.0.1"
-PORT = 8080
+PORT = 8081
 MARKER = b"muse-riscv-os"
 DEADLINE = 30.0
 
