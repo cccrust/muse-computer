@@ -1,0 +1,16 @@
+async fn fetch(n: Int) -> Int
+  return n * 10;
+end
+
+fn make_adder(base: Int) -> fn(Int) -> Int
+  managed {
+    return |x: Int| -> Int x + base end;
+  }
+end
+
+async fn main() -> Unit
+  let v = fetch(4).await;
+  println(v);
+  let add5 = make_adder(5);
+  println(add5(37));
+end

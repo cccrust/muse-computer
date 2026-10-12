@@ -1,0 +1,18 @@
+// 反例（編譯失敗是預期的）：NoAdd 的欄位全是 Bool，結構化證明不出 Add 命題，
+// `sum(xs)` 單態化時 rustc 報 E0277，aeroc 轉成 E0301 指回此檔。
+fn sum[T: Add + Clone](items: Array[T]) -> T
+  let mut total = items[0];
+  let mut i = 1;
+  while i < items.len()
+    total = total + items[i];
+    i = i + 1;
+  end
+  return total;
+end
+
+struct NoAdd { v: Bool } end
+
+fn main() -> Unit
+  let xs = [NoAdd { v: true }];
+  println(sum(xs));
+end

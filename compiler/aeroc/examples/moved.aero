@@ -1,0 +1,11 @@
+struct User { name: String } end
+
+fn consume(u: User) -> Unit
+  println(u.name);
+end
+
+fn main() -> Unit
+  let user_data = User { name: "bob" };
+  consume(move user_data);
+  consume(move user_data);
+end

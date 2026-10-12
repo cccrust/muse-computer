@@ -1,0 +1,24 @@
+// 多檔案模組：別名、巢狀目錄、同名函式共存、循環引用
+import "geometry.aero" as geo;
+import "util/mathx.aero";
+import "ping.aero";
+
+fn helper() -> Int
+  return 2;
+end
+
+fn main() -> Unit
+  let a = geo::Point::new(0, 0);
+  let b = geo::Point::new(3, 4);
+  println(a.dist2(&b));
+  println(mathx::square(9));
+
+  let shapes = [geo::Shape::Circle(2), geo::Shape::Rect(3, 4), geo::Shape::Dot];
+  for s in &shapes
+    println(geo::area(s));
+  end
+
+  println(geo::helper() + helper() + mathx::helper());
+  println(ping::is_even(10));
+  println(ping::is_even(7));
+end

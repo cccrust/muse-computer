@@ -1,0 +1,8 @@
+import "ping.aero" as ping;
+
+fn is_odd(n: Int) -> Bool
+  if n == 0
+    return false;
+  end
+  return ping::is_even(n - 1);
+end

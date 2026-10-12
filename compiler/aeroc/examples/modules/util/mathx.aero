@@ -1,0 +1,7 @@
+fn square(n: Int) -> Int
+  return n * n;
+end
+
+fn helper() -> Int
+  return 100;
+end

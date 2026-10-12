@@ -1,0 +1,16 @@
+[package]
+name = "aeroc"
+version = "0.1.0"
+edition = "2021"
+description = "Aero → Rust transpiler (parser: chumsky, codegen: quote/syn/prettyplease)"
+
+[dependencies]
+chumsky = "0.9"                                  # 解析器組合子（取代手寫 Lexer/Parser）
+ariadne = "0.3"                                  # 漂亮的終端錯誤報告
+proc-macro2 = "1"                                # TokenStream
+quote = "1"                                      # quote! 產生 Rust 程式碼
+syn = { version = "2", features = ["full"] }     # 驗證產出的 Rust 語法
+prettyplease = "0.2"                             # 格式化輸出
+toml = "0.8"                                     # 產生 Cargo.toml
+serde_json = "1"                                 # 解析 rustc JSON / 輸出 LLM 診斷
+clap = { version = "4", features = ["derive"] }  # CLI

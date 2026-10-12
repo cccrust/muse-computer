@@ -1,0 +1,52 @@
+// impl 區塊：靜態函式、&self / &mut self 方法、gc 物件上的方法
+struct Counter { mut n: Int } end
+
+impl Counter
+  fn new(start: Int) -> Counter
+    return Counter { n: start };
+  end
+
+  fn inc(&mut self) -> Unit
+    self.n = self.n + 1;
+  end
+
+  fn get(&self) -> Int
+    return self.n;
+  end
+
+  fn add(&mut self, k: Int) -> Int
+    self.n = self.n + k;
+    return self.n;
+  end
+end
+
+gc struct Account { mut balance: Int, mut history: Array[Int] } end
+
+impl Account
+  fn deposit(&mut self, amt: Int) -> Unit
+    self.balance = self.balance + amt;
+    self.history.push(amt);
+  end
+
+  fn total(&self) -> Int
+    return self.balance;
+  end
+end
+
+fn main() -> Unit
+  let mut c = Counter::new(10);
+  c.inc();
+  c.inc();
+  println(c.get());
+  println(c.add(5));
+  println(c |> get);
+
+  managed {
+    let acc = gc Account { balance: 0, history: [] };
+    let alias = acc;
+    acc.deposit(100);
+    alias.deposit(50);
+    println(acc.total());
+    println(alias.history.len());
+  }
+end

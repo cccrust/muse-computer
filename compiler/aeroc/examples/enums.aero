@@ -1,0 +1,96 @@
+// enum / match / Option[T] / guard / or-pattern / 字串比對 / gc enum
+enum Expr
+  Num(Int),
+  Add(Int, Int),
+  Neg(Int),
+  Zero
+end
+
+gc enum Tree
+  Leaf(Int),
+  Pair(gc Tree, gc Tree)
+end
+
+fn eval(e: &Expr) -> Int
+  match e
+    case Expr::Num(n)
+      return n;
+    case Expr::Add(a, b)
+      return a + b;
+    case Expr::Neg(x)
+      return 0 - x;
+    case Expr::Zero
+      return 0;
+  end
+end
+
+fn describe(n: Int) -> String
+  match n
+    case 0
+      return "zero";
+    case 1 | 2 | 3
+      return "small";
+    case x if x < 0
+      return "negative";
+    case _
+      return "big";
+  end
+end
+
+fn find(items: &Array[Int], target: Int) -> Option[Int]
+  let mut i = 0;
+  while i < items.len()
+    if items[i] == target
+      return Some(i);
+    end
+    i = i + 1;
+  end
+  return None;
+end
+
+fn sum_tree(t: gc Tree) -> Int
+  match t
+    case Tree::Leaf(n)
+      return n;
+    case Tree::Pair(l, r)
+      return sum_tree(l) + sum_tree(r);
+  end
+end
+
+fn main() -> Unit
+  let e1 = Expr::Add(2, 3);
+  let e2 = Expr::Neg(7);
+  let z = Expr::Zero;
+  println(eval(&e1));
+  println(eval(&e2));
+  println(eval(&z));
+
+  println(describe(0));
+  println(describe(2));
+  println(describe(-4));
+  println(describe(99));
+
+  let xs = [5, 6, 7];
+  match find(&xs, 6)
+    case Some(i) println(i);
+    case None println("missing");
+  end
+  match find(&xs, 9)
+    case Some(i) println(i);
+    case None println("missing");
+  end
+
+  let name = "bob";
+  match name
+    case "alice" println(1);
+    case "bob" println(2);
+    case _ println(3);
+  end
+
+  managed {
+    let a: gc Tree = Tree::Leaf(1);
+    let b: gc Tree = Tree::Leaf(2);
+    let root: gc Tree = Tree::Pair(a, b);
+    println(sum_tree(root));
+  }
+end

@@ -1,0 +1,61 @@
+// trait / 自動特徵：Curry-Howard 視角——trait 是「型態滿足特定命題的證明」
+// - LLM 永遠不用手寫 `impl Trait for Type`：固有方法齊了，編譯器自動橋接
+// - 內建特徵（Clone/Comparable/Serializable/...）由編譯器結構化證明並自動 derive
+// - 泛型約束 `fn f[T: Bound]` 即邏輯命題，驗證外包給 rustc（同 Borrow Checker 策略）
+
+// 命題規格：可度量（有面積）
+trait Measurable
+  fn area(&self) -> Int;
+end
+
+struct Point { x: Int, y: Int } end
+
+// 只寫固有方法即可——`impl Measurable for Point` 由編譯器自動橋接產生
+impl Point
+  fn new(x: Int, y: Int) -> Point
+    return Point { x: x, y: y };
+  end
+
+  fn area(&self) -> Int
+    return self.x * self.y;
+  end
+end
+
+// T 必須具備可加性命題（+ Clone：泛型下讀取元素需複製，見 README）
+fn sum[T: Add + Clone](items: Array[T]) -> T
+  let mut total = items[0];
+  let mut i = 1;
+  while i < items.len()
+    total = total + items[i];
+    i = i + 1;
+  end
+  return total;
+end
+
+// 泛型結構：形參邊界即命題
+struct Pair[T: Clone] {
+  first: T,
+  second: T
+}
+end
+
+// 使用者 trait 也可作泛型邊界（M 滿足 Measurable 命題）
+fn describe[M: Measurable](m: &M) -> Int
+  return m.area();
+end
+
+fn main() -> Unit
+  let p = Point::new(3, 4);
+  println(p.area());
+  println(describe(&p));
+
+  let xs = [1, 2, 3, 4];
+  println(sum(xs));
+
+  let pair = Pair { first: 1, second: 2 };
+  println(pair.first + pair.second);
+
+  // 自動衍生：Point 的欄位全是 Int，編譯器已自動證明
+  // Equatable/Comparable/Hashable/Serializable 並 derive，對應 PartialEq/serde 等
+  println(p == Point::new(3, 4));
+end

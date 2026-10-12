@@ -1,0 +1,36 @@
+import "util/mathx.aero" as mx;
+
+struct Point { x: Int, y: Int } end
+
+impl Point
+  fn new(x: Int, y: Int) -> Point
+    return Point { x: x, y: y };
+  end
+
+  fn dist2(&self, other: &Point) -> Int
+    let dx = mx::square(self.x - other.x);
+    let dy = mx::square(self.y - other.y);
+    return dx + dy;
+  end
+end
+
+enum Shape
+  Circle(Int),
+  Rect(Int, Int),
+  Dot
+end
+
+fn area(s: &Shape) -> Int
+  match s
+    case Shape::Circle(r)
+      return 3 * mx::square(r);
+    case Shape::Rect(w, h)
+      return w * h;
+    case Shape::Dot
+      return 0;
+  end
+end
+
+fn helper() -> Int
+  return 1;
+end

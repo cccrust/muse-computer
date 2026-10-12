@@ -1,0 +1,8 @@
+import "pong.aero" as pong;
+
+fn is_even(n: Int) -> Bool
+  if n == 0
+    return true;
+  end
+  return pong::is_odd(n - 1);
+end
