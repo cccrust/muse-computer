@@ -1,0 +1,116 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+fn helper() -> i64 {
+    return 2i64;
+}
+fn main() {
+    let a = geometry__Point::new(0i64, 0i64);
+    let b = geometry__Point::new(3i64, 4i64);
+    println(a.dist2(&b));
+    println(mathx__square(9i64));
+    let shapes = ::std::vec![
+        geometry__Shape::Circle(2i64), geometry__Shape::Rect(3i64, 4i64),
+        geometry__Shape::Dot
+    ];
+    for s in &shapes {
+        println(geometry__area(s));
+    }
+    println(((geometry__helper() + helper()) + mathx__helper()));
+    println(ping__is_even(10i64));
+    println(ping__is_even(7i64));
+}
+#[derive(
+    Clone,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::std::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub struct geometry__Point {
+    pub x: i64,
+    pub y: i64,
+}
+impl geometry__Point {
+    fn new(x: i64, y: i64) -> geometry__Point {
+        return geometry__Point { x: x, y: y };
+    }
+    fn dist2(&self, other: &geometry__Point) -> i64 {
+        let dx = mathx__square((self.x - other.x));
+        let dy = mathx__square((self.y - other.y));
+        return (dx + dy);
+    }
+}
+#[derive(
+    Clone,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub enum geometry__Shape {
+    Circle(i64),
+    Rect(i64, i64),
+    Dot,
+}
+fn geometry__area(s: &geometry__Shape) -> i64 {
+    match s {
+        geometry__Shape::Circle(r) => {
+            return (3i64 * mathx__square((*r)));
+        }
+        geometry__Shape::Rect(w, h) => {
+            return ((*w) * (*h));
+        }
+        geometry__Shape::Dot => {
+            return 0i64;
+        }
+    }
+}
+fn geometry__helper() -> i64 {
+    return 1i64;
+}
+fn mathx__square(n: i64) -> i64 {
+    return (n * n);
+}
+fn mathx__helper() -> i64 {
+    return 100i64;
+}
+fn ping__is_even(n: i64) -> bool {
+    if (n == 0i64) {
+        return true;
+    }
+    return pong__is_odd((n - 1i64));
+}
+fn pong__is_odd(n: i64) -> bool {
+    if (n == 0i64) {
+        return false;
+    }
+    return ping__is_even((n - 1i64));
+}

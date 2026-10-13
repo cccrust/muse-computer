@@ -1,27 +1,31 @@
-// trait / 自動特徵：Curry-Howard 視角——trait 是「型態滿足特定命題的證明」
+// trait / 自動特徵正例：Curry-Howard 視角——trait 是「型態滿足特定命題的證明」。
 // - LLM 永遠不用手寫 `impl Trait for Type`：固有方法齊了，編譯器自動橋接
 // - 內建特徵（Clone/Comparable/Serializable/...）由編譯器結構化證明並自動 derive
 // - 泛型約束 `fn f[T: Bound]` 即邏輯命題，驗證外包給 rustc（同 Borrow Checker 策略）
+// 執行：aeroc run examples/traits.aero（預期輸出見 traits.aero.md）
 
-// 命題規格：可度量（有面積）
+// 命題規格：可度量（有面積）。任何提供 `area(&self) -> Int` 的型別即滿足此命題。
 trait Measurable
   fn area(&self) -> Int;
 end
 
 struct Point { x: Int, y: Int } end
 
-// 只寫固有方法即可——`impl Measurable for Point` 由編譯器自動橋接產生
+// 只寫固有方法即可——`impl Measurable for Point` 由編譯器自動橋接產生（手寫亦可，自動橋接會讓路）。
 impl Point
+  // 靜態建構：Point::new(3, 4)。
   fn new(x: Int, y: Int) -> Point
     return Point { x: x, y: y };
   end
 
+  // 滿足 Measurable 命題的關鍵方法：面積（此處以 x*y 示意）。
   fn area(&self) -> Int
     return self.x * self.y;
   end
 end
 
-// T 必須具備可加性命題（+ Clone：泛型下讀取元素需複製，見 README）
+// 泛型求和：T 必須具備可加性命題（Add）+ Clone。
+// 並列 Clone 的原因：泛型下以索引讀取元素會 `.clone()`（見 README），算術約束通常需並列 Clone。
 fn sum[T: Add + Clone](items: Array[T]) -> T
   let mut total = items[0];
   let mut i = 1;
@@ -32,30 +36,33 @@ fn sum[T: Add + Clone](items: Array[T]) -> T
   return total;
 end
 
-// 泛型結構：形參邊界即命題
+// 泛型結構：形參邊界即命題（T 須 Clone 才能整體 Clone/比較/序列化）。
 struct Pair[T: Clone] {
   first: T,
   second: T
 }
 end
 
-// 使用者 trait 也可作泛型邊界（M 滿足 Measurable 命題）
+// 使用者 trait 也可作泛型邊界：M 滿足 Measurable 命題即可呼叫 m.area()。
 fn describe[M: Measurable](m: &M) -> Int
   return m.area();
 end
 
 fn main() -> Unit
   let p = Point::new(3, 4);
-  println(p.area());
-  println(describe(&p));
+  println(p.area());           // 3 * 4 = 12（直接調固有方法）
+  println(describe(&p));       // 12（經泛型 + Measurable 邊界調用）
 
+  // sum 具現 T=Int（Int 滿足 Add+Clone）：1+2+3+4 = 10。
   let xs = [1, 2, 3, 4];
   println(sum(xs));
 
+  // Pair 具現 T=Int：1 + 2 = 3。
   let pair = Pair { first: 1, second: 2 };
   println(pair.first + pair.second);
 
   // 自動衍生：Point 的欄位全是 Int，編譯器已自動證明
-  // Equatable/Comparable/Hashable/Serializable 並 derive，對應 PartialEq/serde 等
-  println(p == Point::new(3, 4));
+  // Equatable/Comparable/Hashable/Serializable 並 derive，對應 PartialEq/serde 等。
+  // 故 `==` 可直接用（PartialEq 已自動衍生）。
+  println(p == Point::new(3, 4)); // true
 end

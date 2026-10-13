@@ -1,4 +1,8 @@
-// enum / match / Option[T] / guard / or-pattern / 字串比對 / gc enum
+// enum / match / Option[T] / guard / or-pattern / 字串比對 / gc enum 全家桶。
+// 執行：aeroc run examples/enums.aero（預期輸出見 enums.aero.md）
+
+// 普通枚舉：四種變體——帶一個 Int、帶兩個 Int、一元負號、無負載。
+// 漏分支時 rustc E0004 會被 aeroc 轉為 E0200 指回 .aero。
 enum Expr
   Num(Int),
   Add(Int, Int),
@@ -6,11 +10,14 @@ enum Expr
   Zero
 end
 
+// GC 枚舉：變體可遞迴持有 `gc Tree`，樹節點不斷鏈（tracing GC 回收）。
 gc enum Tree
   Leaf(Int),
   Pair(gc Tree, gc Tree)
 end
 
+// 對 Expr 求值：`&Expr` 共享借用傳入，match 解構各變體。
+// 一元負號寫成 `0 - x`。
 fn eval(e: &Expr) -> Int
   match e
     case Expr::Num(n)
@@ -24,19 +31,21 @@ fn eval(e: &Expr) -> Int
   end
 end
 
+// 四種 match 技巧：字面值分支、or-pattern、guard、通配。
 fn describe(n: Int) -> String
   match n
     case 0
-      return "zero";
+      return "zero";           // Int 字面值比對
     case 1 | 2 | 3
-      return "small";
+      return "small";          // `|`：任一命中即進此分支
     case x if x < 0
-      return "negative";
+      return "negative";       // 綁定 x + guard 條件
     case _
-      return "big";
+      return "big";            // 通配：以上皆非
   end
 end
 
+// 線性搜尋：命中回 Some(索引)，找無回 None。
 fn find(items: &Array[Int], target: Int) -> Option[Int]
   let mut i = 0;
   while i < items.len()
@@ -48,6 +57,7 @@ fn find(items: &Array[Int], target: Int) -> Option[Int]
   return None;
 end
 
+// 遞迴求 GC 樹總和：Leaf 回值，Pair 分治相加。
 fn sum_tree(t: gc Tree) -> Int
   match t
     case Tree::Leaf(n)
@@ -58,28 +68,32 @@ fn sum_tree(t: gc Tree) -> Int
 end
 
 fn main() -> Unit
+  // eval 三例：Add(2,3)=5、Neg(7)=-7、Zero=0。
   let e1 = Expr::Add(2, 3);
   let e2 = Expr::Neg(7);
   let z = Expr::Zero;
-  println(eval(&e1));
-  println(eval(&e2));
-  println(eval(&z));
+  println(eval(&e1));          // 5
+  println(eval(&e2));          // -7
+  println(eval(&z));           // 0
 
-  println(describe(0));
-  println(describe(2));
-  println(describe(-4));
-  println(describe(99));
+  // describe 四例：zero / small / negative / big。
+  println(describe(0));        // zero
+  println(describe(2));        // small（or-pattern）
+  println(describe(-4));       // negative（guard）
+  println(describe(99));       // big（通配）
 
+  // Option 解包：find(6) 命中索引 1；find(9) 落 None。
   let xs = [5, 6, 7];
   match find(&xs, 6)
-    case Some(i) println(i);
+    case Some(i) println(i);   // 1
     case None println("missing");
   end
   match find(&xs, 9)
     case Some(i) println(i);
-    case None println("missing");
+    case None println("missing"); // missing
   end
 
+  // 字串 match：命中 "bob" 印 2。
   let name = "bob";
   match name
     case "alice" println(1);
@@ -87,10 +101,11 @@ fn main() -> Unit
     case _ println(3);
   end
 
+  // GC 樹求和：Pair(Leaf(1), Leaf(2)) = 3。
   managed {
     let a: gc Tree = Tree::Leaf(1);
     let b: gc Tree = Tree::Leaf(2);
     let root: gc Tree = Tree::Pair(a, b);
-    println(sum_tree(root));
+    println(sum_tree(root));   // 3
   }
 end

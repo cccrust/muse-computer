@@ -1,0 +1,52 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+fn sum<T: ::std::ops::Add<Output = T> + ::std::clone::Clone>(
+    items: ::std::vec::Vec<T>,
+) -> T {
+    let mut total = items[(0i64) as usize].clone();
+    let mut i = 1i64;
+    while (i < (items.len() as i64)) {
+        total = (total + items[(i) as usize].clone());
+        i = (i + 1i64);
+    }
+    return total;
+}
+#[derive(
+    Clone,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::std::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub struct NoAdd {
+    pub v: bool,
+}
+fn main() {
+    let xs = ::std::vec![NoAdd { v : true }];
+    println(sum(xs));
+}

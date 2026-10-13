@@ -1,0 +1,133 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+extern "C" {
+    fn labs(x: i64) -> i64;
+}
+#[derive(
+    Clone,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::std::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub struct Point {
+    pub x: i64,
+    pub y: i64,
+}
+#[derive(Clone, ::gc::Trace, ::gc::Finalize, ::std::default::Default)]
+pub struct Node {
+    pub value: i64,
+    pub links: ::std::vec::Vec<::gc::Gc<::gc::GcCell<Node>>>,
+}
+fn make_point(x: i64, y: i64) -> Point {
+    return Point { x: x, y: y };
+}
+fn add(a: i64, b: i64) -> i64 {
+    return (a + b);
+}
+fn double(n: i64) -> i64 {
+    return (n * 2i64);
+}
+fn sum(items: &::std::vec::Vec<i64>) -> i64 {
+    let mut total = 0i64;
+    for i in items {
+        total = (total + i);
+    }
+    return total;
+}
+fn bump(n: &mut Node) {
+    n.value = (n.value + 1i64);
+}
+fn show(n: &Node) {
+    println(n.value);
+}
+fn main() {
+    let p = make_point(3i64, 4i64);
+    println((p.x + p.y));
+    let xs = ::std::vec![1i64, 2i64, 3i64, 4i64];
+    println(sum(&xs));
+    let r: i64 = add(3i64, 4i64);
+    println(r);
+    println(double(double(5i64)));
+    let inc = ::std::rc::Rc::new(move |x: i64| -> i64 {
+        return (x + 1i64);
+    });
+    println(inc(41i64));
+    let greeting = ::std::format!(
+        "{}{}", ::std::format!("{}{}", ::std::string::String::from("hello"),
+        ::std::string::String::from(", ")), ::std::string::String::from("aero")
+    );
+    println(greeting);
+    let mut i = 0i64;
+    while (i < 3i64) {
+        i = (i + 1i64);
+    }
+    println(i);
+    {
+        let a = ::gc::Gc::new(
+            ::gc::GcCell::new(Node {
+                value: 1i64,
+                links: ::std::vec![],
+            }),
+        );
+        let b = ::gc::Gc::new(
+            ::gc::GcCell::new(Node {
+                value: 2i64,
+                links: ::std::vec![],
+            }),
+        );
+        {
+            let __aero_a0 = b.clone();
+            a.borrow_mut().links.push(__aero_a0)
+        };
+        {
+            let __aero_a0 = a.clone();
+            b.borrow_mut().links.push(__aero_a0)
+        };
+        {
+            let __aero_rhs = (a.borrow().value + 10i64);
+            a.borrow_mut().value = __aero_rhs;
+        }
+        let alias = a.clone();
+        {
+            let __aero_rhs = (alias.borrow().value + 100i64);
+            alias.borrow_mut().value = __aero_rhs;
+        }
+        println(a.borrow().value);
+        bump(&mut *a.borrow_mut());
+        show(&*a.borrow());
+        println(({ a.borrow().links.len() } as i64));
+        let copy: Node = (*a.borrow()).clone();
+        println(copy.value);
+    }
+    ::gc::force_collect();
+    unsafe {
+        let v = unsafe { labs((0i64 - 5i64)) };
+        println(v);
+    }
+}

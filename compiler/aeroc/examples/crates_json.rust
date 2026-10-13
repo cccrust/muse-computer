@@ -1,0 +1,45 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+#[derive(
+    Clone,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::std::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub struct Point {
+    pub x: i64,
+    pub y: i64,
+}
+fn main() {
+    let p = Point { x: 3i64, y: 4i64 };
+    let s = serde_json::to_string(&p).unwrap();
+    println(&s);
+    let q: Point = serde_json::from_str(&s).unwrap();
+    println((q.x + q.y));
+}

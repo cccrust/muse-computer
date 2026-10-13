@@ -1,0 +1,20 @@
+{"log":
+ [{"message":
+   ".> LEAN_PATH=/Users/Shared/ccc/115a/muse-computer/compiler/lean-self/.lake/build/lib/lean /Users/cccuser/.elan/toolchains/leanprover--lean4---v4.20.0/bin/lean /Users/Shared/ccc/115a/muse-computer/compiler/lean-self/Main.lean -R /Users/Shared/ccc/115a/muse-computer/compiler/lean-self -o /Users/Shared/ccc/115a/muse-computer/compiler/lean-self/.lake/build/lib/lean/Main.olean -i /Users/Shared/ccc/115a/muse-computer/compiler/lean-self/.lake/build/lib/lean/Main.ilean -c /Users/Shared/ccc/115a/muse-computer/compiler/lean-self/.lake/build/ir/Main.c --json",
+   "level": "trace"}],
+ "inputs":
+ [["Main:deps",
+   [["deps",
+     [["minicompiler/minic:extraDep", [["@minicompiler:extraDep", "1723"]]],
+      ["import oleans", "1723"]]],
+    ["libs",
+     [["import dynlibs", "1723"],
+      ["package external libraries", "1723"],
+      ["module dynlibs", "1723"],
+      ["module plugins", "1723"]]]]],
+  ["Lean 4.20.0, commit 77cfc4d1a4f6ef6651792b781eaa6676b4f3f060",
+   "16311077432335102250"],
+  ["Module.leanArgs: #[]", "1723"],
+  ["/Users/Shared/ccc/115a/muse-computer/compiler/lean-self/Main.lean",
+   "8459823159406790824"]],
+ "depHash": "1569959387407730672"}

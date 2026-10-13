@@ -1,0 +1,44 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+async fn hello() -> ::std::string::String {
+    return ::std::string::String::from("hello, aero");
+}
+async fn health() -> ::std::string::String {
+    return ::std::string::String::from("ok");
+}
+#[tokio::main]
+async fn main() {
+    let root = ::std::string::String::from("/");
+    let health_path = ::std::string::String::from("/health");
+    let app = axum::Router::new()
+        .route(&root, axum::routing::get(hello))
+        .route(&health_path, axum::routing::get(health));
+    let listener = (tokio::net::TcpListener::bind(
+        ::std::string::String::from("127.0.0.1:18080"),
+    ))
+        .await
+        .unwrap();
+    println(::std::string::String::from("listening on 18080"));
+    (axum::serve(listener, app)).await;
+}

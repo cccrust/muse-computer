@@ -1,11 +1,19 @@
+// 所有權反例（編譯失敗是預期的）：`move` 後再使用。
+// 檢查：aeroc check examples/moved.aero --json 必失敗，JSON 含 E0102（見 moved.aero.md）。
+// 原理：所有權驗證外包給 rustc，aeroc 以 #[aero_at] 對照表把 use-after-move 指回 .aero 行列。
+
+// Zero-GC 結構：按值傳遞即移動所有權（非 Copy 型別）。
 struct User { name: String } end
 
+// 按值取參：呼叫 `consume(move u)` 時所有權移入函式，呼叫方失去 u。
 fn consume(u: User) -> Unit
   println(u.name);
 end
 
 fn main() -> Unit
   let user_data = User { name: "bob" };
+  // 第一次 move：合法，user_data 所有權移入 consume。
   consume(move user_data);
+  // 第二次 move：非法！user_data 已失效，觸發 E0102（rustc E0382 轉寫）。
   consume(move user_data);
 end

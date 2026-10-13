@@ -1,0 +1,15 @@
+{"log":
+ [{"message":
+   ".> /Users/cccuser/.elan/toolchains/leanprover--lean4---v4.20.0/bin/clang -c -o /Users/Shared/ccc/115a/muse-computer/compiler/lean-self/.lake/build/ir/Main.c.o.export /Users/Shared/ccc/115a/muse-computer/compiler/lean-self/.lake/build/ir/Main.c -I /Users/cccuser/.elan/toolchains/leanprover--lean4---v4.20.0/include -fstack-clash-protection -fwrapv -fvisibility=hidden -Wno-unused-command-line-argument --sysroot /Users/cccuser/.elan/toolchains/leanprover--lean4---v4.20.0 -nostdinc -isystem /Users/cccuser/.elan/toolchains/leanprover--lean4---v4.20.0/include/clang -O3 -DNDEBUG -DLEAN_EXPORTING",
+   "level": "trace"}],
+ "inputs":
+ [["Main:c",
+   [["/Users/Shared/ccc/115a/muse-computer/compiler/lean-self/.lake/build/ir/Main.c",
+     "14610929106872200826"],
+    ["Lean 4.20.0, commit 77cfc4d1a4f6ef6651792b781eaa6676b4f3f060",
+     "16311077432335102250"]]],
+  ["Lean 4.20.0, commit 77cfc4d1a4f6ef6651792b781eaa6676b4f3f060",
+   "16311077432335102250"],
+  ["traceArgs: #[-O3, -DNDEBUG, -DLEAN_EXPORTING]", "13974588697068907418"],
+  ["arm64-apple-darwin23.6.0", "17616366027971700708"]],
+ "depHash": "5225510556545217021"}

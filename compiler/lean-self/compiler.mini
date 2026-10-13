@@ -1,0 +1,663 @@
+// ============================================================================
+//  compiler.mini — 用 MiniLang 寫的 MiniLang 編譯器（自舉用）
+//
+//  輸入：stdin 讀進 MiniLang 原始碼
+//  輸出：stdout 印出 IR 串流（每行一個整數）
+//          記憶體大小, op0, arg0, op1, arg1, ...
+//        出錯時輸出：-1, 錯誤碼, 出錯的 token 位置
+//
+//  單趟（one-pass）編譯器：語法分析的同時直接產生 IR，不建 AST。
+//  它產生的 IR 與 Lean 版 stage0 編譯器逐位元相同。
+//
+//  IR opcode：
+//    0 push   1 load   2 store  3 mload  4 mstore  5 bin   6 neg
+//    7 not    8 print  9 jmp   10 jz    11 call   12 enter 13 ret
+//   14 pop   15 getc  16 putc  17 halt
+//  bin 的運算元：0 add 1 sub 2 mul 3 div 4 mod 5 eq 6 ne 7 lt 8 le 9 gt 10 ge
+//
+//  Token 種類：0 EOF  1 數字/字元  2 識別字  3 字串
+//              4 ==  5 !=  6 <=  7 >=  8 &&  9 ||   其餘單一符號 = 它的 ASCII 碼
+// ============================================================================
+
+// ---------- 全域狀態 ----------
+array src[80000];        // 原始碼
+let srclen = 0;
+
+array tk[30000];         // token 種類
+array tv[30000];         // token 值（數字值，或識別字/字串在 src 中的起點）
+array tl[30000];         // token 長度（識別字/字串）
+let ntok = 0;
+let tp = 0;              // 目前 token 位置
+
+array cop[60000];        // 產生的 IR：opcode
+array carg[60000];       // 產生的 IR：運算元
+let ncode = 0;
+let heap = 0;            // 全域記憶體配置指標（單位：格）
+
+array gname[2000];       // 全域符號表：名稱（token 索引）
+array gaddr[2000];       //            位址
+let ng = 0;
+
+array lname[200];        // 區域符號表（目前函式）
+array lslot[200];
+let nl = 0;
+let lcount = 0;          // 目前函式已配置的槽數（含參數）
+let infn = 0;            // 是否正在編譯函式本體
+
+array fname[500];        // 函式表
+array fpc[500];
+array farity[500];
+let nf = 0;
+
+array spc[3000];         // 呼叫點：待回填的 call 指令位置
+array sname[3000];       //          被呼叫者名稱（token 索引）
+array sn[3000];          //          引數個數
+let ns = 0;
+
+// ---------- 錯誤處理 ----------
+fn fail(code) {
+  print 0 - 1;
+  print code;
+  print tp;
+  halt();
+}
+
+// ---------- 詞法分析 ----------
+fn isDigit(c) { return c >= '0' && c <= '9'; }
+
+fn isAlpha(c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+fn isAlnum(c) { return isAlpha(c) || isDigit(c); }
+
+fn isSym(c) {
+  return c == '+' || c == '-' || c == '*' || c == '/' || c == '%'
+      || c == '(' || c == ')' || c == '<' || c == '>' || c == '='
+      || c == '{' || c == '}' || c == ';' || c == '[' || c == ']'
+      || c == ',' || c == '!';
+}
+
+fn addtok(kind, v, l) {
+  tk[ntok] = kind;
+  tv[ntok] = v;
+  tl[ntok] = l;
+  ntok = ntok + 1;
+}
+
+fn lex() {
+  let i = 0;
+  while (i < srclen) {
+    let c = src[i];
+    let d = src[i + 1];
+    if (c <= 32) {
+      i = i + 1;
+    } else if (c == '/' && d == '/') {
+      while (i < srclen && src[i] != 10) {
+        i = i + 1;
+      }
+    } else if (isDigit(c)) {
+      let v = 0;
+      while (isDigit(src[i])) {
+        v = v * 10 + src[i] - '0';
+        i = i + 1;
+      }
+      addtok(1, v, 0);
+    } else if (isAlpha(c)) {
+      let st = i;
+      while (isAlnum(src[i])) {
+        i = i + 1;
+      }
+      addtok(2, st, i - st);
+    } else if (c == '\'') {
+      let ch = d;
+      let adv = 3;
+      if (d == '\\') {
+        ch = src[i + 2];
+        adv = 4;
+        if (ch == 'n') { ch = 10; }
+        else if (ch == 't') { ch = 9; }
+      }
+      if (src[i + adv - 1] != '\'') { tp = i; fail(1); }
+      addtok(1, ch, 0);
+      i = i + adv;
+    } else if (c == '"') {
+      i = i + 1;
+      let st2 = i;
+      while (i < srclen && src[i] != '"') {
+        i = i + 1;
+      }
+      if (i >= srclen) { tp = i; fail(2); }
+      addtok(3, st2, i - st2);
+      i = i + 1;
+    } else if (c == '=' && d == '=') {
+      addtok(4, 0, 0);
+      i = i + 2;
+    } else if (c == '!' && d == '=') {
+      addtok(5, 0, 0);
+      i = i + 2;
+    } else if (c == '<' && d == '=') {
+      addtok(6, 0, 0);
+      i = i + 2;
+    } else if (c == '>' && d == '=') {
+      addtok(7, 0, 0);
+      i = i + 2;
+    } else if (c == '&' && d == '&') {
+      addtok(8, 0, 0);
+      i = i + 2;
+    } else if (c == '|' && d == '|') {
+      addtok(9, 0, 0);
+      i = i + 2;
+    } else if (isSym(c)) {
+      addtok(c, 0, 0);
+      i = i + 1;
+    } else {
+      tp = i;
+      fail(3);
+    }
+  }
+  addtok(0, 0, 0);
+}
+
+// ---------- 名稱與符號表 ----------
+// token t 的原文是否等於以 0 結尾的字串 s（s 是記憶體位址）
+fn tokeq(t, s) {
+  let len = tl[t];
+  let j = 0;
+  while (j < len) {
+    if (src[tv[t] + j] != s[j]) { return 0; }
+    j = j + 1;
+  }
+  return s[len] == 0;
+}
+
+// 目前 token 是否為關鍵字 s
+fn isKw(s) { return tk[tp] == 2 && tokeq(tp, s); }
+
+// 兩個識別字 token 是否同名
+fn sameName(a, b) {
+  if (tl[a] != tl[b]) { return 0; }
+  let j = 0;
+  while (j < tl[a]) {
+    if (src[tv[a] + j] != src[tv[b] + j]) { return 0; }
+    j = j + 1;
+  }
+  return 1;
+}
+
+fn findLocal(t) {
+  let i = 0;
+  while (i < nl) {
+    if (sameName(lname[i], t)) { return lslot[i]; }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+fn findGlobal(t) {
+  let i = 0;
+  while (i < ng) {
+    if (sameName(gname[i], t)) { return gaddr[i]; }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+fn findFunc(t) {
+  let i = 0;
+  while (i < nf) {
+    if (sameName(fname[i], t)) { return i; }
+    i = i + 1;
+  }
+  return 0 - 1;
+}
+
+fn addGlobal(t, size) {
+  if (findGlobal(t) >= 0) { fail(60); }
+  gname[ng] = t;
+  gaddr[ng] = heap;
+  ng = ng + 1;
+  let a = heap;
+  heap = heap + size;
+  return a;
+}
+
+fn addLocal(t) {
+  if (findLocal(t) >= 0) { fail(61); }
+  lname[nl] = t;
+  lslot[nl] = lcount;
+  nl = nl + 1;
+  lcount = lcount + 1;
+  return lcount - 1;
+}
+
+// ---------- 輸出 IR ----------
+fn emit(op, arg) {
+  cop[ncode] = op;
+  carg[ncode] = arg;
+  ncode = ncode + 1;
+  return ncode - 1;
+}
+
+fn expect(k) {
+  if (tk[tp] != k) { fail(10); }
+  tp = tp + 1;
+}
+
+// 推入「名稱 t 的底址」：區域變數 → 其值（指標）；全域 → 常數位址
+fn pushBase(t) {
+  let s = findLocal(t);
+  if (s >= 0) {
+    emit(1, s);
+    return 0;
+  }
+  let g = findGlobal(t);
+  if (g < 0) { fail(21); }
+  emit(0, g);
+}
+
+// ---------- 運算式（優先序：|| < && < 比較 < +- < */% < 一元 < 原子） ----------
+fn parseExpr() { parseOr(); }
+
+fn parseOr() {
+  parseAnd();
+  while (tk[tp] == 9) {
+    tp = tp + 1;
+    let j1 = emit(10, 0);
+    emit(0, 1);
+    let j2 = emit(9, 0);
+    carg[j1] = ncode;
+    parseAnd();
+    emit(0, 0);
+    emit(5, 6);
+    carg[j2] = ncode;
+  }
+}
+
+fn parseAnd() {
+  parseCmp();
+  while (tk[tp] == 8) {
+    tp = tp + 1;
+    let j1 = emit(10, 0);
+    parseCmp();
+    emit(0, 0);
+    emit(5, 6);
+    let j2 = emit(9, 0);
+    carg[j1] = ncode;
+    emit(0, 0);
+    carg[j2] = ncode;
+  }
+}
+
+// 比較運算子的 token 種類 → bin 運算元；不是比較運算子則回傳 -1
+fn cmpCode(k) {
+  if (k == 4) { return 5; }
+  if (k == 5) { return 6; }
+  if (k == '<') { return 7; }
+  if (k == 6) { return 8; }
+  if (k == '>') { return 9; }
+  if (k == 7) { return 10; }
+  return 0 - 1;
+}
+
+fn parseCmp() {
+  parseAdd();
+  let cc = cmpCode(tk[tp]);
+  if (cc >= 0) {
+    tp = tp + 1;
+    parseAdd();
+    emit(5, cc);
+  }
+}
+
+fn parseAdd() {
+  parseMul();
+  while (tk[tp] == '+' || tk[tp] == '-') {
+    let op = 0;
+    if (tk[tp] == '-') { op = 1; }
+    tp = tp + 1;
+    parseMul();
+    emit(5, op);
+  }
+}
+
+fn parseMul() {
+  parseUnary();
+  while (tk[tp] == '*' || tk[tp] == '/' || tk[tp] == '%') {
+    let op = 2;
+    if (tk[tp] == '/') { op = 3; }
+    if (tk[tp] == '%') { op = 4; }
+    tp = tp + 1;
+    parseUnary();
+    emit(5, op);
+  }
+}
+
+fn parseUnary() {
+  if (tk[tp] == '-') {
+    tp = tp + 1;
+    parseUnary();
+    emit(6, 0);
+  } else if (tk[tp] == '!') {
+    tp = tp + 1;
+    parseUnary();
+    emit(7, 0);
+  } else {
+    parsePrimary();
+  }
+}
+
+// 字串常數：配置 len+1 格，逐字元寫入，最後推入起始位址
+fn strLit() {
+  let len = tl[tp];
+  let st = tv[tp];
+  let a = heap;
+  heap = heap + len + 1;
+  let j = 0;
+  while (j < len) {
+    emit(0, a + j);
+    emit(0, src[st + j]);
+    emit(4, 0);
+    j = j + 1;
+  }
+  emit(0, a);
+  tp = tp + 1;
+}
+
+fn parsePrimary() {
+  let k = tk[tp];
+  if (k == 1) {
+    emit(0, tv[tp]);
+    tp = tp + 1;
+  } else if (k == 3) {
+    strLit();
+  } else if (k == '(') {
+    tp = tp + 1;
+    parseExpr();
+    expect(')');
+  } else if (k == 2) {
+    parseName();
+  } else {
+    fail(20);
+  }
+}
+
+// 識別字開頭：變數、陣列元素、或函式呼叫
+fn parseName() {
+  let t = tp;
+  tp = tp + 1;
+  if (tk[tp] == '(') {
+    tp = tp + 1;
+    parseCall(t);
+  } else if (tk[tp] == '[') {
+    tp = tp + 1;
+    pushBase(t);
+    parseExpr();
+    expect(']');
+    emit(5, 0);
+    emit(3, 0);
+  } else {
+    let s = findLocal(t);
+    if (s >= 0) {
+      emit(1, s);
+    } else {
+      let g = findGlobal(t);
+      if (g < 0) { fail(21); }
+      emit(0, g);
+      emit(3, 0);
+    }
+  }
+}
+
+// 已吃掉 '('：處理內建函式 getc/putc/halt 與一般呼叫
+fn parseCall(t) {
+  if (tokeq(t, "getc")) {
+    expect(')');
+    emit(15, 0);
+  } else if (tokeq(t, "putc")) {
+    parseExpr();
+    expect(')');
+    emit(16, 0);
+  } else if (tokeq(t, "halt")) {
+    expect(')');
+    emit(17, 0);
+  } else {
+    let n = 0;
+    if (tk[tp] != ')') {
+      parseExpr();
+      n = 1;
+      while (tk[tp] == ',') {
+        tp = tp + 1;
+        parseExpr();
+        n = n + 1;
+      }
+    }
+    expect(')');
+    emit(0, n);
+    let pc = emit(11, 0);
+    spc[ns] = pc;
+    sname[ns] = t;
+    sn[ns] = n;
+    ns = ns + 1;
+  }
+}
+
+// ---------- 敘述 ----------
+fn parseBlock() {
+  expect('{');
+  while (tk[tp] != '}' && tk[tp] != 0) {
+    parseStmt();
+  }
+  expect('}');
+}
+
+fn parseLet() {
+  tp = tp + 1;
+  let t = tp;
+  expect(2);
+  expect('=');
+  if (infn) {
+    parseExpr();
+    let slot = addLocal(t);
+    emit(2, slot);
+  } else {
+    let a = addGlobal(t, 1);
+    emit(0, a);
+    parseExpr();
+    emit(4, 0);
+  }
+  expect(';');
+}
+
+fn parsePrint() {
+  tp = tp + 1;
+  parseExpr();
+  emit(8, 0);
+  expect(';');
+}
+
+fn parseReturn() {
+  if (infn == 0) { fail(31); }
+  tp = tp + 1;
+  parseExpr();
+  emit(13, 0);
+  expect(';');
+}
+
+fn parseWhile() {
+  tp = tp + 1;
+  expect('(');
+  let start = ncode;
+  parseExpr();
+  expect(')');
+  let j = emit(10, 0);
+  parseBlock();
+  emit(9, start);
+  carg[j] = ncode;
+}
+
+fn parseIf() {
+  tp = tp + 1;
+  expect('(');
+  parseExpr();
+  expect(')');
+  let j1 = emit(10, 0);
+  parseBlock();
+  if (isKw("else")) {
+    tp = tp + 1;
+    let j2 = emit(9, 0);
+    carg[j1] = ncode;
+    if (isKw("if")) { parseStmt(); } else { parseBlock(); }
+    carg[j2] = ncode;
+  } else {
+    carg[j1] = ncode;
+  }
+}
+
+// 以識別字開頭、但不是關鍵字：賦值、陣列賦值、呼叫敘述
+fn parseSimple() {
+  let t = tp;
+  tp = tp + 1;
+  if (tk[tp] == '=') {
+    tp = tp + 1;
+    let s = findLocal(t);
+    if (s >= 0) {
+      parseExpr();
+      emit(2, s);
+    } else {
+      let g = findGlobal(t);
+      if (g < 0) { fail(21); }
+      emit(0, g);
+      parseExpr();
+      emit(4, 0);
+    }
+    expect(';');
+  } else if (tk[tp] == '[') {
+    tp = tp + 1;
+    pushBase(t);
+    parseExpr();
+    expect(']');
+    emit(5, 0);
+    expect('=');
+    parseExpr();
+    emit(4, 0);
+    expect(';');
+  } else if (tk[tp] == '(') {
+    tp = tp + 1;
+    parseCall(t);
+    emit(14, 0);
+    expect(';');
+  } else {
+    fail(32);
+  }
+}
+
+fn parseStmt() {
+  if (tk[tp] != 2) { fail(30); }
+  if (isKw("let")) { parseLet(); }
+  else if (isKw("print")) { parsePrint(); }
+  else if (isKw("if")) { parseIf(); }
+  else if (isKw("while")) { parseWhile(); }
+  else if (isKw("return")) { parseReturn(); }
+  else { parseSimple(); }
+}
+
+// ---------- 頂層項目 ----------
+fn parseFn() {
+  tp = tp + 1;
+  let name = tp;
+  expect(2);
+  expect('(');
+  nl = 0;
+  lcount = 0;
+  let np = 0;
+  if (tk[tp] != ')') {
+    let pt = tp;
+    expect(2);
+    addLocal(pt);
+    np = 1;
+    while (tk[tp] == ',') {
+      tp = tp + 1;
+      let pt2 = tp;
+      expect(2);
+      addLocal(pt2);
+      np = np + 1;
+    }
+  }
+  expect(')');
+  if (findFunc(name) >= 0) { fail(40); }
+  let skip = emit(9, 0);
+  fname[nf] = name;
+  fpc[nf] = ncode;
+  farity[nf] = np;
+  nf = nf + 1;
+  infn = 1;
+  let en = emit(12, 0);
+  parseBlock();
+  emit(0, 0);
+  emit(13, 0);
+  carg[en] = lcount - np;
+  carg[skip] = ncode;
+  infn = 0;
+  nl = 0;
+  lcount = 0;
+}
+
+fn parseArray() {
+  tp = tp + 1;
+  let t = tp;
+  expect(2);
+  expect('[');
+  let size = tv[tp];
+  expect(1);
+  expect(']');
+  expect(';');
+  addGlobal(t, size);
+}
+
+fn parseProgram() {
+  while (tk[tp] != 0) {
+    if (isKw("fn")) { parseFn(); }
+    else if (isKw("array")) { parseArray(); }
+    else { parseStmt(); }
+  }
+  emit(17, 0);
+}
+
+// 回填所有呼叫點的目標位址，並檢查函式存在與引數個數
+fn resolveCalls() {
+  let i = 0;
+  while (i < ns) {
+    let f = findFunc(sname[i]);
+    if (f < 0) { fail(50); }
+    if (farity[f] != sn[i]) { fail(51); }
+    carg[spc[i]] = fpc[f];
+    i = i + 1;
+  }
+}
+
+fn emitIR() {
+  print heap;
+  let i = 0;
+  while (i < ncode) {
+    print cop[i];
+    print carg[i];
+    i = i + 1;
+  }
+}
+
+fn readSource() {
+  let c = getc();
+  while (c >= 0) {
+    src[srclen] = c;
+    srclen = srclen + 1;
+    c = getc();
+  }
+}
+
+// ---------- 主程式 ----------
+readSource();
+lex();
+parseProgram();
+resolveCalls();
+emitIR();

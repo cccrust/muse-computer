@@ -34,7 +34,32 @@ expect_run examples/enums.aero   '5|-7|0|zero|small|negative|big|1|missing|2|3|'
 expect_run examples/async.aero   '40|42|'
 expect_run examples/syntax2.aero 'negative|zero|positive|50|109|and-ok|or-else|5|7|5|18|'
 expect_run examples/traits.aero  '12|12|10|3|true|'
+expect_run examples/crates_json.aero '{"x":3,"y":4}|7|'
+expect_run examples/crates_regex.aero 'true|false|'
 expect_run examples/modules/main.aero '25|81|12|12|0|103|true|false|'
+
+# ── axum web server：編譯、背景啟動、打兩個端點、比對、關閉 ──
+echo "== axum web server"
+if ! command -v curl >/dev/null; then
+  bad "axum server" "缺 curl，跳過"
+else
+  "$AEROC" build examples/axum_server.aero --out-dir target/aero/t_axum >/dev/null 2>&1
+  BIN=target/aero/t_axum/target/debug/axum_server
+  if [ ! -x "$BIN" ]; then
+    bad "axum server" "編譯失敗，找無 $BIN"
+  else
+    "$BIN" >/dev/null 2>&1 & SRV=$!
+    for _ in $(seq 1 20); do
+      curl -sf --max-time 2 http://127.0.0.1:18080/health >/dev/null 2>&1 && break
+      sleep 0.5
+    done
+    ROOT=$(curl -s --max-time 5 http://127.0.0.1:18080/)
+    HEALTH=$(curl -s --max-time 5 http://127.0.0.1:18080/health)
+    kill $SRV 2>/dev/null; wait 2>/dev/null
+    if [ "$ROOT" = "hello, aero" ] && [ "$HEALTH" = "ok" ]; then ok "axum server（/ 與 /health）";
+    else bad "axum server" "/=[$ROOT] /health=[$HEALTH]"; fi
+  fi
+fi
 
 # ── 反例：check 必須失敗，且 JSON 含預期錯誤碼 ──
 expect_check_fail() { # $1=.aero $2=錯誤碼

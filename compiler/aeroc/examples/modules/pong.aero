@@ -1,5 +1,11 @@
+// 循環引用的另一半：與 ping.aero 互 import，證明 loader 可處理循環依賴。
+// 不被 main.aero 直接引用，經由 ping::is_even 間接呼叫（pong::is_odd）。
+
+// 引入 ping.aero，別名 ping（與 ping.aero 的 import 方向相反，形成循環）。
 import "ping.aero" as ping;
 
+// 判奇數：基例 0 非奇；否則遞減 1 交回 ping::is_even。
+// 偶數次互遞迴後必落在某一檔的 n == 0 基例而終止。
 fn is_odd(n: Int) -> Bool
   if n == 0
     return false;

@@ -1,0 +1,40 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+async fn fetch(n: i64) -> i64 {
+    return (n * 10i64);
+}
+fn make_adder(base: i64) -> ::std::rc::Rc<dyn Fn(i64) -> i64> {
+    {
+        return ::std::rc::Rc::new(move |x: i64| -> i64 {
+            return (x + base);
+        });
+    }
+}
+#[tokio::main]
+async fn main() {
+    let v = (fetch(4i64)).await;
+    println(v);
+    let add5 = make_adder(5i64);
+    println(add5(37i64));
+}

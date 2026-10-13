@@ -1,0 +1,85 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+#[derive(
+    Clone,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::std::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub struct Point {
+    pub x: i64,
+    pub y: i64,
+}
+impl Point {
+    fn new(x: i64, y: i64) -> Point {
+        return Point { x: x, y: y };
+    }
+    fn dist2(&self, other: &Point) -> i64 {
+        let dx = mathx__square((self.x - other.x));
+        let dy = mathx__square((self.y - other.y));
+        return (dx + dy);
+    }
+}
+#[derive(
+    Clone,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub enum Shape {
+    Circle(i64),
+    Rect(i64, i64),
+    Dot,
+}
+fn area(s: &Shape) -> i64 {
+    match s {
+        Shape::Circle(r) => {
+            return (3i64 * mathx__square((*r)));
+        }
+        Shape::Rect(w, h) => {
+            return ((*w) * (*h));
+        }
+        Shape::Dot => {
+            return 0i64;
+        }
+    }
+}
+fn helper() -> i64 {
+    return 1i64;
+}
+fn mathx__square(n: i64) -> i64 {
+    return (n * n);
+}
+fn mathx__helper() -> i64 {
+    return 100i64;
+}

@@ -7,6 +7,10 @@
     ./test.sh                                      # 完整測試：正例輸出比對＋反例錯誤碼＋產碼結構斷言
     ./run.sh                                       # 跑全部案例（所有正例＋反例示範）
 
+  每個範例旁另有同名 `.rust` 對照檔（如 `traits.aero` → `traits.rust`），
+  即 `aeroc emit` 的輸出（`syntax_err.aero` 為解析反例，無對照檔）；
+  範例更新後以 `for f in $(find examples -name "*.aero"); do aeroc emit $f > ${f%.aero}.rust; done` 再生。
+
 架構：chumsky(解析) → loader(多檔) → AST → quote!(產碼) → syn/prettyplease(驗證排版) → cargo/rustc
 GC：現成的 `gc` crate（cycle-collecting tracing GC），`gc T` ⇒ `Gc<GcCell<T>>`
 
@@ -29,6 +33,11 @@ GC：現成的 `gc` crate（cycle-collecting tracing GC），`gc T` ⇒ `Gc<GcCe
   ```
   支援 `_`、綁定、Int/String/Bool 字面值、`|`、`if` guard、巢狀 pattern；漏掉分支時 rustc 會報 E0004 → Aero `E0200`
 - **Option[T]**：`Some(x)` / `None`
+- **crates.io**：`import crate "axum" version = "0.7";` 加依賴，原生路徑直接呼叫
+  （`axum::Router::new()`、方法鏈、`serde_json::to_string(&p).unwrap()` 全直通，無需 binding 層）
+  - Rust API 取 `&str` 時：字面值先綁給變數再 `&` 借用（`&String` 可 deref 成 `&str`）；`Result` 以 `.unwrap()` 處理
+  - 範例：`axum_server.aero`（axum web server，`/: hello, aero`、`/health: ok`）、
+    `crates_json.aero`（serde 自動衍生往返）、`crates_regex.aero`
 - **trait 與自動特徵（Auto-Traits）**：trait 是「型態滿足特定命題的證明」，LLM 永遠不用手寫 `impl Trait for Type`
   ```
   trait Measurable

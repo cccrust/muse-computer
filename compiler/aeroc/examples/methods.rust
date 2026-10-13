@@ -1,0 +1,105 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+#[derive(
+    Clone,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::std::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub struct Counter {
+    pub n: i64,
+}
+impl Counter {
+    fn new(start: i64) -> Counter {
+        return Counter { n: start };
+    }
+    fn inc(&mut self) {
+        self.n = (self.n + 1i64);
+    }
+    fn get(&self) -> i64 {
+        return self.n;
+    }
+    fn add(&mut self, k: i64) -> i64 {
+        self.n = (self.n + k);
+        return self.n;
+    }
+}
+#[derive(
+    Clone,
+    ::gc::Trace,
+    ::gc::Finalize,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::std::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub struct Account {
+    pub balance: i64,
+    pub history: ::std::vec::Vec<i64>,
+}
+impl Account {
+    fn deposit(&mut self, amt: i64) {
+        self.balance = (self.balance + amt);
+        self.history.push(amt);
+    }
+    fn total(&self) -> i64 {
+        return self.balance;
+    }
+}
+fn main() {
+    let mut c = Counter::new(10i64);
+    c.inc();
+    c.inc();
+    println(c.get());
+    println(c.add(5i64));
+    println(c.get());
+    {
+        let acc = ::gc::Gc::new(
+            ::gc::GcCell::new(Account {
+                balance: 0i64,
+                history: ::std::vec![],
+            }),
+        );
+        let alias = acc.clone();
+        {
+            let __aero_a0 = 100i64;
+            acc.borrow_mut().deposit(__aero_a0)
+        };
+        {
+            let __aero_a0 = 50i64;
+            alias.borrow_mut().deposit(__aero_a0)
+        };
+        println({ acc.borrow().total() });
+        println(({ alias.borrow().history.len() } as i64));
+    }
+}

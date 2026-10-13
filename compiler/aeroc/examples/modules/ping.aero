@@ -1,5 +1,11 @@
+// 循環引用的一半：ping import pong，pong 又 import 回 ping。
+// loader 允許循環引用且同一檔案只載入一次；合併時符號加前綴區分。
+// 被 main.aero 以 ping::is_even 呼叫。
+
+// 引入 pong.aero，別名 pong（路徑相對於本檔，即同目錄）。
 import "pong.aero" as pong;
 
+// 判偶數：基例 0 為偶；否則遞減 1 交給 pong::is_odd（兩檔來回互遞迴）。
 fn is_even(n: Int) -> Bool
   if n == 0
     return true;

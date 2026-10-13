@@ -1,0 +1,31 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+fn main() {
+    let pat = ::std::string::String::from("[0-9]+");
+    let re = regex::Regex::new(&pat).unwrap();
+    let a = ::std::string::String::from("abc123");
+    let b = ::std::string::String::from("abc");
+    println(re.is_match(&a));
+    println(re.is_match(&b));
+}

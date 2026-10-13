@@ -1,0 +1,32 @@
+// 以 crates.io 的 axum 開 web server：證明 Aero 可直接駕馭原生 Rust 生態。
+// Aero 這側只有 `import crate`＋路徑直通呼叫，其餘全是原生 Rust API：
+// Router / routing::get / TcpListener / serve 原樣直達，handler 就是普通 async fn。
+// 驗證：僅 build 不 run（server 常駐不退），curl 兩個端點（見 axum_server.aero.md）。
+
+// 宣告依賴：axum 0.7（web 框架）+ tokio 1 full（async runtime）。
+import crate "axum" version = "0.7";
+import crate "tokio" version = "1", features = ["full"];
+
+// 路由 handler：普通 async fn，回 String 即回 200 純文字。
+async fn hello() -> String
+  return "hello, aero";
+end
+
+// 健康檢查 handler：回 "ok"。
+async fn health() -> String
+  return "ok";
+end
+
+async fn main() -> Unit
+  // axum 的 route 要 `&str`：Aero 字串字面值是 owned String，
+  // 先綁給具名變數再 `&` 借用（Zero-GC 借用語義直通，&String 可 deref 成 &str）。
+  let root = "/";
+  let health_path = "/health";
+  // 建 Router：`/` 綁 hello，`/health` 綁 health（方法鏈直通）。
+  let app = axum::Router::new().route(&root, axum::routing::get(hello)).route(&health_path, axum::routing::get(health));
+  // 綁定監聽埠：bind 是 async 且回傳 Result，故先 .await 再 .unwrap()。
+  let listener = tokio::net::TcpListener::bind("127.0.0.1:18080").await.unwrap();
+  println("listening on 18080");
+  // 啟動服務：serve 也是 async，以 .await 驅動（此 future 永不結束，故只能 build 驗證）。
+  axum::serve(listener, app).await;
+end

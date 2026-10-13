@@ -1,0 +1,83 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+pub trait Measurable {
+    fn area(&self) -> i64;
+}
+#[derive(
+    Clone,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::std::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub struct Point {
+    pub x: i64,
+    pub y: i64,
+}
+impl Point {
+    fn new(x: i64, y: i64) -> Point {
+        return Point { x: x, y: y };
+    }
+    fn area(&self) -> i64 {
+        return (self.x * self.y);
+    }
+}
+fn sum<T: ::std::ops::Add<Output = T> + ::std::clone::Clone>(
+    items: ::std::vec::Vec<T>,
+) -> T {
+    let mut total = items[(0i64) as usize].clone();
+    let mut i = 1i64;
+    while (i < (items.len() as i64)) {
+        total = (total + items[(i) as usize].clone());
+        i = (i + 1i64);
+    }
+    return total;
+}
+#[derive(Clone)]
+pub struct Pair<T: ::std::clone::Clone> {
+    pub first: T,
+    pub second: T,
+}
+fn describe<M: Measurable>(m: &M) -> i64 {
+    return m.area();
+}
+fn main() {
+    let p = Point::new(3i64, 4i64);
+    println(p.area());
+    println(describe(&p));
+    let xs = ::std::vec![1i64, 2i64, 3i64, 4i64];
+    println(sum(xs));
+    let pair = Pair { first: 1i64, second: 2i64 };
+    println((pair.first + pair.second));
+    println((p == Point::new(3i64, 4i64)));
+}
+impl Measurable for Point {
+    fn area(&self) -> i64 {
+        Self::area(self)
+    }
+}

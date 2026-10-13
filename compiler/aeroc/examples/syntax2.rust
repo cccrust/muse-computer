@@ -1,0 +1,118 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+#[derive(
+    Clone,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::std::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub struct Box {
+    pub items: ::std::vec::Vec<i64>,
+}
+#[derive(
+    Clone,
+    ::gc::Trace,
+    ::gc::Finalize,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::std::default::Default,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub struct Bag {
+    pub nums: ::std::vec::Vec<i64>,
+}
+fn classify(n: i64) -> ::std::string::String {
+    if (n < 0i64) {
+        return ::std::string::String::from("negative");
+    } else if (n == 0i64) {
+        return ::std::string::String::from("zero");
+    } else {
+        return ::std::string::String::from("positive");
+    }
+}
+fn main() {
+    println(classify((-5i64)));
+    println(classify(0i64));
+    println(classify(7i64));
+    let xs = ::std::vec![10i64, 20i64, 30i64];
+    println((xs[(1i64) as usize] + xs[(2i64) as usize]));
+    let mut ys = ::std::vec![1i64, 2i64, 3i64];
+    ys[(0i64) as usize] = 99i64;
+    ys[(1i64) as usize] = (ys[(1i64) as usize] * 5i64);
+    println((ys[(0i64) as usize] + ys[(1i64) as usize]));
+    let ok = ((!(xs[(0i64) as usize] > 100i64)) && (xs[(2i64) as usize] == 30i64));
+    if ok {
+        println(::std::string::String::from("and-ok"));
+    }
+    if (false || (1i64 > 2i64)) {
+        println(::std::string::String::from("never"));
+    } else {
+        println(::std::string::String::from("or-else"));
+    }
+    let d = ::std::collections::HashMap::from([
+        (::std::string::String::from("a"), 1i64),
+        (::std::string::String::from("b"), 2i64),
+    ]);
+    println((d[&::std::string::String::from("b")] - (-3i64)));
+    let b = Box {
+        items: ::std::vec![5i64, 6i64, 7i64],
+    };
+    println(b.items[(2i64) as usize]);
+    {
+        let bag = ::gc::Gc::new(
+            ::gc::GcCell::new(Bag {
+                nums: ::std::vec![1i64, 2i64, 3i64],
+            }),
+        );
+        {
+            let __aero_ix1 = 1i64;
+            let __aero_rhs = (bag.borrow().nums[(1i64) as usize]
+                + bag.borrow().nums[(2i64) as usize]);
+            bag.borrow_mut().nums[(__aero_ix1) as usize] = __aero_rhs;
+        }
+        println(bag.borrow().nums[(1i64) as usize]);
+        let mut i = 0i64;
+        while (i < 3i64) {
+            {
+                let __aero_ix2 = i;
+                let __aero_rhs = (bag.borrow().nums[(i) as usize] * 2i64);
+                bag.borrow_mut().nums[(__aero_ix2) as usize] = __aero_rhs;
+            }
+            i = (i + 1i64);
+        }
+        println(
+            ((bag.borrow().nums[(0i64) as usize] + bag.borrow().nums[(1i64) as usize])
+                + bag.borrow().nums[(2i64) as usize]),
+        );
+    }
+}

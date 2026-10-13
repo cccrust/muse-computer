@@ -1,0 +1,152 @@
+#![allow(
+    dead_code,
+    unused_variables,
+    unused_mut,
+    unused_parens,
+    unused_unsafe,
+    unused_imports,
+    non_snake_case,
+    non_camel_case_types
+)]
+/// Aero 內建小型 runtime（對應 std::io 的最小子集）
+mod aero_rt {
+    pub fn println<T: ::std::fmt::Display>(v: T) {
+        ::std::println!("{}", v);
+    }
+    pub fn print<T: ::std::fmt::Display>(v: T) {
+        ::std::print!("{}", v);
+    }
+    pub fn to_str<T: ::std::fmt::Display>(v: T) -> ::std::string::String {
+        v.to_string()
+    }
+}
+use aero_rt::*;
+#[derive(
+    Clone,
+    ::std::cmp::PartialEq,
+    ::std::cmp::PartialOrd,
+    ::std::hash::Hash,
+    ::std::cmp::Eq,
+    ::std::fmt::Debug,
+    ::serde::Serialize,
+    ::serde::Deserialize
+)]
+pub enum Expr {
+    Num(i64),
+    Add(i64, i64),
+    Neg(i64),
+    Zero,
+}
+#[derive(Clone, ::gc::Trace, ::gc::Finalize)]
+pub enum Tree {
+    Leaf(i64),
+    Pair(::gc::Gc<::gc::GcCell<Tree>>, ::gc::Gc<::gc::GcCell<Tree>>),
+}
+fn eval(e: &Expr) -> i64 {
+    match e {
+        Expr::Num(n) => {
+            return (*n);
+        }
+        Expr::Add(a, b) => {
+            return ((*a) + (*b));
+        }
+        Expr::Neg(x) => {
+            return (0i64 - (*x));
+        }
+        Expr::Zero => {
+            return 0i64;
+        }
+    }
+}
+fn describe(n: i64) -> ::std::string::String {
+    match n {
+        0 => {
+            return ::std::string::String::from("zero");
+        }
+        1 | 2 | 3 => {
+            return ::std::string::String::from("small");
+        }
+        x if (x < 0i64) => {
+            return ::std::string::String::from("negative");
+        }
+        _ => {
+            return ::std::string::String::from("big");
+        }
+    }
+}
+fn find(items: &::std::vec::Vec<i64>, target: i64) -> ::std::option::Option<i64> {
+    let mut i = 0i64;
+    while (i < (items.len() as i64)) {
+        if (items[(i) as usize] == target) {
+            return Some(i);
+        }
+        i = (i + 1i64);
+    }
+    return None;
+}
+fn sum_tree(t: ::gc::Gc<::gc::GcCell<Tree>>) -> i64 {
+    match &{
+        let __aero_s = (*t.borrow()).clone();
+        __aero_s
+    } {
+        Tree::Leaf(n) => {
+            return (*n);
+        }
+        Tree::Pair(l, r) => {
+            return (sum_tree(l.clone()) + sum_tree(r.clone()));
+        }
+    }
+}
+fn main() {
+    let e1 = Expr::Add(2i64, 3i64);
+    let e2 = Expr::Neg(7i64);
+    let z = Expr::Zero;
+    println(eval(&e1));
+    println(eval(&e2));
+    println(eval(&z));
+    println(describe(0i64));
+    println(describe(2i64));
+    println(describe((-4i64)));
+    println(describe(99i64));
+    let xs = ::std::vec![5i64, 6i64, 7i64];
+    match find(&xs, 6i64) {
+        Some(i) => {
+            println(i);
+        }
+        None => {
+            println(::std::string::String::from("missing"));
+        }
+    }
+    match find(&xs, 9i64) {
+        Some(i) => {
+            println(i);
+        }
+        None => {
+            println(::std::string::String::from("missing"));
+        }
+    }
+    let name = ::std::string::String::from("bob");
+    match (name).as_str() {
+        "alice" => {
+            println(1i64);
+        }
+        "bob" => {
+            println(2i64);
+        }
+        _ => {
+            println(3i64);
+        }
+    }
+    {
+        let a: ::gc::Gc<::gc::GcCell<Tree>> = ::gc::Gc::new(
+            ::gc::GcCell::new(Tree::Leaf(1i64)),
+        );
+        let b: ::gc::Gc<::gc::GcCell<Tree>> = ::gc::Gc::new(
+            ::gc::GcCell::new(Tree::Leaf(2i64)),
+        );
+        let root: ::gc::Gc<::gc::GcCell<Tree>> = ::gc::Gc::new(
+            ::gc::GcCell::new(Tree::Pair(a.clone(), b.clone())),
+        );
+        println(sum_tree(root.clone()));
+    }
+}

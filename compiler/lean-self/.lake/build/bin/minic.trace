@@ -1,0 +1,14 @@
+{"log":
+ [{"message":
+   ".> MACOSX_DEPLOYMENT_TARGET=99.0 /Users/cccuser/.elan/toolchains/leanprover--lean4---v4.20.0/bin/clang -o /Users/Shared/ccc/115a/muse-computer/compiler/lean-self/.lake/build/bin/minic /Users/Shared/ccc/115a/muse-computer/compiler/lean-self/.lake/build/ir/Main.c.o.export -L /Users/cccuser/.elan/toolchains/leanprover--lean4---v4.20.0/lib/lean --sysroot /Users/cccuser/.elan/toolchains/leanprover--lean4---v4.20.0 -L /Users/cccuser/.elan/toolchains/leanprover--lean4---v4.20.0/lib -L /Users/cccuser/.elan/toolchains/leanprover--lean4---v4.20.0/lib/libc -fuse-ld=lld -lleancpp -lInit -lStd -lLean -lleanrt -lc++ -lLake -lgmp -luv",
+   "level": "trace"}],
+ "inputs":
+ [["linkObjs",
+   [["/Users/Shared/ccc/115a/muse-computer/compiler/lean-self/.lake/build/ir/Main.c.o.export",
+     "8277103255242603323"]]],
+  ["linkLibs", "1723"],
+  ["Lean 4.20.0, commit 77cfc4d1a4f6ef6651792b781eaa6676b4f3f060",
+   "16311077432335102250"],
+  ["traceArgs: #[]", "1723"],
+  ["arm64-apple-darwin23.6.0", "17616366027971700708"]],
+ "depHash": "14893931354496188636"}
